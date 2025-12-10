@@ -840,12 +840,14 @@ class WhisperApp:
         trans_model_combo = ttk.Combobox(model_row, textvariable=self.openai_trans_model_var,
                                          values=["whisper-1", "gpt-4o-transcribe"], width=18, state="readonly")
         trans_model_combo.pack(side="left", padx=5)
+        trans_model_combo.bind("<<ComboboxSelected>>", lambda e: self._auto_save_openai_settings())
         
         ttk.Label(model_row, text="Edit Model:").pack(side="left", padx=(10, 0))
         self.openai_edit_model_var = tk.StringVar(value=self.config.get('openai_edit_model', 'gpt-4o-mini'))
         edit_model_combo = ttk.Combobox(model_row, textvariable=self.openai_edit_model_var,
                                         values=["gpt-4o-mini", "gpt-4o", "gpt-4-turbo"], width=15, state="readonly")
         edit_model_combo.pack(side="left", padx=5)
+        edit_model_combo.bind("<<ComboboxSelected>>", lambda e: self._auto_save_openai_settings())
         
         ttk.Label(model_row, text="Language:").pack(side="left", padx=(10, 0))
         self.openai_lang_var = tk.StringVar(value=self.config.get('openai_language', 'auto'))
@@ -853,6 +855,7 @@ class WhisperApp:
                                   values=["auto", "en", "de", "es", "fr", "it", "pt", "nl", "pl", "ru", "zh", "ja", "ko"],
                                   width=6, state="readonly")
         lang_combo.pack(side="left", padx=5)
+        lang_combo.bind("<<ComboboxSelected>>", lambda e: self._auto_save_openai_settings())
         
         # Edit prompt row
         prompt_row = ttk.Frame(openai_frame)
@@ -1257,6 +1260,19 @@ Troubleshooting:
         
         self.msg_queue.put("OpenAI settings saved")
         messagebox.showinfo("Saved", "OpenAI settings saved successfully.")
+
+    def _auto_save_openai_settings(self):
+        """Silently save OpenAI settings when combo boxes change."""
+        self.config['openai_transcription_model'] = self.openai_trans_model_var.get()
+        self.config['openai_edit_model'] = self.openai_edit_model_var.get()
+        self.config['openai_language'] = self.openai_lang_var.get()
+        
+        try:
+            with open(CONFIG_FILE, 'w') as f:
+                json.dump(self.config, f)
+            self.log_internal(f"Settings saved: {self.openai_trans_model_var.get()}")
+        except:
+            pass
 
     def _test_openai_connection(self):
         """Test the OpenAI API connection."""
