@@ -1,0 +1,31 @@
+# Core dependencies for WhisperTyper
+faster-whisper==1.2.1
+ctranslate2==4.6.2
+sounddevice==0.5.3
+keyboard==0.13.5
+customtkinter==5.2.2
+numpy==2.3.5
+
+# For GPU acceleration (optional, will fall back to CPU if not available)
+# onnxruntime==1.23.2
+
+# For Intel GPU acceleration (optional), install separately:
+# pip install -r requirements-openvino.txt
+
+# Audio processing
+av==16.0.1
+scipy==1.16.3
+
+# Hugging Face for model downloads
+huggingface_hub==1.2.1
+tokenizers==0.22.1
+
+# Utilities
+tqdm==4.67.1
+colorama==0.4.6
+coloredlogs==15.0.1
+PyYAML==6.0.3
+
+# OpenAI Cloud Transcription (optional)
+openai>=1.0.0
+python-dotenv>=1.0.0

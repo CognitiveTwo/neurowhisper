@@ -1,0 +1,40 @@
+# Distribution
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# App-specific
+models/
+transcriptions/
+*.wav
+whisper_stats.json
+whisper_config.json
+temp_*.wav
+
+# Secrets
+*.env
+.env
+
+# OS
+.DS_Store
+Thumbs.db
