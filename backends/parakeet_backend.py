@@ -86,56 +86,122 @@ class ParakeetBackend(WhisperBackend):
         model_path: Optional[str] = None,
         progress_callback: Optional[callable] = None
     ) -> None:
-        """Load a Parakeet model using NeMo."""
+        """Load a Parakeet model using NeMo.
+        
+        Note: model_path is ignored for Parakeet models. NeMo handles its own
+        model caching. Only use model_path if it's an explicit .nemo file.
+        """
+        print(f"[Parakeet] load_model called with:")
+        print(f"  model_key: {model_key}")
+        print(f"  device: {device}")
+        print(f"  compute_type: {compute_type}")
+        print(f"  model_path: {model_path}")
+        
+        print("[Parakeet] Importing torch...")
         import torch
+        print(f"[Parakeet] torch imported. CUDA available: {torch.cuda.is_available()}")
+        
+        print("[Parakeet] Importing nemo.collections.asr...")
         import nemo.collections.asr as nemo_asr
+        print("[Parakeet] NeMo ASR imported successfully")
         
         # Map friendly names to model IDs
         model_map = self.get_model_map()
-        model_id = model_map.get(model_key, model_key)
+        print(f"[Parakeet] Model map: {model_map}")
         
-        # If model_key looks like a path or HuggingFace ID, use it directly
-        if "/" in model_key and model_key not in model_map.values():
+        # First check if model_key is directly in our map
+        if model_key in model_map:
+            model_id = model_map[model_key]
+            print(f"[Parakeet] Found model_key in map -> model_id: {model_id}")
+        # Also check if it's a HuggingFace ID we recognize
+        elif model_key in model_map.values():
             model_id = model_key
+            print(f"[Parakeet] model_key is a HF ID -> model_id: {model_id}")
+        # Check if it's the Parakeet model from GUI's MODEL_MAP
+        elif "nvidia/parakeet" in model_key:
+            model_id = model_key
+            print(f"[Parakeet] model_key contains nvidia/parakeet -> model_id: {model_id}")
+        else:
+            # Default to the latest v3 model
+            model_id = "nvidia/parakeet-tdt-0.6b-v3"
+            print(f"[Parakeet] Using default model_id: {model_id}")
         
         # Set device
         if device == "cuda" and torch.cuda.is_available():
-            # NeMo will use GPU automatically when model is moved to cuda
             map_location = "cuda"
+            print(f"[Parakeet] Using CUDA device")
         else:
             map_location = "cpu"
             device = "cpu"  # Fallback to CPU if CUDA requested but not available
+            print(f"[Parakeet] Using CPU device")
         
         if progress_callback:
             progress_callback("Downloading Parakeet model...")
         
-        # Load model from HuggingFace or local path
-        if model_path and os.path.exists(model_path):
-            # Load from local .nemo file
-            self._model = nemo_asr.models.ASRModel.restore_from(model_path, map_location=map_location)
+        # Check if model_path is an explicit .nemo file (user-specified local model)
+        # Otherwise, let NeMo handle downloading from HuggingFace
+        use_local_nemo = False
+        if model_path:
+            print(f"[Parakeet] Checking model_path: {model_path}")
+            # Only use local path if it's explicitly a .nemo file
+            if model_path.endswith('.nemo') and os.path.isfile(model_path):
+                use_local_nemo = True
+                print(f"[Parakeet] Using local .nemo file: {model_path}")
+            # Or if it contains a .nemo file directly
+            elif os.path.isdir(model_path):
+                try:
+                    nemo_files = [f for f in os.listdir(model_path) if f.endswith('.nemo')]
+                    print(f"[Parakeet] Found .nemo files in dir: {nemo_files}")
+                    if nemo_files:
+                        model_path = os.path.join(model_path, nemo_files[0])
+                        use_local_nemo = True
+                        print(f"[Parakeet] Using local .nemo file: {model_path}")
+                except Exception as e:
+                    print(f"[Parakeet] Error scanning model_path: {e}")
+            else:
+                print(f"[Parakeet] model_path exists but is not .nemo file or dir with .nemo")
         else:
-            # Download from HuggingFace
+            print(f"[Parakeet] No model_path provided, will download from HuggingFace")
+        
+        print(f"[Parakeet] use_local_nemo: {use_local_nemo}")
+        
+        if use_local_nemo:
+            # Load from local .nemo file
+            print(f"[Parakeet] Loading from local .nemo file: {model_path}")
+            self._model = nemo_asr.models.ASRModel.restore_from(
+                model_path, 
+                map_location=map_location
+            )
+        else:
+            # Download from HuggingFace using NeMo's native mechanism
+            print(f"[Parakeet] Loading from HuggingFace: {model_id}")
+            print(f"[Parakeet] Calling ASRModel.from_pretrained(model_name='{model_id}', map_location='{map_location}')")
             self._model = nemo_asr.models.ASRModel.from_pretrained(
                 model_name=model_id,
                 map_location=map_location
             )
+            print(f"[Parakeet] Model loaded from HuggingFace successfully")
         
         # Move to appropriate device
+        print(f"[Parakeet] Moving model to device: {device}")
         if device == "cuda":
             self._model = self._model.cuda()
         else:
             self._model = self._model.cpu()
         
         # Set to evaluation mode
+        print(f"[Parakeet] Setting model to eval mode")
         self._model.eval()
         
         # Enable half-precision if requested and on CUDA
         if device == "cuda" and compute_type == "float16":
+            print(f"[Parakeet] Converting to half precision (float16)")
             self._model = self._model.half()
         
         self._current_model_key = model_key
         self._current_device = device
         
+        print(f"[Parakeet] Model loading complete!")
         if progress_callback:
             progress_callback("Parakeet model loaded!")
     
@@ -145,12 +211,33 @@ class ParakeetBackend(WhisperBackend):
         beam_size: int = 5,
         vad_filter: bool = True
     ) -> List[TranscriptionSegment]:
-        """Transcribe audio using Parakeet/NeMo."""
+        """Transcribe audio using Parakeet/NeMo.
+        
+        Note: beam_size and vad_filter are accepted for API compatibility with
+        other backends but are not used by NeMo's RNNT models.
+        """
+        print(f"[Parakeet] transcribe() called with audio_path: {audio_path}")
+        
         if not self._model:
             raise RuntimeError("No model loaded. Call load_model() first.")
         
-        # NeMo transcribe method expects a list of audio files
-        output = self._model.transcribe([audio_path], timestamps=True)
+        import os
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        
+        print(f"[Parakeet] Audio file exists, size: {os.path.getsize(audio_path)} bytes")
+        
+        # NeMo's TDT/RNNT models use a simpler transcribe API
+        # They don't support beam_size - that's for CTC models
+        print(f"[Parakeet] Calling model.transcribe() with timestamps=True")
+        try:
+            output = self._model.transcribe([audio_path], timestamps=True)
+            print(f"[Parakeet] Transcription returned: {type(output)}")
+        except TypeError as e:
+            # If timestamps parameter is not supported, try without it
+            print(f"[Parakeet] timestamps parameter failed: {e}, trying without")
+            output = self._model.transcribe([audio_path])
+            print(f"[Parakeet] Transcription returned: {type(output)}")
         
         # Extract segments from the output
         result = []
@@ -159,9 +246,12 @@ class ParakeetBackend(WhisperBackend):
         # output[0] contains the transcription result for the first file
         if output and len(output) > 0:
             transcription = output[0]
+            print(f"[Parakeet] Transcription type: {type(transcription)}")
+            print(f"[Parakeet] Transcription value: {transcription}")
             
             # Check if we have segment-level timestamps
             if hasattr(transcription, 'timestamp') and transcription.timestamp:
+                print(f"[Parakeet] Has timestamps: {transcription.timestamp}")
                 segments = transcription.timestamp.get('segment', [])
                 for seg in segments:
                     result.append(TranscriptionSegment(
@@ -169,15 +259,26 @@ class ParakeetBackend(WhisperBackend):
                         start=seg.get('start', 0.0),
                         end=seg.get('end', 0.0)
                     ))
-            else:
-                # Fallback: create a single segment with the full text
-                text = transcription.text if hasattr(transcription, 'text') else str(transcription)
+            elif hasattr(transcription, 'text'):
+                # Has text attribute
+                text = transcription.text.strip()
+                print(f"[Parakeet] Using text attribute: {text}")
                 result.append(TranscriptionSegment(
-                    text=text.strip(),
+                    text=text,
+                    start=0.0,
+                    end=0.0
+                ))
+            else:
+                # Fallback: treat as string
+                text = str(transcription).strip()
+                print(f"[Parakeet] Using str() fallback: {text}")
+                result.append(TranscriptionSegment(
+                    text=text,
                     start=0.0,
                     end=0.0
                 ))
         
+        print(f"[Parakeet] Returning {len(result)} segments")
         return result
     
     def transcribe_array(

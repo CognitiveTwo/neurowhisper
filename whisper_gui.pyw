@@ -1897,10 +1897,15 @@ Troubleshooting:
             audio_np = np.concatenate(self.live_backup_buffer, axis=0).flatten()
             wav.write("temp_live_backup.wav", 16000, audio_np)
             if not self.model: return
-            segments, _ = self.model.transcribe(
-                "temp_live_backup.wav", beam_size=5, vad_filter=True, condition_on_previous_text=True 
-            )
-            text = " ".join([s.text for s in segments]).strip()
+            # Use backend abstraction if available
+            if self.backend and hasattr(self.backend, 'transcribe'):
+                segments = self.backend.transcribe("temp_live_backup.wav")
+                text = " ".join([s.text for s in segments]).strip()
+            else:
+                segments, _ = self.model.transcribe(
+                    "temp_live_backup.wav", beam_size=5, vad_filter=True, condition_on_previous_text=True 
+                )
+                text = " ".join([s.text for s in segments]).strip()
             if text:
                 self.result_queue.put(f"[BACKUP] {text}")
                 self.root.clipboard_clear()
@@ -2106,8 +2111,13 @@ Troubleshooting:
             # Track transcription latency
             start_time = time.perf_counter()
             
-            segments, _ = self.model.transcribe("temp_live.wav", beam_size=1, vad_filter=True)
-            text = "".join([s.text for s in segments]).strip()
+            # Use backend abstraction if available
+            if self.backend and hasattr(self.backend, 'transcribe'):
+                segments = self.backend.transcribe("temp_live.wav")
+                text = "".join([s.text for s in segments]).strip()
+            else:
+                segments, _ = self.model.transcribe("temp_live.wav", beam_size=1, vad_filter=True)
+                text = "".join([s.text for s in segments]).strip()
             
             # Calculate and record latency
             latency_ms = (time.perf_counter() - start_time) * 1000
@@ -2174,10 +2184,15 @@ Troubleshooting:
             # Track transcription latency
             start_time = time.perf_counter()
             
-            segments, _ = self.model.transcribe(
-                temp_file, beam_size=5, vad_filter=True
-            )
-            text = " ".join([s.text for s in segments]).strip()
+            # Use backend abstraction if available
+            if self.backend and hasattr(self.backend, 'transcribe'):
+                segments = self.backend.transcribe(temp_file)
+                text = " ".join([s.text for s in segments]).strip()
+            else:
+                segments, _ = self.model.transcribe(
+                    temp_file, beam_size=5, vad_filter=True
+                )
+                text = " ".join([s.text for s in segments]).strip()
             
             # Calculate latency
             latency_ms = (time.perf_counter() - start_time) * 1000
@@ -2885,10 +2900,24 @@ Troubleshooting:
             device = self.config.get('device', 'auto')
             compute_type = self.config.get('compute_type', 'auto')
             
+            # Check if this is a Parakeet model - requires Parakeet backend
+            is_parakeet_model = 'parakeet' in model_id.lower() or 'nvidia/parakeet' in model_id.lower()
+            
             # Use backend abstraction if available
             if BACKENDS_AVAILABLE and backend_name != 'legacy':
-                # Auto-detect best backend if needed
-                if backend_name == 'auto' or device == 'auto':
+                # Force Parakeet backend for Parakeet models
+                if is_parakeet_model:
+                    backend_name = 'parakeet'
+                    self.log_internal(f"[Parakeet model detected] Using Parakeet backend")
+                    # Parakeet works best with CUDA
+                    if device == 'auto':
+                        try:
+                            import torch
+                            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                        except ImportError:
+                            device = 'cpu'
+                # Auto-detect best backend if needed (for non-Parakeet models)
+                elif backend_name == 'auto' or device == 'auto':
                     detected_backend, detected_device, reason = detect_best_backend()
                     if backend_name == 'auto':
                         backend_name = detected_backend
@@ -2933,8 +2962,25 @@ Troubleshooting:
                     self.status_var.set(f"Ready [{backend_name} / {device}]")
                     return
                 except Exception as backend_error:
-                    # Backend failed - fall back to faster-whisper
+                    # Backend failed
                     self.log_internal(f"⚠️ {backend_name} failed: {backend_error}")
+                    
+                    # Don't fall back to faster-whisper for Parakeet models - they're incompatible
+                    if is_parakeet_model:
+                        error_msg = (
+                            f"Parakeet model requires NeMo to be installed.\n\n"
+                            f"Error: {backend_error}\n\n"
+                            f"To install NeMo, run:\n"
+                            f"pip install -r requirements-nemo.txt\n\n"
+                            f"Then restart the application."
+                        )
+                        self.log_internal("❌ Parakeet requires NeMo. Run: pip install -r requirements-nemo.txt")
+                        self.root.after(0, self._hide_progress)
+                        self.root.after(0, lambda: messagebox.showerror("NeMo Required", error_msg))
+                        self.status_var.set("Error: NeMo not installed")
+                        return
+                    
+                    # For other backends, fall back to faster-whisper
                     self.log_internal("Falling back to faster-whisper (CPU)...")
                     self.root.after(0, self._hide_progress)
                     # Fall through to legacy code below
