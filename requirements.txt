@@ -3,7 +3,9 @@ faster-whisper==1.2.1
 ctranslate2==4.6.2
 sounddevice==0.5.3
 keyboard==0.13.5
+pynput>=1.7.6  # Mac-compatible keyboard alternative (used automatically on Mac)
 customtkinter==5.2.2
+
 numpy==2.3.5
 
 # For GPU acceleration (optional, will fall back to CPU if not available)

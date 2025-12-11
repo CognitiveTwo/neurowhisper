@@ -9,4 +9,4 @@ if not exist venv (
 )
 
 call venv\Scripts\activate.bat
-start "" py whisper_gui.pyw
+start "" venv\Scripts\pythonw.exe whisper_gui.pyw

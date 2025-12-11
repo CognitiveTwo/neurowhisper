@@ -78,7 +78,8 @@ MODEL_MAP = {
     "Distil-Multi (Good GPU, 6GB+ VRAM)": "bofenghuang/whisper-large-v3-distil-multi4-v0.2",
     "Medium (GPU or fast CPU, 4GB+ RAM)": "medium",
     "Small (CPU-friendly, 2GB+ RAM)": "small",
-    "Base (Minimal resources, quick)": "base"
+    "Base (Minimal resources, quick)": "base",
+    "Parakeet TDT 0.6B v3 (Multi-lang, 2GB+ VRAM)": "nvidia/parakeet-tdt-0.6b-v3"
 }
 MODEL_MAP_REVERSE = {v: k for k, v in MODEL_MAP.items()}
 
@@ -783,8 +784,8 @@ class WhisperApp:
         ttk.Label(r_backend, text="Acceleration:").pack(side="left")
         
         # Backend options: Auto detects best, or force specific
-        backend_options = ["Auto", "OpenVINO (Intel GPU)", "CUDA (NVIDIA GPU)", "CPU only"]
-        backend_map = {"Auto": "auto", "OpenVINO (Intel GPU)": "openvino", 
+        backend_options = ["Auto", "Parakeet (NVIDIA NeMo)", "OpenVINO (Intel GPU)", "CUDA (NVIDIA GPU)", "CPU only"]
+        backend_map = {"Auto": "auto", "Parakeet (NVIDIA NeMo)": "parakeet", "OpenVINO (Intel GPU)": "openvino", 
                        "CUDA (NVIDIA GPU)": "cuda", "CPU only": "faster-whisper"}
         self.backend_map_display = {v: k for k, v in backend_map.items()}
         
@@ -793,11 +794,11 @@ class WhisperApp:
         
         self.backend_var = tk.StringVar(value=current_backend_display)
         backend_combo = ttk.Combobox(r_backend, textvariable=self.backend_var, 
-                                      values=backend_options, width=20, state="readonly")
+                                      values=backend_options, width=22, state="readonly")
         backend_combo.pack(side="left", padx=5)
         backend_combo.bind("<<ComboboxSelected>>", self.on_backend_change)
         
-        self._create_tooltip(backend_combo, "Acceleration Mode:\\n• Auto: Detects best option\\n• OpenVINO: Intel GPU/NPU (your Intel Arc)\\n• CUDA: NVIDIA GPUs\\n• CPU only: Works everywhere")
+        self._create_tooltip(backend_combo, "Acceleration Mode:\n• Auto: Detects best option\n• Parakeet: NVIDIA NeMo (multi-lang)\n• OpenVINO: Intel GPU/NPU\n• CUDA: NVIDIA GPUs\n• CPU only: Works everywhere")
         
         # Show current detected backend
         self.backend_status_label = ttk.Label(r_backend, text="", foreground=COLOR_TEAL)

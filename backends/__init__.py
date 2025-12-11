@@ -1,7 +1,11 @@
 # Backends Package
 # Registry and factory for Whisper transcription backends
 
+import sys
 from typing import Dict, Type, Optional, List, Tuple
+
+# Platform detection
+IS_MAC = sys.platform == 'darwin'
 
 # Lazy imports to avoid loading unused dependencies
 _backends: Dict[str, Type] = {}
@@ -18,12 +22,14 @@ def _register_backends():
     from .faster_whisper_backend import FasterWhisperBackend
     _backends["faster-whisper"] = FasterWhisperBackend
     
-    # Try to register OpenVINO if available
-    try:
-        from .openvino_backend import OpenVINOBackend
-        _backends["openvino"] = OpenVINOBackend
-    except ImportError:
-        pass  # OpenVINO not installed
+    # Try to register OpenVINO if available (not supported on Mac)
+    if not IS_MAC:
+        try:
+            from .openvino_backend import OpenVINOBackend
+            _backends["openvino"] = OpenVINOBackend
+        except ImportError:
+            pass  # OpenVINO not installed
+
     
     # Try to register OpenAI if available
     try:
@@ -31,6 +37,13 @@ def _register_backends():
         _backends["openai"] = OpenAIBackend
     except ImportError:
         pass  # OpenAI not installed
+    
+    # Try to register Parakeet (NeMo) if available
+    try:
+        from .parakeet_backend import ParakeetBackend
+        _backends["parakeet"] = ParakeetBackend
+    except ImportError:
+        pass  # NeMo not installed
 
 
 def get_available_backends() -> List[Tuple[str, bool, str]]:
@@ -122,6 +135,7 @@ def get_backend_display_name(backend_name: str) -> str:
         "faster-whisper": "Faster Whisper (CPU/CUDA)",
         "openvino": "OpenVINO (Intel GPU)",
         "openai": "OpenAI Cloud (Online)",
+        "parakeet": "Parakeet TDT (NVIDIA NeMo)",
     }
     return names.get(backend_name, backend_name)
 
