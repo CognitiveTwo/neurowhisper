@@ -1,9 +1,13 @@
-# Set Windows App User Model ID for proper taskbar icon
-import ctypes
-try:
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('neuroflash.neurowhisper.1.0')
-except:
-    pass
+# Platform detection and cross-platform compatibility
+import sys
+
+# Set Windows App User Model ID for proper taskbar icon (Windows only)
+if sys.platform == 'win32':
+    import ctypes
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('neuroflash.neurowhisper.1.0')
+    except:
+        pass
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
@@ -11,7 +15,33 @@ import customtkinter as ctk
 import sounddevice as sd
 import numpy as np
 import scipy.io.wavfile as wav
-import keyboard
+
+# Platform abstraction layer for keyboard/sound/clipboard
+try:
+    from platform_utils import (
+        keyboard_module as keyboard,
+        play_system_sound,
+        play_feedback_sound_async,
+        paste_from_clipboard,
+        type_text,
+        get_paste_shortcut,
+        IS_MAC,
+        IS_WINDOWS,
+        PLATFORM_NAME
+    )
+    PLATFORM_UTILS_AVAILABLE = True
+except ImportError:
+    # Fallback to direct imports if platform_utils not available
+    import keyboard
+    IS_MAC = False
+    IS_WINDOWS = True
+    PLATFORM_NAME = 'windows'
+    PLATFORM_UTILS_AVAILABLE = False
+    try:
+        import winsound
+    except ImportError:
+        winsound = None
+
 from faster_whisper import WhisperModel
 
 # Backend abstraction layer
@@ -20,10 +50,10 @@ try:
     BACKENDS_AVAILABLE = True
 except ImportError:
     BACKENDS_AVAILABLE = False
+
 import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
-import sys
 import os
 import json
 import time
@@ -35,11 +65,6 @@ try:
     from huggingface_hub import snapshot_download
 except ImportError:
     snapshot_download = None
-
-try:
-    import winsound
-except ImportError:
-    winsound = None
 
 # --- CONFIGURATION ---
 CONFIG_FILE = "whisper_config.json"
@@ -211,6 +236,15 @@ class WhisperApp:
         self.batch_pending_audio = []      # Current audio buffer not yet segmented
         self.batch_silence_count = 0       # Silence detection counter
 
+        # Online Streaming Transcription (similar to batch but uses OpenAI API)
+        self.online_segments = []          # Ordered list of {seq, audio, result, status}
+        self.online_segment_lock = threading.Lock()
+        self.online_segment_seq = 0        # Sequence counter for ordering
+        self.online_executor = None        # ThreadPoolExecutor for parallel API calls
+        self.online_pending_audio = []     # Current audio buffer for online mode
+        self.online_silence_count = 0      # Silence detection counter for online
+        self.online_with_edit = False      # Whether current online session uses GPT editing
+
         # Latency tracking for performance metrics
         self.session_latencies = []  # List of latency values (ms) for this session
         self.total_latencies = self.stats.get('total_latencies', [])  # All-time latencies
@@ -280,10 +314,17 @@ class WhisperApp:
         widget.bind("<Leave>", hide_tooltip)
 
     def play_feedback_sound(self, start=True):
-        if winsound:
-            freq = 800 if start else 400
-            dur = 150
-            threading.Thread(target=winsound.Beep, args=(freq, dur), daemon=True).start()
+        # Use platform-aware sound function
+        if PLATFORM_UTILS_AVAILABLE:
+            play_feedback_sound_async(start=start)
+        elif IS_WINDOWS:
+            try:
+                freq = 800 if start else 400
+                dur = 150
+                threading.Thread(target=winsound.Beep, args=(freq, dur), daemon=True).start()
+            except:
+                pass
+
 
     def load_config(self):
         if os.path.exists(CONFIG_FILE):
@@ -564,24 +605,28 @@ class WhisperApp:
         self.vu_meter.pack(fill="x")
         self.vu_meter.set(0)
 
-        # --- STATISTICS DASHBOARD ---
+        # --- STATISTICS DASHBOARD (Two-Row Layout) ---
         stats_container = ctk.CTkFrame(self.root, fg_color=COLOR_BG, corner_radius=0)
         stats_container.pack(fill="x", padx=15, pady=5)
         
-        # --- TODAY'S STATISTICS ---
-        today_card = ctk.CTkFrame(stats_container, fg_color=COLOR_ACCENT_BG, 
-                                  corner_radius=12, border_width=1, border_color=COLOR_BORDER)
-        today_card.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        # --- ROW 1: TODAY'S STATS + TODAY'S HISTOGRAM ---
+        today_row = ctk.CTkFrame(stats_container, fg_color=COLOR_ACCENT_BG, 
+                                 corner_radius=12, border_width=1, border_color=COLOR_BORDER)
+        today_row.pack(fill="x", pady=(0, 5))
+        
+        # Today stats on left
+        today_card = ctk.CTkFrame(today_row, fg_color="transparent", corner_radius=0)
+        today_card.pack(side="left", fill="y", padx=(10, 0), pady=10)
         
         # Today header
         tk.Label(today_card, text="Today", bg=COLOR_ACCENT_BG, fg=COLOR_FG, 
                 font=("Arial", 11, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
         
         # Words stat
-        tk.Label(today_card, text="Words", bg=COLOR_ACCENT_BG, fg="#9ca3af", font=("Arial", 9)).grid(row=1, column=0, sticky="w", padx=(15, 20))
+        tk.Label(today_card, text="Words", bg=COLOR_ACCENT_BG, fg="#9ca3af", font=("Arial", 9)).grid(row=1, column=0, sticky="w", padx=(0, 15))
         self.lbl_session_words = tk.Label(today_card, text="0", bg=COLOR_ACCENT_BG, fg=COLOR_TEAL, 
                                           font=("Arial", 14, "bold"))
-        self.lbl_session_words.grid(row=2, column=0, sticky="w", padx=(15, 0))
+        self.lbl_session_words.grid(row=2, column=0, sticky="w")
         
         # Speaking time stat
         tk.Label(today_card, text="Speaking Time", bg=COLOR_ACCENT_BG, fg="#9ca3af", font=("Arial", 9)).grid(row=1, column=1, sticky="w")
@@ -590,10 +635,10 @@ class WhisperApp:
         self.lbl_session_duration.grid(row=2, column=1, sticky="w")
         
         # Saved stat
-        tk.Label(today_card, text="Saved", bg=COLOR_ACCENT_BG, fg="#9ca3af", font=("Arial", 9)).grid(row=3, column=0, sticky="w", pady=(8, 0), padx=(15, 20))
+        tk.Label(today_card, text="Saved", bg=COLOR_ACCENT_BG, fg="#9ca3af", font=("Arial", 9)).grid(row=3, column=0, sticky="w", pady=(8, 0), padx=(0, 15))
         self.lbl_session_time = tk.Label(today_card, text="0m", bg=COLOR_ACCENT_BG, fg=COLOR_TEAL, 
                                          font=("Arial", 14, "bold"))
-        self.lbl_session_time.grid(row=4, column=0, sticky="w", padx=(15, 0))
+        self.lbl_session_time.grid(row=4, column=0, sticky="w")
         
         # Speed stat
         tk.Label(today_card, text="Speed", bg=COLOR_ACCENT_BG, fg="#9ca3af", font=("Arial", 9)).grid(row=3, column=1, sticky="w", pady=(8, 0))
@@ -601,38 +646,32 @@ class WhisperApp:
                                           font=("Arial", 14, "bold"))
         self.lbl_session_speed.grid(row=4, column=1, sticky="w")
 
-        # --- HISTOGRAMS (between Today and All-Time) ---
-        histogram_container = tk.Frame(stats_container, bg=COLOR_BG)
-        histogram_container.pack(side="left", fill="both", expand=True, padx=5)
-        
-        # Today's histogram
-        self.histogram_canvas_today = tk.Canvas(histogram_container, height=100, bg=COLOR_ACCENT_BG, 
+        # Today's histogram on right
+        self.histogram_canvas_today = tk.Canvas(today_row, height=100, bg=COLOR_ACCENT_BG, 
                                                 highlightthickness=0)
-        self.histogram_canvas_today.pack(fill="both", expand=True, pady=(0, 2))
+        self.histogram_canvas_today.pack(side="left", fill="both", expand=True, padx=10, pady=10)
         
-        # All-Time histogram
-        self.histogram_canvas_alltime = tk.Canvas(histogram_container, height=100, bg=COLOR_ACCENT_BG, 
-                                                  highlightthickness=0)
-        self.histogram_canvas_alltime.pack(fill="both", expand=True, pady=(2, 0))
-        
-        # Store bar info for both canvases
+        # Store bar info for today
         self.histogram_bars_today = []
-        self.histogram_bars_alltime = []
         
-        # --- ALL-TIME STATISTICS ---
-        alltime_card = ctk.CTkFrame(stats_container, fg_color=COLOR_ACCENT_BG, 
-                                    corner_radius=12, border_width=1, border_color=COLOR_BORDER)
-        alltime_card.pack(side="left", fill="both", expand=True, padx=(5, 0))
+        # --- ROW 2: ALL-TIME STATS + ALL-TIME HISTOGRAM ---
+        alltime_row = ctk.CTkFrame(stats_container, fg_color=COLOR_ACCENT_BG, 
+                                   corner_radius=12, border_width=1, border_color=COLOR_BORDER)
+        alltime_row.pack(fill="x")
+        
+        # All-Time stats on left
+        alltime_card = ctk.CTkFrame(alltime_row, fg_color="transparent", corner_radius=0)
+        alltime_card.pack(side="left", fill="y", padx=(10, 0), pady=10)
         
         # All-Time header
         tk.Label(alltime_card, text="All-Time", bg=COLOR_ACCENT_BG, fg=COLOR_FG, 
                 font=("Arial", 11, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
         
         # Words stat
-        tk.Label(alltime_card, text="Words", bg=COLOR_ACCENT_BG, fg="#9ca3af", font=("Arial", 9)).grid(row=1, column=0, sticky="w", padx=(15, 20))
+        tk.Label(alltime_card, text="Words", bg=COLOR_ACCENT_BG, fg="#9ca3af", font=("Arial", 9)).grid(row=1, column=0, sticky="w", padx=(0, 15))
         self.lbl_alltime_words = tk.Label(alltime_card, text="0", bg=COLOR_ACCENT_BG, fg=COLOR_TEAL, 
                                           font=("Arial", 14, "bold"))
-        self.lbl_alltime_words.grid(row=2, column=0, sticky="w", padx=(15, 0))
+        self.lbl_alltime_words.grid(row=2, column=0, sticky="w")
         
         # Speaking time stat
         tk.Label(alltime_card, text="Speaking Time", bg=COLOR_ACCENT_BG, fg="#9ca3af", font=("Arial", 9)).grid(row=1, column=1, sticky="w")
@@ -641,16 +680,24 @@ class WhisperApp:
         self.lbl_alltime_duration.grid(row=2, column=1, sticky="w")
         
         # Saved stat
-        tk.Label(alltime_card, text="Saved", bg=COLOR_ACCENT_BG, fg="#9ca3af", font=("Arial", 9)).grid(row=3, column=0, sticky="w", pady=(8, 0), padx=(15, 20))
+        tk.Label(alltime_card, text="Saved", bg=COLOR_ACCENT_BG, fg="#9ca3af", font=("Arial", 9)).grid(row=3, column=0, sticky="w", pady=(8, 0), padx=(0, 15))
         self.lbl_alltime_time = tk.Label(alltime_card, text="0m", bg=COLOR_ACCENT_BG, fg=COLOR_TEAL, 
                                          font=("Arial", 14, "bold"))
-        self.lbl_alltime_time.grid(row=4, column=0, sticky="w", padx=(15, 0))
+        self.lbl_alltime_time.grid(row=4, column=0, sticky="w")
         
         # Speed stat
         tk.Label(alltime_card, text="Speed", bg=COLOR_ACCENT_BG, fg="#9ca3af", font=("Arial", 9)).grid(row=3, column=1, sticky="w", pady=(8, 0))
         self.lbl_alltime_speed = tk.Label(alltime_card, text="0 WPM", bg=COLOR_ACCENT_BG, fg=COLOR_TEAL, 
                                           font=("Arial", 14, "bold"))
         self.lbl_alltime_speed.grid(row=4, column=1, sticky="w")
+
+        # All-Time histogram on right
+        self.histogram_canvas_alltime = tk.Canvas(alltime_row, height=100, bg=COLOR_ACCENT_BG, 
+                                                  highlightthickness=0)
+        self.histogram_canvas_alltime.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+        
+        # Store bar info for all-time
+        self.histogram_bars_alltime = []
 
 
         # --- COLLAPSIBLE SETTINGS ---
@@ -1104,8 +1151,8 @@ Troubleshooting:
             # Start recording
             self._start_online_recording(with_edit=False)
         else:
-            # Already in another mode
-            self.msg_queue.put("Stop current recording first")
+            # Already in another mode - stop it (any key = stop)
+            self._stop_any_recording()
 
     def toggle_online_transcribe_edit(self):
         """Toggle online transcription with GPT editing."""
@@ -1116,127 +1163,208 @@ Troubleshooting:
             # Start recording
             self._start_online_recording(with_edit=True)
         else:
-            # Already in another mode
-            self.msg_queue.put("Stop current recording first")
+            # Already in another mode - stop it (any key = stop)
+            self._stop_any_recording()
 
     def _start_online_recording(self, with_edit=False):
-        """Start recording for online transcription."""
+        """Start recording for online transcription with streaming segments."""
         mode_name = 'online_transcribe_edit' if with_edit else 'online_transcribe'
         self.mode = mode_name
-        self.batch_audio = []  # Reuse batch audio buffer
+        self.online_with_edit = with_edit
+        
+        # Reset streaming state
+        self.online_segments = []
+        self.online_segment_seq = 0
+        self.online_pending_audio = []
+        self.online_silence_count = 0
+        
+        # Create thread pool for parallel API calls (2 workers for API rate limits)
+        from concurrent.futures import ThreadPoolExecutor
+        self.online_executor = ThreadPoolExecutor(max_workers=2)
         
         # Update UI
         btn = self.btn_transcribe_edit if with_edit else self.btn_transcribe
         btn.configure(fg_color=COLOR_ONLINE, text_color=COLOR_FG)
         
         self.play_feedback_sound(start=True)
-        self.status_var.set(f"Recording for online transcription{' + edit' if with_edit else ''}...")
-        self.msg_queue.put(f"Recording started (online mode)")
+        self.status_var.set(f"🎤 Recording{' + GPT edit' if with_edit else ''}...")
+        self.msg_queue.put(f"Recording started (online streaming mode)")
+
+    def _queue_online_segment(self):
+        """Queue current pending audio for background OpenAI transcription."""
+        with self.online_segment_lock:
+            if not self.online_pending_audio:
+                return
+            
+            seq = self.online_segment_seq
+            self.online_segment_seq += 1
+            audio_data = self.online_pending_audio.copy()
+            
+            segment = {
+                'seq': seq,
+                'audio': audio_data,
+                'result': None,
+                'status': 'pending'
+            }
+            self.online_segments.append(segment)
+            self.online_pending_audio = []
+            self.online_silence_count = 0
+        
+        # Submit to thread pool
+        if self.online_executor:
+            self.online_executor.submit(self._transcribe_online_segment, seq)
+        
+        self.log_internal(f"☁️ Queued segment {seq + 1} for OpenAI")
+
+    def _transcribe_online_segment(self, seq):
+        """Transcribe a single segment using OpenAI API (runs in thread pool)."""
+        segment = None
+        with self.online_segment_lock:
+            for s in self.online_segments:
+                if s['seq'] == seq:
+                    segment = s
+                    s['status'] = 'transcribing'
+                    break
+        
+        if not segment:
+            return
+        
+        try:
+            from backends.openai_backend import OpenAIBackend
+            
+            # Write segment to temp file
+            audio_np = np.concatenate(segment['audio'], axis=0).flatten()
+            temp_file = f"temp_online_seg_{seq}.wav"
+            wav.write(temp_file, 16000, (audio_np * 32767).astype(np.int16))
+            
+            backend = OpenAIBackend()
+            backend.configure(
+                api_key=self.config.get('openai_api_key', ''),
+                transcription_model=self.config.get('openai_transcription_model', 'whisper-1'),
+                edit_model=self.config.get('openai_edit_model', 'gpt-4o-mini'),
+                edit_prompt=self.config.get('openai_edit_prompt', '') or None,
+                language=self.config.get('openai_language', 'auto')
+            )
+            
+            start_time = time.time()
+            
+            if self.online_with_edit:
+                _, edited_text = backend.transcribe_and_edit(temp_file)
+                text = edited_text
+            else:
+                segments = backend.transcribe(temp_file)
+                text = " ".join(seg.text for seg in segments).strip()
+            
+            latency = (time.time() - start_time) * 1000
+            
+            with self.online_segment_lock:
+                segment['result'] = text
+                segment['status'] = 'done'
+                segment['latency'] = latency
+            
+            self.log_internal(f"☁️ Segment {seq + 1} done ({latency:.0f}ms)")
+            
+            # Clean up temp file
+            try:
+                os.remove(temp_file)
+            except:
+                pass
+                
+        except Exception as e:
+            with self.online_segment_lock:
+                segment['status'] = 'error'
+                segment['result'] = ''
+            self.log_internal(f"☁️ Segment {seq + 1} error: {e}")
 
     def _stop_online_recording(self, with_edit=False):
-        """Stop recording and send to OpenAI."""
-        if not self.batch_audio:
+        """Stop recording, process final segment, and combine all results."""
+        self.play_feedback_sound(start=False)
+        
+        # Queue any remaining audio
+        if self.online_pending_audio:
+            self._queue_online_segment()
+        
+        # Check if we have any segments
+        if not self.online_segments:
             self.mode = None
             self._reset_online_buttons()
             return
         
-        self.play_feedback_sound(start=False)
-        
-        # Save audio to temp file
-        audio_data = np.concatenate(self.batch_audio)
-        temp_file = "temp_online.wav"
-        wav.write(temp_file, 16000, (audio_data * 32767).astype(np.int16))
-        
         self.mode = None
         
-        # Show TRANSCRIBING state (amber)
-        if with_edit:
-            self.btn_transcribe_edit.configure(fg_color=COLOR_TRANSCRIBING, text_color="white", text="⏳ Transcribing...")
-        else:
-            self.btn_transcribe.configure(fg_color=COLOR_TRANSCRIBING, text_color="white", text="⏳ Transcribing...")
-        self.status_var.set("⏳ Sending to OpenAI...")
+        # Show TRANSCRIBING state
+        btn = self.btn_transcribe_edit if with_edit else self.btn_transcribe
+        btn.configure(fg_color=COLOR_TRANSCRIBING, text_color="white", text="⏳ Finishing...")
+        self.status_var.set("⏳ Waiting for transcriptions...")
         self.update_mini_window_color(COLOR_TRANSCRIBING)
         
-        # Process in background thread
-        def process_online():
+        # Wait for all segments to complete in background
+        def wait_and_combine():
             try:
-                from backends.openai_backend import OpenAIBackend
+                # Wait for executor to finish
+                if self.online_executor:
+                    self.online_executor.shutdown(wait=True)
+                    self.online_executor = None
                 
-                backend = OpenAIBackend()
-                backend.configure(
-                    api_key=self.config.get('openai_api_key', ''),
-                    transcription_model=self.config.get('openai_transcription_model', 'whisper-1'),
-                    edit_model=self.config.get('openai_edit_model', 'gpt-4o-mini'),
-                    edit_prompt=self.config.get('openai_edit_prompt', '') or None,
-                    language=self.config.get('openai_language', 'auto')
-                )
+                # Combine results in order
+                with self.online_segment_lock:
+                    results = []
+                    total_latency = 0
+                    total_audio_duration = 0
+                    for seg in sorted(self.online_segments, key=lambda x: x['seq']):
+                        if seg['result']:
+                            results.append(seg['result'])
+                        total_latency += seg.get('latency', 0)
+                        # Calculate audio duration from segment
+                        if seg['audio']:
+                            total_audio_duration += len(seg['audio']) * 0.1
                 
-                start_time = time.time()
-                
-                if with_edit:
-                    raw_text, edited_text = backend.transcribe_and_edit(temp_file)
-                    result_text = edited_text
-                    self.msg_queue.put(f"Raw: {raw_text[:50]}..." if len(raw_text) > 50 else f"Raw: {raw_text}")
-                else:
-                    segments = backend.transcribe(temp_file)
-                    result_text = " ".join(seg.text for seg in segments).strip()
-                
-                latency = (time.time() - start_time) * 1000
+                result_text = " ".join(results).strip()
                 
                 if result_text:
-                    # Type the result
-                    keyboard.write(result_text)
+                    # Copy to clipboard and paste
+                    def do_paste():
+                        self.root.clipboard_clear()
+                        self.root.clipboard_append(result_text)
+                        self.root.update()
+                        keyboard.send('ctrl+v')
+                    self.root.after(0, do_paste)
                     
                     # Update stats
                     word_count = len(result_text.split())
-                    audio_duration = len(audio_data) / 16000
                     
                     self.today_words += word_count
-                    self.today_audio_duration += audio_duration
+                    self.today_audio_duration += total_audio_duration
                     self.total_words += word_count
-                    self.total_audio_duration += audio_duration
+                    self.total_audio_duration += total_audio_duration
                     self.record_hourly_words(word_count)
                     self.save_stats()
                     
                     # Save to history
-                    self.save_transcription(result_text, latency)
+                    self.save_transcription(result_text, total_latency)
                     
-                    self.msg_queue.put(f"Transcribed {word_count} words ({latency:.0f}ms)")
+                    num_segments = len(self.online_segments)
+                    self.msg_queue.put(f"☁️ Transcribed {word_count} words from {num_segments} segments ({total_latency:.0f}ms total)")
                     
-                    # Show READY state (green)
+                    # Show READY state
                     def show_ready():
                         if with_edit:
                             self.btn_transcribe_edit.configure(fg_color=COLOR_READY, text_color="white", text="✓ Done!")
                         else:
                             self.btn_transcribe.configure(fg_color=COLOR_READY, text_color="white", text="✓ Done!")
-                        self.status_var.set("✅ Transcribed!")
+                        self.status_var.set("✅ Copied & Pasted!")
                         self.update_mini_window_color(COLOR_READY)
-                        # Reset after 2 seconds
                         self.root.after(2000, self._reset_online_buttons)
                     self.root.after(0, show_ready)
                 else:
                     self.msg_queue.put("No transcription result")
                     self.root.after(0, self._reset_online_buttons)
-                    self.root.after(0, lambda: self.status_var.set("Ready"))
                     
-            except ImportError as e:
-                self.msg_queue.put(f"OpenAI library not installed: {e}")
-                self.root.after(0, self._reset_online_buttons)
-                self.root.after(0, lambda: self.status_var.set("Error: OpenAI not installed"))
             except Exception as e:
                 self.msg_queue.put(f"Online transcription failed: {e}")
                 self.root.after(0, self._reset_online_buttons)
-                self.root.after(0, lambda: self.status_var.set("Error"))
-            finally:
-                # Clean up temp file
-                if os.path.exists(temp_file):
-                    try:
-                        os.remove(temp_file)
-                    except:
-                        pass
         
-        threading.Thread(target=process_online, daemon=True).start()
-        self.batch_audio = []
+        threading.Thread(target=wait_and_combine, daemon=True).start()
 
     def _reset_online_buttons(self):
         """Reset online mode button colors and text."""
@@ -1574,7 +1702,8 @@ Troubleshooting:
         if self.stopping: return
 
         if self.mode == "batch": 
-            self.log_internal("⚠️ Cannot start Live mode while Batch recording.")
+            # Stop batch mode instead of blocking (any key = stop)
+            self._stop_any_recording()
             return
 
         if self.mode == "live":
@@ -1629,12 +1758,26 @@ Troubleshooting:
         self.btn_live.configure(fg_color=COLOR_ACCENT_BG, text_color="#888888", text=f"LIVE    {live_hk}")
         self.update_mini_window_color(COLOR_IDLE)
 
+    def _stop_any_recording(self):
+        """Stop any active recording mode (unified stop behavior)."""
+        if self.stopping:
+            return
+        if self.mode == "live":
+            self.toggle_live_mode()  # Will trigger stop
+        elif self.mode == "batch":
+            self.toggle_batch_mode()  # Will trigger stop
+        elif self.mode == 'online_transcribe':
+            self._stop_online_recording(with_edit=False)
+        elif self.mode == 'online_transcribe_edit':
+            self._stop_online_recording(with_edit=True)
+
     def toggle_batch_mode(self):
         """F8 Toggled"""
         if self.stopping: return
 
         if self.mode == "live":
-            self.log_internal("⚠️ Cannot start Batch mode while Live recording.")
+            # Stop live mode instead of blocking (any key = stop)
+            self._stop_any_recording()
             return
 
         if self.mode == "batch":
@@ -1727,7 +1870,9 @@ Troubleshooting:
                 self.root.update()
                 
                 # Auto-paste
-                keyboard.send('ctrl+v')
+                # Platform-aware paste (Cmd+V on Mac, Ctrl+V on Windows)
+            paste_key = get_paste_shortcut() if PLATFORM_UTILS_AVAILABLE else 'ctrl+v'
+            keyboard.send(paste_key)
                 
                 # Return to idle after a delay
                 self.root.after(2000, self._reset_buttons_to_idle)
@@ -1883,8 +2028,33 @@ Troubleshooting:
                     if (is_natural_break or is_max_duration) and not self.stopping:
                         self._queue_batch_segment()
                 elif self.mode in ("online_transcribe", "online_transcribe_edit"):
-                    # Online mode: capture audio to batch_audio buffer for sending to OpenAI
-                    self.batch_audio.append(data)
+                    # Online mode: streaming transcription with pause detection
+                    self.online_pending_audio.append(data)
+                    online_pending_duration = len(self.online_pending_audio) * 0.1  # ~100ms per chunk
+                    
+                    # Check for silence
+                    if raw_amp < self.config['silence_threshold']:
+                        self.online_silence_count += 1
+                    else:
+                        self.online_silence_count = 0
+                    
+                    online_silence_duration = self.online_silence_count * 0.1
+                    
+                    # Same progressive threshold as batch: ~20s target segments
+                    if online_pending_duration < 10.0:
+                        online_pause_threshold = 2.0
+                    elif online_pending_duration < 20.0:
+                        progress = (online_pending_duration - 10.0) / 10.0
+                        online_pause_threshold = 2.0 - (0.5 * progress)
+                    else:
+                        online_pause_threshold = 1.5
+                    
+                    is_natural_break = online_silence_duration > online_pause_threshold and online_pending_duration > 10.0
+                    is_max_duration = online_pending_duration > 60.0
+                    
+                    # Queue segment when pause or max duration
+                    if (is_natural_break or is_max_duration) and not self.stopping:
+                        self._queue_online_segment()
                 elif self.mode == "live":
                     with self.live_buffer_lock:
                         self.live_buffer.append(data)
@@ -2381,14 +2551,15 @@ Troubleshooting:
         width = canvas.winfo_width() or 200
         height = canvas.winfo_height() or 100
         
-        hours = list(range(6, 24))  # 6am to midnight
+        # Use same hour range as today histogram for alignment (6am to 10pm)
+        hours = list(range(6, 23))  # 6am to 10pm (matching today)
         num_bars = len(hours)
         
-        # Minimal padding for cleaner look
+        # Padding - extra space at bottom for hour labels
         left_padding = 8
         right_padding = 8
         top_padding = 8
-        bottom_padding = 8
+        bottom_padding = 18  # Extra space for hour labels
         
         bar_area_width = width - left_padding - right_padding
         bar_area_height = height - top_padding - bottom_padding
@@ -2449,6 +2620,13 @@ Troubleshooting:
                     'avg': avg, 'std': std, 'count': stat['count'], 'max_val': max_val,
                     'x1': x, 'y1': y_top, 'x2': x + bar_width, 'y2': y_bottom
                 })
+        
+        # Draw hour labels at bottom (every 4 hours: 6, 10, 14, 18, 22)
+        for i, hour in enumerate(hours):
+            if hour % 4 == 2 or hour == 6 or hour == 22:  # Show 6, 10, 14, 18, 22
+                x = left_padding + i * bar_spacing + bar_spacing / 2
+                canvas.create_text(x, height - 2, text=str(hour), 
+                                  fill="#888888", font=("Arial", 7), anchor="s")
         
         # Bind hover for stats tooltip
         canvas.bind("<Motion>", self._on_alltime_hist_hover)
