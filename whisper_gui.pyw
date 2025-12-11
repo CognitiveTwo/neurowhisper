@@ -1327,8 +1327,11 @@ Troubleshooting:
                         self.root.clipboard_clear()
                         self.root.clipboard_append(result_text)
                         self.root.update()
-                        keyboard.send('ctrl+v')
+                        # Platform-aware paste (Cmd+V on Mac, Ctrl+V on Windows)
+                        paste_key = get_paste_shortcut() if PLATFORM_UTILS_AVAILABLE else 'ctrl+v'
+                        keyboard.send(paste_key)
                     self.root.after(0, do_paste)
+
                     
                     # Update stats
                     word_count = len(result_text.split())
@@ -1871,8 +1874,8 @@ Troubleshooting:
                 
                 # Auto-paste
                 # Platform-aware paste (Cmd+V on Mac, Ctrl+V on Windows)
-            paste_key = get_paste_shortcut() if PLATFORM_UTILS_AVAILABLE else 'ctrl+v'
-            keyboard.send(paste_key)
+                paste_key = get_paste_shortcut() if PLATFORM_UTILS_AVAILABLE else 'ctrl+v'
+                keyboard.send(paste_key)
                 
                 # Return to idle after a delay
                 self.root.after(2000, self._reset_buttons_to_idle)
@@ -2117,6 +2120,7 @@ Troubleshooting:
             self.log_internal(f"🎤 LIVE ⚡{latency_ms:.0f}ms")
             self.last_transcription_latency = latency_ms  # Store for display
             self.result_queue.put(f"[LIVE] {text}")
+            # Type the text directly (uses platform-aware keyboard module)
             keyboard.write(text + " ")
         except Exception as e:
             self.log_internal(f"Transcription error: {e}")
@@ -2207,6 +2211,108 @@ Troubleshooting:
         
         if total > 0:
             progress_text = f"🔵 BATCH ({done}/{total} chunks)"
+            self.status_var.set(progress_text)
+
+    def _queue_online_segment(self):
+        """Queue current pending audio for background OpenAI transcription"""
+        with self.online_segment_lock:
+            if not self.online_pending_audio:
+                return
+            
+            seq = self.online_segment_seq
+            self.online_segment_seq += 1
+            audio_data = self.online_pending_audio.copy()
+            
+            segment = {
+                'seq': seq,
+                'audio': audio_data,
+                'result': None,
+                'status': 'pending',
+                'latency': 0
+            }
+            self.online_segments.append(segment)
+            self.online_pending_audio = []
+            self.online_silence_count = 0
+        
+        # Submit to thread pool (created on online start)
+        if self.online_executor:
+            self.online_executor.submit(self._transcribe_online_segment, seq)
+        
+        self._update_online_progress()
+        self.log_internal(f"📦 Queued online segment {seq + 1}")
+
+    def _transcribe_online_segment(self, seq):
+        """Transcribe a single segment via OpenAI API (runs in thread pool)"""
+        segment = None
+        with self.online_segment_lock:
+            for s in self.online_segments:
+                if s['seq'] == seq:
+                    segment = s
+                    s['status'] = 'transcribing'
+                    break
+        
+        if not segment:
+            return
+        
+        try:
+            # Concatenate audio and save to temp file
+            audio_np = np.concatenate(segment['audio'], axis=0).flatten()
+            temp_file = f"temp_online_seg_{seq}.wav"
+            wav.write(temp_file, 16000, (audio_np * 32767).astype(np.int16))
+            
+            # Track transcription latency
+            start_time = time.perf_counter()
+            
+            from backends.openai_backend import OpenAIBackend
+            
+            backend = OpenAIBackend()
+            backend.configure(
+                api_key=self.config.get('openai_api_key', ''),
+                transcription_model=self.config.get('openai_transcription_model', 'whisper-1'),
+                edit_model=self.config.get('openai_edit_model', 'gpt-4o-mini'),
+                edit_prompt=self.config.get('openai_edit_prompt', '') or None,
+                language=self.config.get('openai_language', 'auto')
+            )
+            
+            if self.online_with_edit:
+                raw_text, edited_text = backend.transcribe_and_edit(temp_file)
+                text = edited_text
+            else:
+                segments_result = backend.transcribe(temp_file)
+                text = " ".join(seg.text for seg in segments_result).strip()
+            
+            # Calculate latency
+            latency_ms = (time.perf_counter() - start_time) * 1000
+            
+            with self.online_segment_lock:
+                segment['result'] = text
+                segment['status'] = 'done'
+                segment['latency'] = latency_ms
+            
+            # Cleanup temp file
+            try:
+                os.remove(temp_file)
+            except:
+                pass
+            
+            self.log_internal(f"✅ Online segment {seq + 1} ⚡{latency_ms:.0f}ms")
+            
+        except Exception as e:
+            with self.online_segment_lock:
+                segment['status'] = 'error'
+                segment['result'] = f"[Error: {e}]"
+            self.log_internal(f"❌ Online segment {seq + 1} error: {e}")
+        
+        self._update_online_progress()
+
+    def _update_online_progress(self):
+        """Update UI with online transcription progress"""
+        with self.online_segment_lock:
+            total = len(self.online_segments)
+            done = sum(1 for s in self.online_segments if s['status'] == 'done')
+        
+        if total > 0:
+            progress_text = f"☁️ ONLINE ({done}/{total} chunks)"
             self.status_var.set(progress_text)
 
     def _show_progress(self, label_text="Loading..."):
