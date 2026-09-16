@@ -1,5 +1,7 @@
 # neurowhisper
 
+[![CI](https://github.com/CognitiveTwo/neurowhisper/actions/workflows/ci.yml/badge.svg)](https://github.com/CognitiveTwo/neurowhisper/actions/workflows/ci.yml)
+
 A local voice-dictation app for the desktop. Hold a hotkey, speak, and the text is
 typed into whatever window you were already in — your editor, your browser, your
 chat client. Transcription runs on your own machine with
@@ -124,6 +126,17 @@ Transcription on an NVIDIA GPU is several times faster than on CPU.
    driver is too old.
 
 The DLLs are large (~1.8 GB) and are deliberately not part of this repository.
+
+**Other backends.** Intel GPUs can run the model through OpenVINO, and NVIDIA
+GPUs can alternatively use the Parakeet TDT model via NVIDIA NeMo. Both are
+optional and need extra packages installed into the app's virtual environment:
+
+```bash
+pip install -r requirements-openvino.txt   # Intel GPU (OpenVINO)
+pip install -r requirements-nemo.txt       # Parakeet TDT (NeMo, NVIDIA GPU)
+```
+
+Then pick the backend in the app's Configuration section.
 
 ## Optional: OpenAI cloud transcription
 
