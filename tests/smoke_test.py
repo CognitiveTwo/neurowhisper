@@ -142,9 +142,13 @@ def install_stubs():
 def load_whisper_gui(app_dir):
     """Import whisper_gui.pyw as a module (the .pyw suffix blocks plain import)."""
     import importlib.util
+    from importlib.machinery import SourceFileLoader
 
     path = os.path.join(app_dir, "whisper_gui.pyw")
-    spec = importlib.util.spec_from_file_location("whisper_gui", path)
+    # On Linux/macOS ".pyw" is not a registered source suffix, so an explicit
+    # loader is required or spec_from_file_location() returns None.
+    loader = SourceFileLoader("whisper_gui", path)
+    spec = importlib.util.spec_from_file_location("whisper_gui", path, loader=loader)
     module = importlib.util.module_from_spec(spec)
     sys.modules["whisper_gui"] = module
     spec.loader.exec_module(module)
