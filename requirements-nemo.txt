@@ -1,0 +1,16 @@
+# NeMo ASR dependencies for Parakeet TDT model
+# Install with: pip install -r requirements-nemo.txt
+
+# NVIDIA NeMo Toolkit (ASR components)
+nemo_toolkit[asr]>=2.0.0
+
+# PyTorch with CUDA support (required for NeMo)
+# Note: Install PyTorch separately with CUDA support for best performance:
+# pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+torch>=2.0.0
+torchaudio>=2.0.0
+
+# Additional dependencies that NeMo may need
+pytorch-lightning>=2.0.0
+hydra-core>=1.3.0
+omegaconf>=2.3.0

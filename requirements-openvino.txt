@@ -1,0 +1,9 @@
+# OpenVINO Dependencies for NeuroWhisper
+# Install these for Intel GPU acceleration:
+# pip install -r requirements-openvino.txt
+
+openvino>=2024.0
+optimum[openvino]>=1.16.0
+librosa>=0.10.0
+torch>=2.0.0
+transformers>=4.36.0

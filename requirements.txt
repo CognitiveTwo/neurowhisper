@@ -1,0 +1,34 @@
+# neurowhisper dependencies
+# Requires Python 3.11+ (numpy/scipy/onnxruntime floors)
+
+# Core
+faster-whisper==1.2.1
+ctranslate2==4.6.2
+sounddevice==0.5.3
+keyboard==0.13.5
+pynput>=1.7.6,<2  # macOS-compatible keyboard alternative (used automatically on Mac)
+customtkinter==5.2.2
+Pillow>=10       # window icon rendering
+
+numpy==2.3.5
+
+# Hard transitive dependency of faster-whisper (VAD runs on onnxruntime).
+onnxruntime>=1.14,<2
+
+# Audio processing
+av==16.0.1
+scipy==1.16.3
+
+# Hugging Face for model downloads
+huggingface_hub==1.2.1
+tokenizers==0.22.1
+
+# Utilities
+tqdm==4.67.1
+PyYAML==6.0.3
+
+# OpenAI cloud transcription (optional feature, key entered in the app)
+openai>=1.0,<4
+
+# Optional: Intel GPU acceleration via OpenVINO. Not installed by default:
+#   pip install openvino "optimum[openvino]" transformers librosa

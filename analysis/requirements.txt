@@ -1,0 +1,5 @@
+# Dictation analysis toolkit. Install inside the app's virtual environment:
+#   pip install -r analysis/requirements.txt
+openai>=1.40
+numpy>=1.26
+scikit-learn>=1.4
