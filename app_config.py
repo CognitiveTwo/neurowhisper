@@ -13,7 +13,9 @@ CTK_COLOR_THEME = "dark-blue"
 CONFIG_FILE = "whisper_config.json"
 STATS_FILE = "whisper_stats.json"
 AI_INSIGHTS_FILE = "ai_insights.json"
+LEXICAL_CACHE_PREFIX = "lexical_cache"
 TRANSCRIPTIONS_DIR = "transcriptions"
+ACOUSTIC_META_SUBDIR = "meta"
 ICON_ICO = "icon.ico"
 ICON_PNG = "icon.png"
 ICON_ICNS = "icon.icns"
@@ -88,7 +90,9 @@ DEFAULT_CONFIG = {
     "openai_language": "auto",
     "idle_unload_minutes": 5,
     "worker_process": True,
-    "insights_range": "30 days",
+    "insights_range": "6 months",
+    "insights_bucket": "Auto",
+    "insights_lang": "All",
     # Opt-in only: when True (and an API key is set) the app sends transcript
     # text to OpenAI in the background to refresh the AI insight tabs.
     "ai_insights_auto": False,
@@ -370,14 +374,27 @@ PEER_PROFILE = {
 PEER_BENCHMARK_NOTE = "Heuristic proxy benchmark (trend context, not diagnostic norm)."
 
 PEER_BENCHMARKS = {
+    "clarity_index": {"low": 40.0, "high": 60.0},
     "pace_avg_words_entry": {"low": 16.0, "high": 55.0},
     "pace_stability": {"low": 55.0, "high": 100.0},
     "pause_avg_seconds": {"low": 1.2, "high": 4.8},
     "pause_long_share": {"low": 0.05, "high": 0.35},
+    "pause_long_pct": {"low": 5.0, "high": 35.0},
+    "pause_p90_s": {"low": 3.0, "high": 14.0},
     "clarity_fillers_per_100": {"low": 0.0, "high": 2.5},
     "clarity_repetition_per_1k": {"low": 0.0, "high": 8.0},
-    "lexical_diversity_percent": {"low": 22.0, "high": 48.0},
+    "vague_per_100": {"low": 0.3, "high": 2.4},
+    "lexical_diversity_percent": {"low": 58.0, "high": 78.0},
+    "mattr_diversity": {"low": 58.0, "high": 78.0},
+    "content_density_pct": {"low": 44.0, "high": 66.0},
     "lexical_long_word_percent": {"low": 12.0, "high": 36.0},
+    "self_focus_per_100": {"low": 1.5, "high": 6.5},
+    "absolutist_per_100": {"low": 0.4, "high": 2.2},
+    "hedges_per_100": {"low": 0.3, "high": 2.2},
+    "vitality_balance": {"low": 42.0, "high": 62.0},
+    "late_night_pct": {"low": 0.0, "high": 15.0},
+    "acoustic_wpm": {"low": 105.0, "high": 165.0},
+    "acoustic_silence_pct": {"low": 8.0, "high": 28.0},
     "intervention_open_question_per_100": {"low": 3.0, "high": 18.0},
     "intervention_reflection_ratio": {"low": 0.4, "high": 2.5},
     "intervention_affirmation_per_100": {"low": 1.0, "high": 12.0},
@@ -386,21 +403,42 @@ PEER_BENCHMARKS = {
 
 # --- Speech insights: rolling window, personal baseline, language lists ---
 
-# Rolling window options for the non-AI insight tabs. Value is the number of
-# trailing days; 0 means "today only" (calendar day) and None means "all time".
-#
-# Known deviation from the InsightsExpanded artboard, which shows three chips
-# (Today / 7 d / All) with Today highlighted: "30 days" is kept and is the
-# default because the personal baseline compares the current window against a
-# trailing 90-day average, and a one-day window is too noisy to read against
-# it. The artboard should be updated to four chips rather than the code cut.
+# Rolling & calendar window options across all insight tabs.
+# Values:
+#   0          -> current calendar day ("Today")
+#   int > 0    -> trailing N days
+#   "ytd"      -> Jan 1 of current year through today ("This year")
+#   "prev_6m"  -> previous 6-month window ([today-364d, today-183d])
+#   None       -> entire archive ("All")
+# Dynamic calendar-year slices ("Year 2026", "Year 2025", ...) are also
+# accepted at runtime via "year:YYYY".
 INSIGHTS_RANGE_OPTIONS = {
     "Today": 0,
     "7 days": 7,
     "30 days": 30,
+    "90 days": 90,
+    "6 months": 182,
+    "This year": "ytd",
+    "12 months": 365,
+    "Prev 6 months": "prev_6m",
     "All": None,
 }
-INSIGHTS_RANGE_DEFAULT = "30 days"
+INSIGHTS_RANGE_DEFAULT = "6 months"
+
+# Quick-select chip labels (key in INSIGHTS_RANGE_OPTIONS, compact chip text)
+INSIGHTS_QUICK_CHIPS = (
+    ("Today", "1d"),
+    ("7 days", "7d"),
+    ("30 days", "30d"),
+    ("90 days", "90d"),
+    ("6 months", "6m"),
+    ("This year", "YTD"),
+    ("12 months", "1y"),
+    ("All", "All"),
+)
+
+INSIGHTS_BUCKET_OPTIONS = ("Auto", "Daily", "Weekly", "Monthly")
+INSIGHTS_LANG_OPTIONS = ("All", "EN", "DE")
 
 # Personal baseline: metrics are compared against the user's own trailing
 # average instead of a hand-set peer band. PEER_BENCHMARKS is only used as a
@@ -409,6 +447,9 @@ PERSONAL_BASELINE_DAYS = 90
 PERSONAL_BASELINE_MIN_DAYS = 14
 # Half-width of the "normal" band drawn around the personal baseline value.
 PERSONAL_BASELINE_BAND_FRACTION = 0.25
+# Minimum daily word count for reliable rate/ratio markers (lighter days are
+# still counted in totals and volume, but de-emphasized in rate smoothing).
+INSIGHTS_MIN_WORDS_CONFIDENT = 40
 
 # --- Language-aware filler / stopword lists ---
 

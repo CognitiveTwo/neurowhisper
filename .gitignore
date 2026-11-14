@@ -29,6 +29,7 @@ transcriptions/
 logs/
 *.wav
 whisper_stats*.json
+lexical_cache*.json
 whisper_config.json
 temp_*.wav
 ai_insights.json

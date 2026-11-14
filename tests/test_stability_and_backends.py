@@ -745,15 +745,23 @@ def _get_or_load_whisper_gui_module():
     boot_dir = tempfile.mkdtemp(prefix="nw_wg_boot_")
     _CACHED_WG_BOOT_DIR = boot_dir
     atexit.register(lambda: shutil.rmtree(boot_dir, ignore_errors=True))
-    for fname in ("whisper_gui.pyw", "app_config.py", "platform_utils.py", "icon.ico", "icon.png"):
+    for fname in (
+        "whisper_gui.pyw",
+        "app_config.py",
+        "platform_utils.py",
+        "lexical_insights.py",
+        "icon.ico",
+        "icon.png",
+    ):
         src = os.path.join(REPO_ROOT, fname)
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(boot_dir, fname))
-    shutil.copytree(
-        os.path.join(REPO_ROOT, "backends"),
-        os.path.join(boot_dir, "backends"),
-        ignore=shutil.ignore_patterns("__pycache__"),
-    )
+    for dname in ("backends", "analysis"):
+        shutil.copytree(
+            os.path.join(REPO_ROOT, dname),
+            os.path.join(boot_dir, dname),
+            ignore=shutil.ignore_patterns("__pycache__", "out"),
+        )
 
     orig_cwd = os.getcwd()
     try:

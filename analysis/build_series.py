@@ -16,7 +16,13 @@ from __future__ import annotations
 import argparse
 import collections
 import datetime as dt
+import os
 import statistics as st
+import sys
+
+_ANALYSIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _ANALYSIS_DIR not in sys.path:
+    sys.path.insert(0, _ANALYSIS_DIR)
 
 import common
 
@@ -38,15 +44,30 @@ def longest_streak(days):
     return best
 
 
-def build(transcripts_dir=None, labels_dir=None):
+def build(transcripts_dir=None, labels_dir=None, cache_path=None, out_dir=None, ai_insights_path=None):
     entries = common.load_entries(transcripts_dir)
     if not entries:
         raise SystemExit("No transcript entries found.")
     by_day = common.group_by_day(entries)
-    labels = common.load_labels(labels_dir)
+    eff_labels_dir = labels_dir or (os.path.join(out_dir, "labels") if out_dir else None)
+    labels = common.load_labels(eff_labels_dir)
+    if ai_insights_path and os.path.isfile(ai_insights_path):
+        app_ai = common.read_json(ai_insights_path)
+        daily_ai = (app_ai or {}).get("daily", app_ai) if isinstance(app_ai, dict) else {}
+        if isinstance(daily_ai, dict):
+            for day_k, rec in daily_ai.items():
+                if day_k not in labels and isinstance(rec, dict):
+                    labels[day_k] = {
+                        "mood": rec.get("mood"),
+                        "mood_score": rec.get("mood_score"),
+                        "topics": rec.get("topics", []),
+                        "activities": rec.get("activities", []),
+                    }
 
-    clusters = common.read_json(common.out_path("clusters.json"))
-    cats = common.read_json(common.out_path("categories.json"))
+    clusters_p = os.path.join(out_dir, "clusters.json") if out_dir else common.out_path("clusters.json")
+    cats_p = os.path.join(out_dir, "categories.json") if out_dir else common.out_path("categories.json")
+    clusters = common.read_json(clusters_p)
+    cats = common.read_json(cats_p)
     phrase_cluster = (clusters or {}).get("phrase_cluster") or {}
     cluster_to_category = {str(k): v for k, v
                            in ((cats or {}).get("cluster_to_category") or {}).items()}
@@ -206,6 +227,51 @@ def build(transcripts_dir=None, labels_dir=None):
     busiest = max(range(24), key=lambda h: hour_words[h]) if total_words else None
     moods = [r["mood"] for r in daily if r["mood"] is not None]
 
+    # ---- longitudinal lexical & pause health proxies (100% local) -------
+    lexical_block = None
+    try:
+        import sys as _sys
+        if common.APP_DIR not in _sys.path:
+            _sys.path.insert(0, common.APP_DIR)
+        import lexical_insights as _li
+
+        tx_dir = transcripts_dir or common.TRANSCRIPTIONS_DIR
+        cache_p = (
+            cache_path
+            or (os.path.join(out_dir, "lexical_series_cache.json") if out_dir else None)
+            or common.out_path("lexical_series_cache.json")
+        )
+        idx = _li.LexicalDiskIndex(transcriptions_dir=tx_dir, cache_path=cache_p)
+        idx.refresh(persist=True)
+        last_d = dt.date.fromisoformat(daily[-1]["date"])
+        sl_all = _li.query_slice(idx, "All", "Daily", "All", today=last_d)
+        sl_6m = _li.query_slice(idx, "6 months", "Daily", "All", today=last_d)
+        sl_ytd = _li.query_slice(idx, "This year", "Daily", "All", today=last_d)
+        lexical_block = {
+            "callout": sl_6m["callout"],
+            "baselines": sl_all["baselines"],
+            "summary_all": sl_all["summary"],
+            "summary_6m": sl_6m["summary"],
+            "summary_ytd": sl_ytd["summary"],
+            "points": sl_all["points"],
+            "rolling": {
+                k: sl_all["rolling"].get(k, [])
+                for k in (
+                    "clarity_index",
+                    "mattr_diversity",
+                    "vague_per_100",
+                    "pause_long_pct",
+                    "fillers_per_100",
+                    "self_focus_per_100",
+                    "absolutist_per_100",
+                    "vitality_balance",
+                    "late_night_pct",
+                )
+            },
+        }
+    except Exception:
+        lexical_block = None
+
     return {
         "generated": dt.date.today().isoformat(),
         "has_categories": have_categories,
@@ -231,6 +297,7 @@ def build(transcripts_dir=None, labels_dir=None):
         "weekdays": weekdays,
         "hours": hours,
         "heat_weekday_hour": heat,
+        "lexical": lexical_block,
     }
 
 

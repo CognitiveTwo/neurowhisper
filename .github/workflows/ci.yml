@@ -37,7 +37,7 @@ jobs:
 
       - name: Byte-compile
         shell: bash
-        run: python -m py_compile whisper_gui.pyw app_config.py platform_utils.py backends/*.py analysis/*.py tests/*.py
+        run: python -m py_compile whisper_gui.pyw app_config.py platform_utils.py lexical_insights.py backends/*.py analysis/*.py tests/*.py
 
       - name: Smoke test
         run: python tests/smoke_test.py
@@ -70,7 +70,7 @@ jobs:
       - name: Syntax & byte-compile checks
         run: |
           bash -n run.sh
-          python -m py_compile whisper_gui.pyw app_config.py platform_utils.py backends/*.py analysis/*.py tests/*.py
+          python -m py_compile whisper_gui.pyw app_config.py platform_utils.py lexical_insights.py backends/*.py analysis/*.py tests/*.py
 
       - name: Smoke test
         run: xvfb-run -a python tests/smoke_test.py

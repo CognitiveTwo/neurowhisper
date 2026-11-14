@@ -34,8 +34,15 @@ GUI_SETTLE_SECONDS = 8.0
 CLOSE_BUDGET_SECONDS = 5.0
 
 # Files/directories the app needs in its working directory to start up.
-APP_FILES = ("whisper_gui.pyw", "app_config.py", "platform_utils.py", "icon.ico", "icon.png")
-APP_DIRS = ("backends",)
+APP_FILES = (
+    "whisper_gui.pyw",
+    "app_config.py",
+    "platform_utils.py",
+    "lexical_insights.py",
+    "icon.ico",
+    "icon.png",
+)
+APP_DIRS = ("backends", "analysis")
 
 _failures = []
 
@@ -170,6 +177,9 @@ def check_imports():
 
     import platform_utils  # noqa: F401
     ok("imported platform_utils")
+
+    import lexical_insights
+    ok("imported lexical_insights (%d metric specs)" % len(lexical_insights.METRIC_SPECS))
 
     import backends
     result = backends.detect_best_backend()
