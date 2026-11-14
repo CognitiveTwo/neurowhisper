@@ -376,12 +376,13 @@ class TestOnnxAsrBackend(unittest.TestCase):
             "nemo-parakeet-tdt-0.6b-v3",
         )
         self.assertEqual(b._resolve_asr_name_and_dir("canary-1b-v2", None)[0], "nemo-canary-1b-v2")
+        base_models_root = os.path.abspath("/tmp/models")
         self.assertEqual(
             b._resolve_asr_name_and_dir(
                 "Base (Minimal resources, quick)",
-                "/tmp/models/Base_Minimal_resources,_quick",
+                os.path.join(base_models_root, "Base_Minimal_resources,_quick"),
             ),
-            ("whisper-base", "/tmp/models/onnx_whisper-base"),
+            ("whisper-base", os.path.join(base_models_root, "onnx_whisper-base")),
         )
 
         calls = []
