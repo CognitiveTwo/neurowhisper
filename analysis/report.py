@@ -501,9 +501,15 @@ def render(series, calendar=None, title="Dictation report"):
             ("Lexical Vitality Score", _f(s_ytd, "vitality_balance"), _f(s_6m, "vitality_balance"), _f(s_all, "vitality_balance")),
             ("Late-Night Speech (22:00-05:00)", _f(s_ytd, "late_night_pct", "%"), _f(s_6m, "late_night_pct", "%"), _f(s_all, "late_night_pct", "%")),
         ]
+        interps = lex.get("interpretations") or {}
+        trim_badge = (
+            " · Outliers &gt;2.5&sigma; excluded (non-destructive)."
+            if lex.get("trim_outliers")
+            else ""
+        )
         parts.append(
             "<section><h2>Longitudinal Lexical &amp; Fluency Signals (Local, Zero-API)</h2>"
-            f"<p class='note'>Personal self-tracking proxies (non-diagnostic). "
+            f"<p class='note'>Personal self-tracking proxies (non-diagnostic){trim_badge} "
             f"6-month summary: {esc(lex.get('callout', ''))}</p>"
             + table_rows(["Signal", "This Year (YTD)", "Last 6 Months", "All Time"], comp_rows)
             + "</section>"
@@ -525,9 +531,17 @@ def render(series, calendar=None, title="Dictation report"):
              "Local vitality/clarity lexicon minus fatigue/overload markers (50 = neutral).",
              "", "#59a14f"),
         ):
+            g_info = interps.get(mkey) or {}
+            expl = g_info.get("explanation") or sub_txt
+            pat = g_info.get("pattern") or ""
+            pat_html = (
+                f"<br><strong>Window pattern:</strong> {esc(pat)}"
+                if pat
+                else ""
+            )
             parts.append(
                 f"<section><h2>{esc(title_txt)}</h2>"
-                f"<p class='note'>{esc(sub_txt)}</p>"
+                f"<p class='note'><strong>What it measures:</strong> {esc(expl)}{pat_html}</p>"
                 f"<div class='chart'>"
                 f"{chart_lexical_line(pts, roll.get(mkey), mkey, bases.get(mkey), title_txt, unit=unit, color=col)}"
                 f"</div></section>"

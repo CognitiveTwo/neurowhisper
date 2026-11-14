@@ -44,7 +44,14 @@ def longest_streak(days):
     return best
 
 
-def build(transcripts_dir=None, labels_dir=None, cache_path=None, out_dir=None, ai_insights_path=None):
+def build(
+    transcripts_dir=None,
+    labels_dir=None,
+    cache_path=None,
+    out_dir=None,
+    ai_insights_path=None,
+    trim_outliers=False,
+):
     entries = common.load_entries(transcripts_dir)
     if not entries:
         raise SystemExit("No transcript entries found.")
@@ -244,10 +251,19 @@ def build(transcripts_dir=None, labels_dir=None, cache_path=None, out_dir=None, 
         idx = _li.LexicalDiskIndex(transcriptions_dir=tx_dir, cache_path=cache_p)
         idx.refresh(persist=True)
         last_d = dt.date.fromisoformat(daily[-1]["date"])
-        sl_all = _li.query_slice(idx, "All", "Daily", "All", today=last_d)
-        sl_6m = _li.query_slice(idx, "6 months", "Daily", "All", today=last_d)
-        sl_ytd = _li.query_slice(idx, "This year", "Daily", "All", today=last_d)
+        do_trim = bool(trim_outliers)
+        sl_all = _li.query_slice(idx, "All", "Daily", "All", today=last_d, trim_outliers=do_trim)
+        sl_6m = _li.query_slice(idx, "6 months", "Daily", "All", today=last_d, trim_outliers=do_trim)
+        sl_ytd = _li.query_slice(idx, "This year", "Daily", "All", today=last_d, trim_outliers=do_trim)
+        report_keys = (
+            "clarity_index",
+            "mattr_diversity",
+            "pause_long_pct",
+            "vague_per_100",
+            "vitality_balance",
+        )
         lexical_block = {
+            "trim_outliers": do_trim,
             "callout": sl_6m["callout"],
             "baselines": sl_all["baselines"],
             "summary_all": sl_all["summary"],
@@ -267,6 +283,9 @@ def build(transcripts_dir=None, labels_dir=None, cache_path=None, out_dir=None, 
                     "vitality_balance",
                     "late_night_pct",
                 )
+            },
+            "interpretations": {
+                k: _li.interpret_metric_window(sl_all, k) for k in report_keys
             },
         }
     except Exception:
@@ -308,12 +327,17 @@ def build_parser():
     )
     p.add_argument("--transcripts", metavar="DIR", help="transcript archive directory")
     p.add_argument("--labels", metavar="DIR", help="labels directory")
+    p.add_argument(
+        "--trim-outliers",
+        action="store_true",
+        help="exclude >2.5σ outlier spikes non-destructively from lexical series",
+    )
     return p
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    series = build(args.transcripts, args.labels)
+    series = build(args.transcripts, args.labels, trim_outliers=args.trim_outliers)
     path = common.out_path("series.json")
     common.write_json(path, series)
     h = series["headline"]

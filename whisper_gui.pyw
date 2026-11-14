@@ -44,6 +44,7 @@ from app_config import (
     INSIGHTS_BUCKET_OPTIONS,
     INSIGHTS_LANG_OPTIONS,
     INSIGHTS_MIN_WORDS_CONFIDENT,
+    INSIGHTS_OUTLIER_SIGMA,
     LEXICAL_CACHE_PREFIX,
     ACOUSTIC_META_SUBDIR,
     PERSONAL_BASELINE_DAYS,
@@ -2666,9 +2667,9 @@ class WhisperApp:
             period_values.append(range_value)
         self.insights_period_combo = ttk.Combobox(
             insights_subbar, textvariable=self.insights_range_var,
-            values=period_values, state="readonly", width=11,
+            values=period_values, state="readonly", width=10,
         )
-        self.insights_period_combo.pack(side="left", padx=(0, 5))
+        self.insights_period_combo.pack(side="left", padx=(0, 4))
         self.insights_period_combo.bind("<<ComboboxSelected>>", self._on_insights_period_combo_select)
         self._enhance_combobox(
             self.insights_period_combo,
@@ -2681,9 +2682,9 @@ class WhisperApp:
         self.insights_bucket_var = tk.StringVar(value=bucket_val)
         self.insights_bucket_combo = ttk.Combobox(
             insights_subbar, textvariable=self.insights_bucket_var,
-            values=list(INSIGHTS_BUCKET_OPTIONS), state="readonly", width=7,
+            values=list(INSIGHTS_BUCKET_OPTIONS), state="readonly", width=6,
         )
-        self.insights_bucket_combo.pack(side="left", padx=(0, 5))
+        self.insights_bucket_combo.pack(side="left", padx=(0, 4))
         self.insights_bucket_combo.bind("<<ComboboxSelected>>", self._on_insights_filter_change)
         self._enhance_combobox(
             self.insights_bucket_combo,
@@ -2705,8 +2706,12 @@ class WhisperApp:
             "Language filter: All (EN+DE normalized), EN only, or DE only",
         )
 
+        self.insights_trim_outliers_var = tk.BooleanVar(
+            value=bool(self.config.get("insights_trim_outliers", False))
+        )
+
         self.btn_expand_insights = ctk.CTkButton(
-            insights_subbar, text="⤢ Expand", width=68, height=22,
+            insights_subbar, text="⤢ Expand", width=66, height=22,
             corner_radius=7, font=ctk.CTkFont(size=10, weight="bold"),
             fg_color=COLOR_BG, hover_color=COLOR_TEAL_DIM,
             border_width=1, border_color=COLOR_TEAL,
@@ -2717,6 +2722,23 @@ class WhisperApp:
         self._create_tooltip(
             self.btn_expand_insights,
             "Open wide resizable Longitudinal Trends Explorer & HTML Report export",
+        )
+
+        self.btn_trim_outliers = ctk.CTkButton(
+            insights_subbar, text="✂ >2.5σ", width=68, height=22,
+            corner_radius=7, font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color=COLOR_BG, hover_color=COLOR_TEAL_DIM,
+            border_width=1, border_color=COLOR_BORDER,
+            text_color=COLOR_TEXT_MUTED,
+            command=self._toggle_trim_outliers,
+        )
+        self.btn_trim_outliers.pack(side="right", padx=(0, 4))
+        self._create_tooltip(
+            self.btn_trim_outliers,
+            "Kick out >2.5σ outliers (non-destructive):\n"
+            "Excludes accidental open-mic pushes, extreme stall spikes,\n"
+            "and runaway utterances from charts & averages without\n"
+            "modifying any transcript files on disk.",
         )
 
         # Coverage / baseline / freshness / profile notes
@@ -3327,10 +3349,48 @@ Troubleshooting:
                            highlightthickness=1, highlightbackground=COLOR_BORDER)
         canvas.pack(fill="x", padx=10, pady=(0, 6))
 
+        self._build_insight_guide_box(parent, prefix)
+
         tk.Label(parent, textvariable=peer_var, bg=COLOR_ACCENT_BG, fg=COLOR_TEXT_FAINT,
                  font=("Arial", 8), anchor="w", justify="left",
                  wraplength=400).pack(fill="x", padx=10, pady=(0, 8))
         return canvas
+
+    def _build_insight_guide_box(self, parent, prefix):
+        """Compact zero-LLM dimension explanation + window pattern reading card."""
+        box = ctk.CTkFrame(
+            parent, fg_color=COLOR_BG, corner_radius=8,
+            border_width=1, border_color=COLOR_BORDER,
+        )
+        box.pack(fill="x", padx=10, pady=(0, 6))
+        exp_var = tk.StringVar(value="")
+        pat_var = tk.StringVar(value="")
+        setattr(self, f"{prefix}_explain_var", exp_var)
+        setattr(self, f"{prefix}_pattern_var", pat_var)
+        tk.Label(
+            box, textvariable=exp_var, bg=COLOR_BG, fg=COLOR_TEXT_MUTED,
+            font=("Arial", 8), anchor="w", justify="left", wraplength=386,
+        ).pack(fill="x", padx=8, pady=(6, 2))
+        tk.Label(
+            box, textvariable=pat_var, bg=COLOR_BG, fg="#99f6e4",
+            font=("Arial", 8, "bold"), anchor="w", justify="left", wraplength=386,
+        ).pack(fill="x", padx=8, pady=(0, 6))
+        return box
+
+    def _set_tab_guide(self, prefix, guide):
+        """Populate ``{prefix}_explain_var`` and ``{prefix}_pattern_var`` from a guide dict."""
+        if not isinstance(guide, dict):
+            return
+        exp_var = getattr(self, f"{prefix}_explain_var", None)
+        pat_var = getattr(self, f"{prefix}_pattern_var", None)
+        if exp_var is not None:
+            expl = str(guide.get("explanation", "")).strip()
+            exp_var.set(f"What it measures: {expl}" if expl else "")
+        if pat_var is not None:
+            pat = str(guide.get("pattern", "")).strip()
+            corr = str(guide.get("correlation", "")).strip()
+            full_pat = f"{pat}  {corr}".strip() if corr else pat
+            pat_var.set(f"Window pattern: {full_pat}" if full_pat else "")
 
     def _make_pill_bar(self, parent, options, var, on_change):
         """Render a row of compact CTk pill buttons bound to ``var``."""
@@ -3688,7 +3748,8 @@ Troubleshooting:
         self.ai_mood_dropdown.pack(side="left", padx=10)
 
         self.ai_mood_canvas = tk.Canvas(self.ai_mood_tab, height=140, bg=COLOR_TEXT_BG, highlightthickness=1, highlightbackground=COLOR_BORDER)
-        self.ai_mood_canvas.pack(fill="x", padx=10, pady=(10, 8))
+        self.ai_mood_canvas.pack(fill="x", padx=10, pady=(10, 6))
+        self._build_insight_guide_box(self.ai_mood_tab, "mood")
 
     def _setup_activity_matrix_tab(self):
         tk.Label(
@@ -3722,7 +3783,8 @@ Troubleshooting:
         self.activity_metric_dropdown.pack(side="left")
 
         self.activity_canvas = tk.Canvas(self.activity_matrix_tab, height=150, bg=COLOR_TEXT_BG, highlightthickness=1, highlightbackground=COLOR_BORDER)
-        self.activity_canvas.pack(fill="x", padx=10, pady=(10, 8))
+        self.activity_canvas.pack(fill="x", padx=10, pady=(10, 6))
+        self._build_insight_guide_box(self.activity_matrix_tab, "activity")
 
     def _setup_speaker_profile_tab(self):
         tk.Label(
@@ -3737,7 +3799,8 @@ Troubleshooting:
         ).pack(fill="x", padx=10, pady=(8, 4))
 
         self.speaker_profile_canvas = tk.Canvas(self.speaker_profile_tab, height=200, bg=COLOR_TEXT_BG, highlightthickness=1, highlightbackground=COLOR_BORDER)
-        self.speaker_profile_canvas.pack(fill="x", padx=10, pady=(10, 8))
+        self.speaker_profile_canvas.pack(fill="x", padx=10, pady=(10, 6))
+        self._build_insight_guide_box(self.speaker_profile_tab, "profile")
 
     def _setup_daily_brief_tab(self):
         paned = tk.Frame(self.daily_brief_tab, bg=COLOR_ACCENT_BG)
@@ -3869,6 +3932,77 @@ Troubleshooting:
                         btn.configure(fg_color=COLOR_BG, text_color=COLOR_TEXT_FAINT)
                 except Exception:
                     pass
+        self._update_trim_outlier_button_styles()
+
+    def _is_trim_outliers_enabled(self):
+        var = getattr(self, "insights_trim_outliers_var", None)
+        if var is not None:
+            return bool(var.get())
+        return bool(self.config.get("insights_trim_outliers", False))
+
+    def _toggle_trim_outliers(self):
+        """Toggle non-destructive >2.5σ outlier filtering across all Speech Insights views."""
+        new_val = not self._is_trim_outliers_enabled()
+        if hasattr(self, "insights_trim_outliers_var"):
+            self.insights_trim_outliers_var.set(new_val)
+        self.config["insights_trim_outliers"] = new_val
+        self._persist_config()
+        self._current_lexical_slice = None
+        self._update_trim_outlier_button_styles()
+        self.refresh_insights_tabs()
+
+    def _update_trim_outlier_button_styles(self):
+        trim_on = self._is_trim_outliers_enabled()
+        sl = getattr(self, "_current_lexical_slice", None)
+        n_out = int(sl.get("total_outlier_buckets", 0)) if isinstance(sl, dict) else 0
+
+        main_btn = getattr(self, "btn_trim_outliers", None)
+        if main_btn is not None:
+            try:
+                if trim_on:
+                    lbl = f"✂ >2.5σ ({n_out})" if n_out > 0 else "✂ >2.5σ ✓"
+                    main_btn.configure(
+                        text=lbl,
+                        fg_color="#78350f",
+                        hover_color="#92400e",
+                        border_color="#f59e0b",
+                        text_color="#fef3c7",
+                    )
+                else:
+                    lbl = f"✂ >2.5σ·{n_out}" if n_out > 0 else "✂ >2.5σ"
+                    main_btn.configure(
+                        text=lbl,
+                        fg_color=COLOR_BG,
+                        hover_color=COLOR_TEAL_DIM,
+                        border_color="#f59e0b" if n_out > 0 else COLOR_BORDER,
+                        text_color="#fbbf24" if n_out > 0 else COLOR_TEXT_MUTED,
+                    )
+            except Exception:
+                pass
+
+        exp_btn = getattr(self, "_explorer_trim_btn", None)
+        if exp_btn is not None:
+            try:
+                if trim_on:
+                    lbl = f"✂ Kick >2.5σ ({n_out})" if n_out > 0 else "✂ Kick >2.5σ ✓"
+                    exp_btn.configure(
+                        text=lbl,
+                        fg_color="#78350f",
+                        hover_color="#92400e",
+                        border_color="#f59e0b",
+                        text_color="#fef3c7",
+                    )
+                else:
+                    lbl = f"✂ Kick >2.5σ ({n_out} found)" if n_out > 0 else "✂ Kick >2.5σ"
+                    exp_btn.configure(
+                        text=lbl,
+                        fg_color=COLOR_BG,
+                        hover_color=COLOR_TEAL_DIM,
+                        border_color="#f59e0b" if n_out > 0 else COLOR_BORDER,
+                        text_color="#fbbf24" if n_out > 0 else COLOR_TEXT_MUTED,
+                    )
+            except Exception:
+                pass
 
     def _update_insights_summary(self, today_words, session_speed):
         """One-line summary on the collapsed Speech Insights header."""
@@ -4283,6 +4417,16 @@ Troubleshooting:
                 else:
                     canvas.create_oval(px_i - 2.3, py_i - 2.3, px_i + 2.3, py_i + 2.3, fill=prim_color, outline="")
 
+        # 4b. Subtle top-edge amber '×' ticks for >2.5σ buckets kicked out by trim_outliers
+        if n_pts <= 180:
+            for idx, pt_obj in enumerate(points):
+                trimmed_map = pt_obj.get("_trimmed_values")
+                if isinstance(trimmed_map, dict) and primary_key in trimmed_map:
+                    tx_m = x_of(idx)
+                    ty_m = top + 4
+                    canvas.create_line(tx_m - 2.5, ty_m - 2.5, tx_m + 2.5, ty_m + 2.5, fill="#f59e0b", width=1.4)
+                    canvas.create_line(tx_m - 2.5, ty_m + 2.5, tx_m + 2.5, ty_m - 2.5, fill="#f59e0b", width=1.4)
+
         # 5. Bold rolling trajectory curve
         roll_pairs = [
             (i, float(roll_series[i]))
@@ -4305,6 +4449,9 @@ Troubleshooting:
             legend_bits.append("░ 90d norm")
         if has_sec and sec_spec is not None:
             legend_bits.append(f"╌ {sec_spec.get('short', secondary_key)}")
+        n_trim_prim = int((slice_data.get("trimmed_points_by_metric") or {}).get(primary_key, 0))
+        if n_trim_prim > 0:
+            legend_bits.append(f"✂ {n_trim_prim} >2.5σ")
         canvas.create_text(
             left + cw, 8, text="   ".join(legend_bits),
             fill="#94a3b8", font=("Arial", 7), anchor="e",
@@ -4340,6 +4487,7 @@ Troubleshooting:
             canvas.create_line(hx, top, hx, top + ch, fill="#64748b", dash=(2, 2), tags="ts_hover")
 
             pval = pt.get(primary_key)
+            trimmed_pt = pt.get("_trimmed_values") if isinstance(pt.get("_trimmed_values"), dict) else {}
             rval = roll_series[idx] if idx < len(roll_series) else None
             if pval is not None:
                 hy = y_of(pval)
@@ -4356,13 +4504,22 @@ Troubleshooting:
             if pval is not None:
                 r_note = f" · trend {fmt_v(rval)}" if rval is not None else ""
                 lines.append(f"{spec.get('short', primary_key)}: {fmt_v(pval)}{r_note}")
+            elif primary_key in trimmed_pt:
+                lines.append(
+                    f"{spec.get('short', primary_key)}: ✂ {fmt_v(float(trimmed_pt[primary_key]))} (>2.5σ excluded)"
+                )
             else:
                 lines.append(f"{spec.get('short', primary_key)}: n/a")
 
-            if has_sec and sec_spec is not None and pt.get(secondary_key) is not None:
+            if has_sec and sec_spec is not None:
                 s_dec = int(sec_spec.get("decimals", 1))
                 s_unit = sec_spec.get("unit", "")
-                lines.append(f"{sec_spec.get('short', secondary_key)}: {pt[secondary_key]:.{s_dec}f}{s_unit}")
+                if pt.get(secondary_key) is not None:
+                    lines.append(f"{sec_spec.get('short', secondary_key)}: {pt[secondary_key]:.{s_dec}f}{s_unit}")
+                elif secondary_key in trimmed_pt:
+                    lines.append(
+                        f"{sec_spec.get('short', secondary_key)}: ✂ {float(trimmed_pt[secondary_key]):.{s_dec}f}{s_unit}"
+                    )
 
             meta_line = f"{int(pt.get('words', 0)):,} w · {int(pt.get('entries', 0))} ent"
             if pt.get("de_share_pct") is not None:
@@ -4820,6 +4977,8 @@ Troubleshooting:
             else "All"
         )
 
+        trim_on = self._is_trim_outliers_enabled()
+
         if lex_idx is not None and lexical_insights is not None:
             self._analytics_scanned_files = lex_idx.scanned_files
             self._sync_period_combo_values(lex_idx.daily)
@@ -4828,6 +4987,8 @@ Troubleshooting:
                 range_spec=range_label,
                 bucket_mode=bucket_mode,
                 lang_mode=lang_mode,
+                trim_outliers=trim_on,
+                outlier_sigma=INSIGHTS_OUTLIER_SIGMA,
             )
             self._current_lexical_slice = sl
             self._lexical_baselines = sl.get("baselines") or {}
@@ -4837,6 +4998,7 @@ Troubleshooting:
                 for mk, bdict in self._lexical_baselines.items():
                     if bdict.get("is_personal"):
                         self._personal_baseline[mk] = float(bdict["median"])
+            self._update_trim_outlier_button_styles()
 
         if panel_collapsed and explorer_open:
             self._insights_dirty = True
@@ -4859,7 +5021,7 @@ Troubleshooting:
                 if bdict.get("is_personal"):
                     self._personal_baseline[mk] = float(bdict["median"])
 
-        # Rolling display window + optional EN/DE language filter
+        # Rolling display window + optional EN/DE language filter + optional >2.5σ utterance trim
         window_idx = filter_entries_by_days(entries_all, self._insights_range_days())
         if lang_mode in ("EN", "DE"):
             target_l = lang_mode.lower()
@@ -4868,10 +5030,22 @@ Troubleshooting:
         tokens_per_entry = [tokens_all[i] for i in window_idx]
         langs = [langs_all[i] for i in window_idx]
 
+        removed_entry_outliers = 0
+        if trim_on and lexical_insights is not None and entries:
+            kept_rel, removed_entry_outliers = lexical_insights.filter_outlier_entries(
+                entries, tokens_per_entry, INSIGHTS_OUTLIER_SIGMA
+            )
+            if removed_entry_outliers > 0:
+                entries = [entries[k] for k in kept_rel]
+                tokens_per_entry = [tokens_per_entry[k] for k in kept_rel]
+                langs = [langs[k] for k in kept_rel]
+
         if hasattr(self, "insights_coverage_var"):
             cov_txt = self._build_analytics_coverage_text(entries, len(entries_all))
             if sl is not None:
                 cov_txt += f" · Bucket: {sl.get('bucket_mode', 'daily')} · Lang: {lang_mode}"
+            if removed_entry_outliers > 0:
+                cov_txt += f" · ✂ {removed_entry_outliers} entry outlier(s) excluded"
             self.insights_coverage_var.set(cov_txt)
         self._update_baseline_label()
         self._update_ai_freshness_label()
@@ -4939,6 +5113,13 @@ Troubleshooting:
         if not hasattr(self, "fogwatch_summary_var"):
             return
         sl = sl or getattr(self, "_current_lexical_slice", None)
+        mkey = self.fogwatch_metric_var.get()
+        sec_key = "pause_long_pct" if mkey == "clarity_index" else None
+        if lexical_insights is not None:
+            self._set_tab_guide(
+                "fogwatch",
+                lexical_insights.interpret_metric_window(sl, mkey, secondary_key=sec_key),
+            )
         if not sl or int((sl.get("summary") or {}).get("words", 0)) == 0:
             self.fogwatch_summary_var.set("No cognitive clarity data in slice")
             self.fogwatch_detail_var.set("Record or select a broader horizon (e.g. 6m, YTD, All) to inspect trends.")
@@ -4947,7 +5128,6 @@ Troubleshooting:
             return
 
         summ = sl["summary"]
-        mkey = self.fogwatch_metric_var.get()
         ci = summ.get("clarity_index")
         mattr = summ.get("mattr_diversity")
         vague = summ.get("vague_per_100")
@@ -4970,19 +5150,20 @@ Troubleshooting:
             dec = int(spec.get("decimals", 1))
             self.fogwatch_peer_var.set(
                 f"{spec.get('short', mkey)}: {val:.{dec}f}{u} vs your 90d norm "
-                f"{base['median']:.{dec}f}{u} (band {base['low']:.{dec}f}–{base['high']:.{dec}f}{u}). "
-                f"{spec.get('description', '')}"
+                f"{base['median']:.{dec}f}{u} (band {base['low']:.{dec}f}–{base['high']:.{dec}f}{u}) · non-diagnostic."
             )
         else:
-            self.fogwatch_peer_var.set(spec.get("description", "Personal self-tracking trend."))
+            self.fogwatch_peer_var.set("Personal self-tracking trend (non-diagnostic).")
 
-        sec_key = "pause_long_pct" if mkey == "clarity_index" else None
         self._draw_timeseries_chart(self.fogwatch_canvas, sl, mkey, secondary_key=sec_key)
 
     def _refresh_mind_tab(self, sl=None):
         if not hasattr(self, "mind_summary_var"):
             return
         sl = sl or getattr(self, "_current_lexical_slice", None)
+        mkey = self.mind_metric_var.get()
+        if lexical_insights is not None:
+            self._set_tab_guide("mind", lexical_insights.interpret_metric_window(sl, mkey))
         if not sl or int((sl.get("summary") or {}).get("words", 0)) == 0:
             self.mind_summary_var.set("No local affect/style data in slice")
             self.mind_detail_var.set("100% local lexical markers populate automatically from your transcripts.")
@@ -4991,7 +5172,6 @@ Troubleshooting:
             return
 
         summ = sl["summary"]
-        mkey = self.mind_metric_var.get()
         vit = summ.get("vitality_balance")
         italk = summ.get("self_focus_per_100")
         absw = summ.get("absolutist_per_100")
@@ -5019,11 +5199,10 @@ Troubleshooting:
             dec = int(spec.get("decimals", 1))
             self.mind_peer_var.set(
                 f"{spec.get('short', mkey)}: {val:.{dec}f}{u} vs your 90d norm "
-                f"{base['median']:.{dec}f}{u} (band {base['low']:.{dec}f}–{base['high']:.{dec}f}{u}). "
-                f"{spec.get('description', '')}"
+                f"{base['median']:.{dec}f}{u} (band {base['low']:.{dec}f}–{base['high']:.{dec}f}{u}) · non-diagnostic."
             )
         else:
-            self.mind_peer_var.set(spec.get("description", "Local lexical self-tracking."))
+            self.mind_peer_var.set("Local lexical self-tracking (non-diagnostic).")
 
         self._draw_timeseries_chart(self.mind_canvas, sl, mkey)
 
@@ -5031,6 +5210,10 @@ Troubleshooting:
         if not hasattr(self, "pace_summary_var"):
             return
         sl = sl or getattr(self, "_current_lexical_slice", None)
+        mkey = getattr(self, "pace_metric_var", None)
+        mkey = mkey.get() if mkey is not None else "pace_words_entry"
+        if lexical_insights is not None:
+            self._set_tab_guide("pace", lexical_insights.interpret_metric_window(sl, mkey))
         if not entries:
             self.pace_summary_var.set("No pace data yet")
             self.pace_detail_var.set("Record a few transcriptions to view pace patterns.")
@@ -5076,8 +5259,6 @@ Troubleshooting:
         )
         self._peer_snapshot["pace"] = (avg_delta + stab_delta) / 2.0
 
-        mkey = getattr(self, "pace_metric_var", None)
-        mkey = mkey.get() if mkey is not None else "pace_words_entry"
         if sl is not None:
             self._sync_dynamic_tab_band("pace", mkey, summ.get(mkey, avg_words))
             self._draw_timeseries_chart(self.pace_canvas, sl, mkey)
@@ -5117,6 +5298,16 @@ Troubleshooting:
 
         view_mode = getattr(self, "pause_view_var", None)
         view_mode = view_mode.get() if view_mode is not None else "pause_long_pct"
+        if lexical_insights is not None:
+            if view_mode == "breakdown":
+                self._set_tab_guide(
+                    "pause",
+                    lexical_insights.interpret_categorical_view(
+                        "pause_breakdown", {"short": short, "medium": medium, "long": long_c}, sl
+                    ),
+                )
+            else:
+                self._set_tab_guide("pause", lexical_insights.interpret_metric_window(sl, view_mode))
 
         if gap_count == 0 and view_mode != "acoustic_silence_pct":
             self.pause_summary_var.set("No burst pause intervals in slice")
@@ -5164,9 +5355,19 @@ Troubleshooting:
         tokens_per_entry = tokens_per_entry or []
         langs = langs or []
         tokens = [t for toks in tokens_per_entry for t in toks]
+        view_mode = getattr(self, "clarity_view_var", None)
+        view_mode = view_mode.get() if view_mode is not None else "fillers_per_100"
 
         total_words = len(tokens)
         if total_words == 0:
+            if lexical_insights is not None:
+                if view_mode == "breakdown":
+                    self._set_tab_guide(
+                        "clarity",
+                        lexical_insights.interpret_categorical_view("clarity_breakdown", {"top_items": []}, sl),
+                    )
+                else:
+                    self._set_tab_guide("clarity", lexical_insights.interpret_metric_window(sl, view_mode))
             self.clarity_summary_var.set("No clarity data yet")
             self.clarity_detail_var.set("Transcribe more speech to estimate fluency & retrieval signals.")
             self.clarity_peer_var.set("Comparison unavailable (no words detected).")
@@ -5211,11 +5412,14 @@ Troubleshooting:
         )
         self._peer_snapshot["clarity"] = (filler_delta + rep_delta) / 2.0
 
-        view_mode = getattr(self, "clarity_view_var", None)
-        view_mode = view_mode.get() if view_mode is not None else "fillers_per_100"
         if view_mode == "breakdown":
             self._sync_dynamic_tab_band("clarity", "clarity_fillers_per_100", filler_per_100)
             items = Counter(counts).most_common(5)
+            if lexical_insights is not None:
+                self._set_tab_guide(
+                    "clarity",
+                    lexical_insights.interpret_categorical_view("clarity_breakdown", {"top_items": items}, sl),
+                )
             if not items:
                 self._draw_empty_insight_canvas(self.clarity_canvas, "No fillers detected in slice")
                 return
@@ -5225,6 +5429,8 @@ Troubleshooting:
                 colors=["#38bdf8", "#22d3ee", "#2dd4bf", "#f59e0b", "#f97316"],
             )
         else:
+            if lexical_insights is not None:
+                self._set_tab_guide("clarity", lexical_insights.interpret_metric_window(sl, view_mode))
             self._sync_dynamic_tab_band("clarity", view_mode, summ.get(view_mode, filler_per_100))
             self._draw_timeseries_chart(self.clarity_canvas, sl, view_mode)
 
@@ -5233,7 +5439,17 @@ Troubleshooting:
             return
         sl = sl or getattr(self, "_current_lexical_slice", None)
         tokens = tokens or []
+        view_mode = getattr(self, "lexical_view_var", None)
+        view_mode = view_mode.get() if view_mode is not None else "mattr_diversity"
         if not tokens:
+            if lexical_insights is not None:
+                if view_mode == "breakdown":
+                    self._set_tab_guide(
+                        "lexical",
+                        lexical_insights.interpret_categorical_view("lexical_breakdown", {"top_words": []}, sl),
+                    )
+                else:
+                    self._set_tab_guide("lexical", lexical_insights.interpret_metric_window(sl, view_mode))
             self.lexical_summary_var.set("No vocabulary data yet")
             self.lexical_detail_var.set("Start dictating to populate vocabulary metrics.")
             self.lexical_peer_var.set("Comparison unavailable (no vocabulary sample).")
@@ -5284,9 +5500,12 @@ Troubleshooting:
             + f" ({total:,} words)"
         )
 
-        view_mode = getattr(self, "lexical_view_var", None)
-        view_mode = view_mode.get() if view_mode is not None else "mattr_diversity"
         if view_mode == "breakdown":
+            if lexical_insights is not None:
+                self._set_tab_guide(
+                    "lexical",
+                    lexical_insights.interpret_categorical_view("lexical_breakdown", {"top_words": top}, sl),
+                )
             self._sync_dynamic_tab_band("lexical", "mattr_diversity", diversity)
             self._draw_vertical_bars(
                 self.lexical_canvas,
@@ -5294,6 +5513,8 @@ Troubleshooting:
                 colors=["#34d399", "#2dd4bf", "#14b8a6", "#0ea5e9", "#22d3ee"],
             )
         else:
+            if lexical_insights is not None:
+                self._set_tab_guide("lexical", lexical_insights.interpret_metric_window(sl, view_mode))
             self._sync_dynamic_tab_band("lexical", view_mode, summ.get(view_mode, diversity))
             self._draw_timeseries_chart(self.lexical_canvas, sl, view_mode)
 
@@ -5343,7 +5564,19 @@ Troubleshooting:
     def _refresh_intervention_tab(self, sentences=None):
         if not hasattr(self, "intervention_summary_var"):
             return  # tab body not built yet
+        sl = getattr(self, "_current_lexical_slice", None)
         if not sentences:
+            if lexical_insights is not None:
+                self._set_tab_guide(
+                    "intervention",
+                    {
+                        "explanation": (
+                            "Counts conversational stance markers — open questions, empathetic reflections, "
+                            "affirmations, summaries, and individual ('I/ich') vs. collective ('we/wir') framing."
+                        ),
+                        "pattern": "No sentence samples in this slice yet — widen horizon to inspect stance.",
+                    },
+                )
             self.intervention_summary_var.set("No intervention data yet")
             self.intervention_detail_var.set("Heuristic language tag counts will appear here.")
             self.intervention_peer_var.set("Comparison unavailable (no sentence samples).")
@@ -5358,6 +5591,23 @@ Troubleshooting:
         for sentence in sentences:
             self_count += len(self._SELF_WORDS_RX.findall(sentence))
             collective_count += len(self._COLLECTIVE_WORDS_RX.findall(sentence))
+
+        if lexical_insights is not None:
+            self._set_tab_guide(
+                "intervention",
+                lexical_insights.interpret_categorical_view(
+                    "interventions",
+                    {
+                        "open_q": open_questions,
+                        "reflect": reflections,
+                        "affirm": affirmations,
+                        "summary": summaries,
+                        "self_count": self_count,
+                        "we_count": collective_count,
+                    },
+                    sl,
+                ),
+            )
 
         total = len(sentences)
         self.intervention_summary_var.set(
@@ -5630,9 +5880,15 @@ Troubleshooting:
             return
         self.ai_mood_summary_var.set("Loading mood cache...")
         self.ai_mood_canvas.update_idletasks()
+        sl = getattr(self, "_current_lexical_slice", None)
 
         cache = self._get_daily_insights_cache()
         if not cache:
+            if lexical_insights is not None:
+                self._set_tab_guide(
+                    "mood",
+                    lexical_insights.interpret_categorical_view("mood", {"scores": []}, sl),
+                )
             self._draw_empty_insight_canvas(self.ai_mood_canvas, "No AI history to plot yet.")
             return
 
@@ -5640,6 +5896,12 @@ Troubleshooting:
         dates = self._filter_ai_dates(dates, self.ai_mood_temporal_var.get())
 
         valid_dates = [d for d in dates if "mood_score" in cache[d]]
+        scores = [float(cache[d].get("mood_score", 50)) for d in valid_dates]
+        if lexical_insights is not None:
+            self._set_tab_guide(
+                "mood",
+                lexical_insights.interpret_categorical_view("mood", {"scores": scores}, sl),
+            )
         if len(valid_dates) < 2:
             self.ai_mood_summary_var.set("Not enough scored days.")
             self._draw_empty_insight_canvas(self.ai_mood_canvas, "Need at least 2 days of scored Moods.")
@@ -5784,30 +6046,31 @@ Troubleshooting:
 
         lex_idx = self._get_lexical_index() if lexical_insights is not None else None
         lang_mode = self.insights_lang_var.get() if hasattr(self, "insights_lang_var") else "All"
+        sl = getattr(self, "_current_lexical_slice", None)
+        key_map = {
+            "Clarity Index": "clarity_index",
+            "Lexical Diversity": "mattr_diversity",
+            "Long Pauses %": "pause_long_pct",
+            "Vitality": "vitality_balance",
+        }
+        mapped_mkey = key_map.get(metric_type)
 
         if metric_type == "Mood":
             cache = self._get_daily_insights_cache()
             for d, data in cache.items():
                 if "mood_score" in data:
                     daily_vals[d] = float(data["mood_score"])
-        elif lex_idx is not None and metric_type in ("Clarity Index", "Lexical Diversity", "Long Pauses %", "Vitality"):
-            key_map = {
-                "Clarity Index": "clarity_index",
-                "Lexical Diversity": "mattr_diversity",
-                "Long Pauses %": "pause_long_pct",
-                "Vitality": "vitality_balance",
-            }
-            mkey = key_map[metric_type]
+        elif lex_idx is not None and mapped_mkey is not None:
             offsets = lexical_insights._compute_language_offsets(lex_idx.daily)
             baselines = getattr(self, "_lexical_baselines", None) or {}
             for d_iso, rec in lex_idx.daily.items():
                 m = lexical_insights.compute_record_metrics(rec, lang_mode=lang_mode, lang_offsets=offsets)
                 if m["words"] <= 0:
                     continue
-                if mkey == "clarity_index":
+                if mapped_mkey == "clarity_index":
                     val = lexical_insights.score_clarity_index(m, baselines)
                 else:
-                    val = m.get(mkey)
+                    val = m.get(mapped_mkey)
                 if val is not None:
                     daily_vals[d_iso] = float(val)
         elif tokens_per_entry is not None and len(tokens_per_entry) == len(entries):
@@ -5818,6 +6081,31 @@ Troubleshooting:
             for e in entries:
                 d = e["timestamp"].strftime("%Y-%m-%d")
                 daily_vals[d] += len(self._tokenize_words(e["text"]))
+
+        if self._is_trim_outliers_enabled() and lexical_insights is not None and len(daily_vals) >= 6:
+            cut_key = mapped_mkey or "volume_words"
+            base_ref = (getattr(self, "_lexical_baselines", None) or {}).get(cut_key)
+            lo_c, hi_c, _, _ = lexical_insights.compute_outlier_cutoff(
+                list(daily_vals.values()), base_ref, cut_key, INSIGHTS_OUTLIER_SIGMA
+            )
+            if lo_c is not None or hi_c is not None:
+                for d_k in list(daily_vals.keys()):
+                    dv = daily_vals[d_k]
+                    if (hi_c is not None and dv > hi_c) or (lo_c is not None and dv < lo_c):
+                        del daily_vals[d_k]
+
+        if lexical_insights is not None:
+            mean_v = (sum(daily_vals.values()) / len(daily_vals)) if daily_vals else None
+            cat_g = lexical_insights.interpret_categorical_view(
+                "activity",
+                {"metric_type": metric_type, "active_days": len(daily_vals), "mean_val": mean_v},
+                sl,
+            )
+            if mapped_mkey is not None and sl is not None:
+                m_g = lexical_insights.interpret_metric_window(sl, mapped_mkey)
+                cat_g["explanation"] = f"{cat_g['explanation']} Layer: {m_g['explanation']}"
+                cat_g["pattern"] = m_g["pattern"]
+            self._set_tab_guide("activity", cat_g)
 
         if not daily_vals:
             self._draw_empty_insight_canvas(self.activity_canvas, "No data in selected metric yet.")
@@ -5830,11 +6118,16 @@ Troubleshooting:
             return
         self.speaker_profile_canvas.delete("all")
         self.speaker_profile_canvas.update_idletasks()
+        sl = sl or getattr(self, "_current_lexical_slice", None)
         if not entries or len(all_tokens) < 10:
+            if lexical_insights is not None:
+                self._set_tab_guide(
+                    "profile",
+                    lexical_insights.interpret_categorical_view("profile", {"axes": {}}, sl),
+                )
             self._draw_empty_insight_canvas(self.speaker_profile_canvas, "Need more spoken data to build profile.")
             return
 
-        sl = sl or getattr(self, "_current_lexical_slice", None)
         summ = (sl or {}).get("summary") or {}
 
         # Axis 1: Length-invariant MATTR-50 diversity (scaled 45%->15 .. 80%->95)
@@ -5876,6 +6169,12 @@ Troubleshooting:
             "Inquiry Drive": max(10.0, inquiry_score),
             "Sustained Thought": max(10.0, thought_score),
         }
+
+        if lexical_insights is not None:
+            self._set_tab_guide(
+                "profile",
+                lexical_insights.interpret_categorical_view("profile", {"axes": axes_data}, sl),
+            )
 
         self._draw_radar_chart(self.speaker_profile_canvas, axes_data)
 
@@ -6104,8 +6403,8 @@ Troubleshooting:
 
         win = tk.Toplevel(self.root)
         win.title("neurowhisper · Longitudinal Speech & Cognitive Clarity Explorer")
-        win.geometry("1040x690")
-        win.minsize(780, 520)
+        win.geometry("1060x725")
+        win.minsize(780, 540)
         win.configure(bg=COLOR_BG)
         self._trends_explorer_win = win
 
@@ -6116,6 +6415,7 @@ Troubleshooting:
             self._explorer_main_canvas = None
             self._explorer_vol_canvas = None
             self._explorer_report_btn = None
+            self._explorer_trim_btn = None
             try:
                 win.destroy()
             except Exception:
@@ -6123,7 +6423,7 @@ Troubleshooting:
 
         win.protocol("WM_DELETE_WINDOW", _close_explorer)
 
-        # 1. Top Control Bar (synced with main Speech Insights horizon/bucket/lang)
+        # 1. Top Control Bar (synced with main Speech Insights horizon/bucket/lang/outliers)
         top_bar = tk.Frame(win, bg=COLOR_ACCENT_BG, highlightthickness=1, highlightbackground=COLOR_BORDER)
         top_bar.pack(fill="x", padx=14, pady=(12, 8))
 
@@ -6184,7 +6484,21 @@ Troubleshooting:
             border_width=1, border_color=COLOR_TEAL, text_color=COLOR_TEAL,
             command=self._export_and_open_html_report,
         )
-        self._explorer_report_btn.pack(side="right", padx=10, pady=8)
+        self._explorer_report_btn.pack(side="right", padx=(4, 10), pady=8)
+
+        self._explorer_trim_btn = ctk.CTkButton(
+            top_bar, text="✂ Kick >2.5σ", width=132, height=24, corner_radius=7,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color=COLOR_BG, hover_color=COLOR_TEAL_DIM,
+            border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT_MUTED,
+            command=self._toggle_trim_outliers,
+        )
+        self._explorer_trim_btn.pack(side="right", padx=(4, 2), pady=8)
+        self._create_tooltip(
+            self._explorer_trim_btn,
+            "Kick out >2.5σ outlier spikes (e.g. accidental hot-mic / stuck hotkey).\n"
+            "100% non-destructive — raw transcript files on disk are never modified.",
+        )
 
         # 2. Callout & Coverage Strip
         callout_frame = tk.Frame(win, bg=COLOR_BG)
@@ -6235,7 +6549,7 @@ Troubleshooting:
 
         # 4. Primary & Secondary Metric Selector Row
         metric_bar = tk.Frame(win, bg=COLOR_BG)
-        metric_bar.pack(fill="x", padx=16, pady=(0, 6))
+        metric_bar.pack(fill="x", padx=16, pady=(0, 4))
 
         self._explorer_label_to_key = {
             spec["label"]: k for k, spec in lexical_insights.METRIC_SPECS.items()
@@ -6277,9 +6591,38 @@ Troubleshooting:
             bg=COLOR_BG, fg=COLOR_TEXT_FAINT, font=("Arial", 8), anchor="w",
         ).pack(side="left", fill="x", expand=True)
 
+        # 4b. Local Zero-LLM Dimension Explanation + Window Pattern Card
+        guide_card = tk.Frame(
+            win, bg=COLOR_ACCENT_BG, highlightthickness=1, highlightbackground="#1f2937"
+        )
+        guide_card.pack(fill="x", padx=14, pady=(0, 6))
+        self._explorer_explain_var = tk.StringVar(value="")
+        self._explorer_pattern_var = tk.StringVar(value="")
+        exp_lbl = tk.Label(
+            guide_card, textvariable=self._explorer_explain_var,
+            bg=COLOR_ACCENT_BG, fg=COLOR_TEXT_MUTED, font=("Arial", 8),
+            anchor="w", justify="left", wraplength=980,
+        )
+        exp_lbl.pack(fill="x", padx=10, pady=(4, 1))
+        pat_lbl = tk.Label(
+            guide_card, textvariable=self._explorer_pattern_var,
+            bg=COLOR_ACCENT_BG, fg="#99f6e4", font=("Arial", 9, "bold"),
+            anchor="w", justify="left", wraplength=980,
+        )
+        pat_lbl.pack(fill="x", padx=10, pady=(0, 5))
+
+        def _sync_exp_guide_wrap(ev, l_a=exp_lbl, l_b=pat_lbl):
+            wl = max(320, int(ev.width) - 24)
+            if wl != getattr(guide_card, "_nw_last_wl", None):
+                guide_card._nw_last_wl = wl
+                l_a.configure(wraplength=wl)
+                l_b.configure(wraplength=wl)
+
+        guide_card.bind("<Configure>", _sync_exp_guide_wrap)
+
         # 5. Main Longitudinal Line Graph Canvas (expands with window)
         self._explorer_main_canvas = tk.Canvas(
-            win, height=330, bg=COLOR_TEXT_BG,
+            win, height=320, bg=COLOR_TEXT_BG,
             highlightthickness=1, highlightbackground=COLOR_BORDER,
         )
         self._explorer_main_canvas.pack(fill="both", expand=True, padx=14, pady=(0, 6))
@@ -6299,6 +6642,7 @@ Troubleshooting:
         self._explorer_vol_canvas.bind("<Configure>", _on_vol_cfg)
 
         self._update_range_button_styles()
+        self._update_trim_outlier_button_styles()
         if self._current_lexical_slice is None:
             self.refresh_insights_tabs()
         else:
@@ -6314,8 +6658,9 @@ Troubleshooting:
         if not self._explorer_is_open() or lexical_insights is None:
             return
         self._update_range_button_styles()
+        trim_on = self._is_trim_outliers_enabled()
         sl = self._current_lexical_slice
-        if sl is None:
+        if sl is None or bool(sl.get("trim_outliers", False)) != trim_on:
             lex_idx = self._get_lexical_index()
             if lex_idx is not None:
                 sl = lexical_insights.query_slice(
@@ -6323,8 +6668,11 @@ Troubleshooting:
                     range_spec=self.insights_range_var.get(),
                     bucket_mode=self.insights_bucket_var.get(),
                     lang_mode=self.insights_lang_var.get(),
+                    trim_outliers=trim_on,
+                    outlier_sigma=INSIGHTS_OUTLIER_SIGMA,
                 )
                 self._current_lexical_slice = sl
+        self._update_trim_outlier_button_styles()
 
         if not sl:
             return
@@ -6381,8 +6729,16 @@ Troubleshooting:
         s_lbl = self._explorer_secondary_var.get()
         s_key = self._explorer_label_to_key.get(s_lbl) if s_lbl != "None" else None
 
-        p_spec = lexical_insights.METRIC_SPECS.get(p_key, {})
-        self._explorer_desc_var.set(p_spec.get("description", ""))
+        guide = lexical_insights.interpret_metric_window(sl, p_key, secondary_key=s_key)
+        corr_txt = guide.get("correlation") or ""
+        self._explorer_desc_var.set(corr_txt)
+        if hasattr(self, "_explorer_explain_var"):
+            self._explorer_explain_var.set(f"What it measures: {guide.get('explanation', '')}")
+        if hasattr(self, "_explorer_pattern_var"):
+            pat_txt = guide.get("pattern", "")
+            self._explorer_pattern_var.set(
+                f"Window pattern: {pat_txt}" + (f"  ·  {corr_txt}" if corr_txt else "")
+            )
 
         self._draw_timeseries_chart(
             self._explorer_main_canvas, sl, p_key, secondary_key=s_key, show_baseline=True
@@ -6410,7 +6766,12 @@ Troubleshooting:
         cw = max(20, w - left - right)
         ch = max(16, h - top - bottom)
 
-        max_w = max(float(p.get("words", 0)) for p in pts) or 1.0
+        kept_vols = [
+            float(p.get("words", 0))
+            for p in pts
+            if "volume_words" not in (p.get("_trimmed_values") or {}) and float(p.get("words", 0)) > 0
+        ]
+        max_w = max(kept_vols) if kept_vols else 1.0
         n = len(pts)
         slot = cw / float(max(1, n))
         bar_w = max(1.5, min(18.0, slot * 0.72))
@@ -6427,11 +6788,14 @@ Troubleshooting:
         canvas.create_line(left, top + ch, left + cw, top + ch, fill="#1e293b")
 
         for i, p in enumerate(pts):
+            cx = (left + cw * 0.5) if n == 1 else (left + (i / float(n - 1)) * cw)
+            if "volume_words" in (p.get("_trimmed_values") or {}):
+                canvas.create_text(cx, top + 5, text="×", fill="#f59e0b", font=("Arial", 8, "bold"))
+                continue
             words = float(p.get("words", 0))
             if words <= 0:
                 continue
-            cx = (left + cw * 0.5) if n == 1 else (left + (i / float(n - 1)) * cw)
-            bh = max(2.0, (words / max_w) * ch)
+            bh = max(2.0, min(1.0, words / max_w) * ch)
             x0, x1 = cx - bar_w / 2.0, cx + bar_w / 2.0
             y1 = top + ch
             y0 = y1 - bh
@@ -6468,6 +6832,7 @@ Troubleshooting:
             cache_path=cache_p,
             out_dir=target_out,
             ai_insights_path=ai_path,
+            trim_outliers=self._is_trim_outliers_enabled(),
         )
         series_path = os.path.join(target_out, "series.json")
         build_series.common.write_json(series_path, series)

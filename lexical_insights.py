@@ -42,6 +42,7 @@ try:
         GERMAN_FUNCTION_WORDS,
         GERMAN_STOPWORDS,
         INSIGHTS_MIN_WORDS_CONFIDENT,
+        INSIGHTS_OUTLIER_SIGMA,
         INSIGHTS_RANGE_OPTIONS,
         LEXICAL_CACHE_PREFIX,
         PEER_BENCHMARKS,
@@ -56,6 +57,7 @@ except Exception:  # pragma: no cover - standalone fallback outside repo root
     PERSONAL_BASELINE_DAYS = 90
     PERSONAL_BASELINE_MIN_DAYS = 14
     INSIGHTS_MIN_WORDS_CONFIDENT = 40
+    INSIGHTS_OUTLIER_SIGMA = 2.5
     GERMAN_DETECT_THRESHOLD = 0.08
     INSIGHTS_RANGE_OPTIONS = {
         "Today": 0,
@@ -228,12 +230,13 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "unit": "",
         "decimals": 1,
         "good_direction": "higher",
+        "two_sided_outlier": True,
         "color": "#2dd4bf",
         "peer_key": "clarity_index",
         "description": (
-            "Personal composite (50 = your 90-day norm) combining lexical diversity "
-            "(+MATTR-50), specificity (-vague placeholders), fluency (-fillers/repairs), "
-            "and continuity (-long pauses). Sustained dips below 40 may reflect fatigue or brain fog."
+            "Personal composite (50 = your 90-day norm) combining vocabulary variety (+MATTR-50), "
+            "word specificity (-vague placeholders), verbal fluency (-fillers & self-repairs), "
+            "and continuity (-long pauses >=5s)."
         ),
     },
     "mattr_diversity": {
@@ -242,11 +245,12 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "unit": "%",
         "decimals": 1,
         "good_direction": "higher",
+        "two_sided_outlier": True,
         "color": "#34d399",
         "peer_key": "mattr_diversity",
         "description": (
-            "Moving-Average Type-Token Ratio across 50-word windows (language-adjusted). "
-            "Immune to sample-length bias so 7-day, 6-month, and YTD slices stay comparable."
+            "Moving-Average Type-Token Ratio: distinct words per 50-word sliding window (EN/DE aligned). "
+            "Unlike raw unique-word %, MATTR-50 stays fair across short days and multi-month horizons."
         ),
     },
     "vague_per_100": {
@@ -258,8 +262,8 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "color": "#f59e0b",
         "peer_key": "vague_per_100",
         "description": (
-            "Placeholder nouns & hedges ('thing, stuff, something / dinge, irgendwas') "
-            "per 100 words — rises when specific word retrieval feels effortful."
+            "Generic placeholder words ('thing, stuff, something, sort of / Ding, Zeug, irgendwas') "
+            "per 100 words — tracks how often general stand-ins replace precise nouns."
         ),
     },
     "pause_long_pct": {
@@ -271,7 +275,8 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "color": "#ef4444",
         "peer_key": "pause_long_pct",
         "description": (
-            "Share of within-burst dictation gaps (<=120s) lasting 5 seconds or longer."
+            "Percentage of within-session dictation gaps (<=120s) lasting 5 seconds or longer — "
+            "captures mid-chain stalls, retrieval hesitations, or thinking pauses between utterances."
         ),
     },
     "pause_p90_s": {
@@ -283,8 +288,8 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "color": "#fb7185",
         "peer_key": "pause_p90_s",
         "description": (
-            "90th-percentile burst pause duration in seconds — sensitive to occasional "
-            "long mid-thought stalls."
+            "Duration (in seconds) of your longest 10% of within-burst pauses — sensitive to "
+            "occasional heavy mid-thought blocks that average pause time can hide."
         ),
     },
     "pause_avg_s": {
@@ -295,7 +300,9 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "good_direction": "lower",
         "color": "#f97316",
         "peer_key": "pause_avg_seconds",
-        "description": "Mean timestamp gap (<=120s) between consecutive utterances.",
+        "description": (
+            "Mean timestamp gap (up to 120s) between consecutive utterances in an active dictation burst."
+        ),
     },
     "fillers_per_100": {
         "label": "Filler Words",
@@ -305,7 +312,10 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "good_direction": "lower",
         "color": "#38bdf8",
         "peer_key": "clarity_fillers_per_100",
-        "description": "Vocalized hesitations & discourse fillers per 100 words (EN + DE).",
+        "description": (
+            "Vocalized hesitation markers ('um, uh, like, you know / äh, ähm, halt, quasi') per 100 words — "
+            "reflects real-time speech planning load while formulating thoughts."
+        ),
     },
     "disfluency_per_1k": {
         "label": "Repetitions & Self-Repairs",
@@ -316,7 +326,8 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "color": "#818cf8",
         "peer_key": "clarity_repetition_per_1k",
         "description": (
-            "Immediate word/phrase repetitions plus aborted clauses ('...', '--') per 1,000 words."
+            "Immediate word/phrase repetitions ('the the', 'I think I think') plus mid-sentence restarts "
+            "('...', '--') per 1,000 words — tracks working-memory restarts during speech."
         ),
     },
     "content_density_pct": {
@@ -325,9 +336,27 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "unit": "%",
         "decimals": 1,
         "good_direction": "higher",
+        "two_sided_outlier": True,
         "color": "#22d3ee",
         "peer_key": "content_density_pct",
-        "description": "Share of non-stopword content words (language-adjusted idea density proxy).",
+        "description": (
+            "Share of substantive content words (nouns, verbs, adjectives) vs. grammatical glue words, "
+            "normalized across English and German — a classic proxy for propositional idea density."
+        ),
+    },
+    "lexical_long_word_percent": {
+        "label": "Vocabulary Depth (7+ Char Words)",
+        "short": "7+ Chars %",
+        "unit": "%",
+        "decimals": 1,
+        "good_direction": "higher",
+        "two_sided_outlier": True,
+        "color": "#0ea5e9",
+        "peer_key": "lexical_long_word_percent",
+        "description": (
+            "Percentage of words with 7 or more characters (EN/DE offset-adjusted) — reflects technical "
+            "precision and morphological complexity vs. simplified everyday phrasing."
+        ),
     },
     "pace_words_entry": {
         "label": "Sustained Utterance Length",
@@ -337,7 +366,10 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "good_direction": "higher",
         "color": "#2dd4bf",
         "peer_key": "pace_avg_words_entry",
-        "description": "Mean words per dictation entry — tracks sustained thought vs fragmentation.",
+        "description": (
+            "Average words spoken per dictation chunk — distinguishes sustained multi-clause reasoning "
+            "from fragmented bursts or quick one-line commands."
+        ),
     },
     "words_per_sentence": {
         "label": "Mean Sentence Length",
@@ -347,7 +379,9 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "good_direction": "neutral",
         "color": "#60a5fa",
         "peer_key": "pace_avg_words_entry",
-        "description": "Average words per punctuated sentence (syntactic elaboration proxy).",
+        "description": (
+            "Average words per punctuated sentence — tracks syntactic elaboration and clause complexity."
+        ),
     },
     "self_focus_per_100": {
         "label": "Self-Focus ('I / ich')",
@@ -358,8 +392,8 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "color": "#c084fc",
         "peer_key": "self_focus_per_100",
         "description": (
-            "1st-person singular pronouns per 100 words. Sustained upward shifts can "
-            "accompany inward rumination or personal stress load."
+            "1st-person singular pronouns ('I, me, my / ich, mir, mich, mein*') per 100 words — tracks "
+            "inward self-referential focus vs. external/task-focused or collective ('we/wir') framing."
         ),
     },
     "absolutist_per_100": {
@@ -371,7 +405,8 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "color": "#f472b6",
         "peer_key": "absolutist_per_100",
         "description": (
-            "All-or-nothing quantifiers ('always, never, nothing / immer, nie, nichts') per 100 words."
+            "All-or-nothing words ('always, never, completely, nothing / immer, nie, völlig, nichts') "
+            "per 100 words — tracks categorical framing vs. nuanced qualification."
         ),
     },
     "hedges_per_100": {
@@ -382,7 +417,10 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "good_direction": "lower",
         "color": "#fbbf24",
         "peer_key": "hedges_per_100",
-        "description": "Uncertainty markers ('maybe, not sure / vielleicht, keine ahnung') per 100 words.",
+        "description": (
+            "Tentative qualifiers ('maybe, perhaps, not sure / vielleicht, wahrscheinlich, keine Ahnung') "
+            "per 100 words — rises during exploratory brainstorming or low confidence."
+        ),
     },
     "vitality_balance": {
         "label": "Lexical Vitality vs. Strain",
@@ -390,11 +428,12 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "unit": "",
         "decimals": 1,
         "good_direction": "higher",
+        "two_sided_outlier": True,
         "color": "#4ade80",
         "peer_key": "vitality_balance",
         "description": (
-            "100% local lexical affect balance (50 = neutral; >50 more vitality/clarity words; "
-            "<50 more fatigue/overload/stress words)."
+            "100% offline affect word balance centered at 50 (>50 = more energy/clarity/progress words; "
+            "<50 = more tired/foggy/overwhelmed/stressed words)."
         ),
     },
     "late_night_pct": {
@@ -405,7 +444,10 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "good_direction": "lower",
         "color": "#a78bfa",
         "peer_key": "late_night_pct",
-        "description": "Percentage of words spoken between 22:00 and 04:59 (circadian drift proxy).",
+        "description": (
+            "Percentage of your dictated words spoken between 22:00 and 04:59 — a local behavioral "
+            "proxy for evening work extension and sleep-window encroachment."
+        ),
     },
     "acoustic_wpm": {
         "label": "Articulation Speed (Acoustic WPM)",
@@ -415,7 +457,10 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "good_direction": "neutral",
         "color": "#14b8a6",
         "peer_key": "acoustic_wpm",
-        "description": "Spoken words per minute from local segment timing (recorded on new dictations).",
+        "description": (
+            "True speaking rate (words per minute of active voice, excluding silence) captured from "
+            "local ASR segment timestamps on new recordings."
+        ),
     },
     "acoustic_silence_pct": {
         "label": "Within-Utterance Silence (VAD)",
@@ -425,7 +470,10 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "good_direction": "lower",
         "color": "#fb923c",
         "peer_key": "acoustic_silence_pct",
-        "description": "Share of non-speech pause time inside utterances (recorded on new dictations).",
+        "description": (
+            "Share of non-speech silence inside individual recordings (captured forward via local ASR "
+            "segment boundaries) — measures mid-sentence hesitation or open-mic dead air."
+        ),
     },
     "volume_words": {
         "label": "Dictated Volume",
@@ -435,7 +483,10 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "good_direction": "higher",
         "color": "#38bdf8",
         "peer_key": None,
-        "description": "Total words dictated per period.",
+        "description": (
+            "Total words dictated per time bucket — provides context so rate changes on quiet days "
+            "aren't over-interpreted."
+        ),
     },
 }
 
@@ -1977,17 +2028,170 @@ def _is_iso_date(day_str: str) -> bool:
         return False
 
 
+def compute_outlier_cutoff(
+    values: list[float | None],
+    baseline: dict[str, Any] | None = None,
+    metric_key: str = "",
+    sigma_mult: float = INSIGHTS_OUTLIER_SIGMA,
+) -> tuple[float | None, float | None, float, float]:
+    """Compute resistant ``(low_cutoff, high_cutoff, center, sd)`` for ``> 2.5σ`` outlier scrubbing.
+
+    Uses a trimmed core standard deviation + MAD/IQR scale so extreme open-mic
+    spikes never inflate ``sd`` and mask themselves, while safeguarding ``0``-heavy
+    metrics with a scale-appropriate floor.
+    """
+    clean = [float(v) for v in values if v is not None and math.isfinite(float(v))]
+    has_personal = bool(baseline and baseline.get("is_personal"))
+    if len(clean) < 4 and not has_personal:
+        return None, None, 0.0, 1.0
+
+    spec = METRIC_SPECS.get(metric_key, {})
+    peer_key = spec.get("peer_key")
+    peer = PEER_BENCHMARKS.get(peer_key or "", {})
+    if "low" in peer and "high" in peer:
+        min_sd = max(0.20, abs(float(peer["high"]) - float(peer["low"])) * 0.12)
+    else:
+        med_guess = statistics.median(clean) if clean else 50.0
+        min_sd = max(1.0, abs(med_guess) * 0.12)
+
+    if len(clean) >= 5:
+        s_vals = sorted(clean)
+        n = len(s_vals)
+        n_hi = max(1, int(n * 0.15))
+        n_lo = int(n * 0.10) if n >= 8 else 0
+        core = s_vals[n_lo : n - n_hi]
+        if len(core) < 3:
+            core = s_vals[:-1]
+        med = float(statistics.median(s_vals))
+        mad_sd = float(statistics.median([abs(x - med) for x in s_vals])) * 1.4826
+        q1 = s_vals[n // 4]
+        q3 = s_vals[(n * 3) // 4]
+        iqr_sd = (q3 - q1) / 1.349
+        core_std = float(statistics.stdev(core)) if len(core) >= 2 else 0.0
+        center = (0.5 * med + 0.5 * float(baseline["median"])) if has_personal else med
+        sd = max(mad_sd, iqr_sd, core_std, min_sd)
+        if has_personal:
+            sd = max(sd, float(baseline.get("sigma", min_sd)) * 0.70)
+    else:
+        center = float(baseline["median"]) if baseline else float(statistics.median(clean))
+        sd = max(float(baseline.get("sigma", min_sd)) if baseline else min_sd, min_sd)
+
+    eff_mult = max(1.5, float(sigma_mult))
+    high_cut = center + eff_mult * sd
+    low_cut: float | None = None
+    if spec.get("two_sided_outlier"):
+        low_cut = center - eff_mult * sd
+    return low_cut, high_cut, center, sd
+
+
+def filter_outlier_entries(
+    entries: list[dict[str, Any]],
+    tokens_per_entry: list[list[str]] | None = None,
+    sigma_mult: float = INSIGHTS_OUTLIER_SIGMA,
+    *,
+    outlier_sigma: float | None = None,
+) -> tuple[list[int], int]:
+    """Identify non-outlier entry indices, excluding accidental open-mic utterances (>2.5σ).
+
+    Catches both runaway long recordings (word count > center + 2.5σ and >= 80 words)
+    and silence-hallucination repetition storms (immediate repeat rate > center + 2.5σ).
+    Returns ``(kept_indices, removed_count)``.
+    """
+    eff_sigma = float(outlier_sigma) if outlier_sigma is not None else float(sigma_mult)
+    n = len(entries)
+    if n < 5:
+        return list(range(n)), 0
+
+    toks_list = (
+        tokens_per_entry
+        if (tokens_per_entry is not None and len(tokens_per_entry) == n)
+        else [tokenize_words(e.get("text", "")) for e in entries]
+    )
+    lengths = [float(len(t)) for t in toks_list]
+    non_empty = [x for x in lengths if x > 0]
+    if len(non_empty) < 5:
+        return list(range(n)), 0
+
+    _, len_high, len_center, _ = compute_outlier_cutoff(
+        non_empty, baseline=None, metric_key="pace_words_entry", sigma_mult=eff_sigma
+    )
+    rep_rates: list[float] = []
+    for toks in toks_list:
+        if len(toks) >= 6:
+            reps = sum(1 for i in range(len(toks) - 1) if toks[i] == toks[i + 1])
+            rep_rates.append((reps * 1000.0) / len(toks))
+        else:
+            rep_rates.append(0.0)
+    _, rep_high, _, _ = compute_outlier_cutoff(
+        rep_rates, baseline=None, metric_key="disfluency_per_1k", sigma_mult=eff_sigma
+    )
+
+    kept: list[int] = []
+    removed = 0
+    min_runaway_words = max(80.0, len_center * 2.2)
+    for idx in range(n):
+        w_len = lengths[idx]
+        r_rate = rep_rates[idx]
+        is_runaway_len = len_high is not None and w_len > len_high and w_len >= min_runaway_words
+        is_rep_storm = rep_high is not None and w_len >= 8 and r_rate > rep_high and r_rate >= 180.0
+        if is_runaway_len or is_rep_storm:
+            removed += 1
+        else:
+            kept.append(idx)
+    return kept, removed
+
+
+def _detect_runaway_open_mic_days(
+    day_metrics_map: dict[str, dict[str, Any]],
+    baselines: dict[str, dict[str, Any]],
+    sigma_mult: float,
+) -> set[str]:
+    """Detect calendar days dominated by accidental open-mic captures before bucketing."""
+    if len(day_metrics_map) < 5:
+        return set()
+
+    pace_vals = [m.get("pace_words_entry") for m in day_metrics_map.values()]
+    rep_vals = [m.get("disfluency_per_1k") for m in day_metrics_map.values()]
+    sil_vals = [m.get("acoustic_silence_pct") for m in day_metrics_map.values()]
+
+    _, pace_hi, pace_c, _ = compute_outlier_cutoff(
+        pace_vals, baselines.get("pace_words_entry"), "pace_words_entry", sigma_mult
+    )
+    _, rep_hi, _, _ = compute_outlier_cutoff(
+        rep_vals, baselines.get("disfluency_per_1k"), "disfluency_per_1k", sigma_mult
+    )
+    _, sil_hi, _, _ = compute_outlier_cutoff(
+        sil_vals, baselines.get("acoustic_silence_pct"), "acoustic_silence_pct", sigma_mult
+    )
+
+    flagged: set[str] = set()
+    for d_iso, m in day_metrics_map.items():
+        pw = m.get("pace_words_entry")
+        rp = m.get("disfluency_per_1k")
+        sl = m.get("acoustic_silence_pct")
+        if pw is not None and pace_hi is not None and pw > pace_hi and pw >= max(110.0, pace_c * 2.4):
+            flagged.add(d_iso)
+        elif rp is not None and rep_hi is not None and rp > rep_hi and rp >= 45.0:
+            flagged.add(d_iso)
+        elif sl is not None and sil_hi is not None and sl > sil_hi and sl >= 75.0:
+            flagged.add(d_iso)
+    return flagged
+
+
 def query_slice(
     index: LexicalDiskIndex | dict[str, dict[str, Any]],
     range_spec: Any = "6 months",
     bucket_mode: str = "Auto",
     lang_mode: str = "All",
     today: dt.date | None = None,
+    trim_outliers: bool = False,
+    outlier_sigma: float = INSIGHTS_OUTLIER_SIGMA,
 ) -> dict[str, Any]:
-    """Slice, aggregate, smooth, and summarize any longitudinal horizon in milliseconds."""
+    """Slice, aggregate, optionally scrub >2.5σ outliers, smooth, and summarize in milliseconds."""
     raw_daily = index.daily if isinstance(index, LexicalDiskIndex) else index
     daily_map = {k: v for k, v in (raw_daily or {}).items() if isinstance(k, str) and isinstance(v, dict) and _is_iso_date(k)}
     today = today or dt.date.today()
+    eff_sigma = max(1.5, float(outlier_sigma or INSIGHTS_OUTLIER_SIGMA))
 
     all_dates = sorted(daily_map.keys())
     first_archive = dt.date.fromisoformat(all_dates[0]) if all_dates else None
@@ -2037,6 +2241,14 @@ def query_slice(
             "rolling_window": 3,
             "rolling_label": "3h rolling",
             "lang_mode": lang_mode,
+            "trim_outliers": bool(trim_outliers),
+            "outlier_sigma": eff_sigma,
+            "trimmed_days_count": 0,
+            "detected_runaway_days": 0,
+            "trimmed_points_by_metric": {},
+            "detected_outliers_by_metric": {},
+            "total_trimmed_points": 0,
+            "total_outlier_buckets": 0,
             "points": points,
             "rolling": rolling_h,
             "summary": summary,
@@ -2046,12 +2258,8 @@ def query_slice(
             "callout": generate_fogwatch_callout([], summary, baselines, range_spec),
         }
 
-    # Filter matching calendar days and roll up into daily/weekly/monthly buckets
-    buckets_raw: dict[str, dict[str, Any]] = {}
-    bucket_labels: dict[str, str] = {}
-    active_days_in_slice = 0
-    window_total_rec = _empty_day_record()
-
+    # Pre-scan matching calendar days
+    candidate_days: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
     for day_iso, rec in daily_map.items():
         if not (start_iso <= day_iso <= end_iso):
             continue
@@ -2061,8 +2269,33 @@ def query_slice(
                 continue
         elif m_check["words"] <= 0 and int(rec.get("gap_count", 0)) <= 0:
             continue
-        active_days_in_slice += 1
-        _merge_day_records(window_total_rec, rec)
+        candidate_days[day_iso] = (rec, m_check)
+
+    runaway_days = _detect_runaway_open_mic_days(
+        {d: pair[1] for d, pair in candidate_days.items()}, baselines, eff_sigma
+    )
+    trimmed_days_count = 0
+
+    buckets_raw: dict[str, dict[str, Any]] = {}
+    bucket_labels: dict[str, str] = {}
+    active_days_in_slice = 0
+    window_total_rec = _empty_day_record()
+
+    for day_iso in sorted(candidate_days.keys()):
+        rec, _ = candidate_days[day_iso]
+        is_trimmed_runaway = (
+            trim_outliers
+            and day_iso in runaway_days
+            and (len(candidate_days) - trimmed_days_count) > 2
+        )
+        if is_trimmed_runaway:
+            trimmed_days_count += 1
+            if resolved_bucket != "daily":
+                continue
+        else:
+            active_days_in_slice += 1
+            _merge_day_records(window_total_rec, rec)
+
         bkey, blabel = _bucket_key_and_label(day_iso, resolved_bucket)
         if bkey not in buckets_raw:
             buckets_raw[bkey] = _empty_day_record()
@@ -2083,6 +2316,58 @@ def query_slice(
     summary = compute_record_metrics(window_total_rec, lang_mode=lang_mode, lang_offsets=lang_offsets)
     summary["clarity_index"] = score_clarity_index(summary, baselines)
 
+    # Evaluate >2.5σ bucket outliers across every longitudinal metric (and scrub when trim_outliers=True)
+    detected_outliers_by_metric: dict[str, int] = {}
+    trimmed_points_by_metric: dict[str, int] = {}
+    outlier_bucket_keys: set[str] = set()
+
+    for mkey, spec in METRIC_SPECS.items():
+        series_vals = [
+            p.get(mkey) for p in points
+            if p.get(mkey) is not None and (not p.get("low_confidence") or mkey == "volume_words" or len(points) < 8)
+        ]
+        if len(series_vals) < 4:
+            series_vals = [p.get(mkey) for p in points if p.get(mkey) is not None]
+        low_cut, high_cut, _c, _sd = compute_outlier_cutoff(
+            series_vals, baselines.get(mkey), mkey, eff_sigma
+        )
+
+        flagged_indices: list[int] = []
+        for idx, pt in enumerate(points):
+            v = pt.get(mkey)
+            if v is None or not math.isfinite(float(v)):
+                continue
+            fv = float(v)
+            is_runaway_pt = resolved_bucket == "daily" and str(pt.get("key")) in runaway_days
+            is_stat_out = (high_cut is not None and fv > high_cut) or (low_cut is not None and fv < low_cut)
+            if is_runaway_pt or is_stat_out:
+                flagged_indices.append(idx)
+                outlier_bucket_keys.add(str(pt.get("key", idx)))
+
+        if flagged_indices:
+            detected_outliers_by_metric[mkey] = len(flagged_indices)
+            if trim_outliers and len(flagged_indices) < len(points):
+                for idx in flagged_indices:
+                    orig_v = points[idx][mkey]
+                    points[idx].setdefault("_trimmed_values", {})[mkey] = orig_v
+                    points[idx][mkey] = None
+                trimmed_points_by_metric[mkey] = len(flagged_indices)
+
+                # Recompute clean summary metric from remaining non-outlier buckets
+                rem_pts = [p for p in points if p.get(mkey) is not None and math.isfinite(float(p[mkey]))]
+                if rem_pts:
+                    dec = int(spec.get("decimals", 2))
+                    if mkey == "volume_words":
+                        summary["volume_words"] = round(sum(float(p[mkey]) for p in rem_pts), 1)
+                        summary["words"] = int(round(summary["volume_words"]))
+                    else:
+                        w_tot = sum(max(1.0, float(p.get("words", 1))) for p in rem_pts)
+                        clean_avg = sum(float(p[mkey]) * max(1.0, float(p.get("words", 1))) for p in rem_pts) / max(w_tot, 1.0)
+                        summary[mkey] = round(clean_avg, max(dec, 2))
+
+    if trim_outliers and trimmed_points_by_metric:
+        summary["clarity_index"] = score_clarity_index(summary, baselines)
+
     if resolved_bucket == "daily":
         span_days = max(0, (end_d - start_d).days) if (start_d and end_d) else 180
         roll_w = 7 if span_days <= 45 else 14
@@ -2098,7 +2383,23 @@ def query_slice(
     for mkey in METRIC_SPECS:
         rolling[mkey] = compute_rolling_series(points, mkey, roll_w)
 
+    unique_outlier_buckets = (
+        len(outlier_bucket_keys | set(runaway_days))
+        if resolved_bucket == "daily"
+        else len(outlier_bucket_keys) + len(runaway_days)
+    )
+    total_trimmed_points = sum(trimmed_points_by_metric.values()) + (
+        trimmed_days_count if resolved_bucket != "daily" else 0
+    )
+
     callout = generate_fogwatch_callout(points, summary, baselines, range_spec)
+    if trim_outliers and (trimmed_days_count > 0 or trimmed_points_by_metric):
+        n_tot_trim = (
+            len(outlier_bucket_keys)
+            if resolved_bucket == "daily"
+            else trimmed_days_count + len(outlier_bucket_keys)
+        )
+        callout = f"{callout} [✂ >{eff_sigma:.1f}σ filter active: {max(1, n_tot_trim)} outlier bucket(s) excluded]"
 
     return {
         "range_spec": range_spec,
@@ -2108,6 +2409,14 @@ def query_slice(
         "rolling_window": roll_w,
         "rolling_label": roll_label,
         "lang_mode": lang_mode,
+        "trim_outliers": bool(trim_outliers),
+        "outlier_sigma": eff_sigma,
+        "trimmed_days_count": trimmed_days_count,
+        "detected_runaway_days": len(runaway_days),
+        "trimmed_points_by_metric": trimmed_points_by_metric,
+        "detected_outliers_by_metric": detected_outliers_by_metric,
+        "total_trimmed_points": total_trimmed_points,
+        "total_outlier_buckets": unique_outlier_buckets,
         "points": points,
         "rolling": rolling,
         "summary": summary,
@@ -2174,3 +2483,535 @@ def generate_fogwatch_callout(
     if not notes:
         return f"Analyzed {words:,} words across active slice."
     return " · ".join(notes) + "."
+
+
+# ---------------------------------------------------------------------------
+# Zero-LLM Deterministic Dimension Guide & Window Pattern Interpreter
+# ---------------------------------------------------------------------------
+
+def compute_series_correlation(
+    points: list[dict[str, Any]],
+    key_a: str,
+    key_b: str,
+) -> tuple[float | None, int]:
+    """Compute Pearson ``r`` between two metric series across paired buckets."""
+    pairs: list[tuple[float, float]] = []
+    for p in points:
+        va = p.get(key_a)
+        vb = p.get(key_b)
+        if va is None or vb is None:
+            continue
+        fa, fb = float(va), float(vb)
+        if math.isfinite(fa) and math.isfinite(fb):
+            pairs.append((fa, fb))
+    n = len(pairs)
+    if n < 5:
+        return None, n
+    ma = sum(x for x, _ in pairs) / n
+    mb = sum(y for _, y in pairs) / n
+    num = sum((x - ma) * (y - mb) for x, y in pairs)
+    da = math.sqrt(sum((x - ma) ** 2 for x, _ in pairs))
+    db = math.sqrt(sum((y - mb) ** 2 for _, y in pairs))
+    if da <= 1e-9 or db <= 1e-9:
+        return None, n
+    return max(-1.0, min(1.0, num / (da * db))), n
+
+
+def _z_of(summary: dict[str, Any], baselines: dict[str, dict[str, Any]], key: str) -> float | None:
+    val = summary.get(key)
+    base = baselines.get(key)
+    if val is None or not base:
+        return None
+    f_val = float(val)
+    f_med = float(base.get("median", 0.0))
+    sigma = max(float(base.get("sigma", 1.0)), 1e-3)
+    if not (math.isfinite(f_val) and math.isfinite(f_med) and math.isfinite(sigma)):
+        return None
+    return (f_val - f_med) / sigma
+
+
+def _domain_implication(
+    metric_key: str,
+    z: float | None,
+    traj_state: str,
+    is_spiky: bool,
+    summary: dict[str, Any],
+    baselines: dict[str, dict[str, Any]],
+) -> str:
+    """Synthesize non-diagnostic cross-metric context for what the window pattern may mean."""
+    z_vague = _z_of(summary, baselines, "vague_per_100") or 0.0
+    z_pause = _z_of(summary, baselines, "pause_long_pct") or 0.0
+    z_filler = _z_of(summary, baselines, "fillers_per_100") or 0.0
+    z_mattr = _z_of(summary, baselines, "mattr_diversity") or 0.0
+    z_vit = _z_of(summary, baselines, "vitality_balance") or 0.0
+    z_night = _z_of(summary, baselines, "late_night_pct") or 0.0
+    ci = summary.get("clarity_index")
+
+    if metric_key == "clarity_index":
+        if ci is not None and ci < 44.0:
+            drivers = []
+            if z_pause > 0.9:
+                drivers.append("longer pauses")
+            if z_vague > 0.9:
+                drivers.append("more vague stand-in words")
+            if z_mattr < -0.9:
+                drivers.append("narrower active vocabulary")
+            if z_filler > 0.9:
+                drivers.append("elevated fillers")
+            drv_txt = ", ".join(drivers[:3]) if drivers else "mild multi-factor hesitation shifts"
+            night_bit = " coinciding with increased late-night dictation" if z_night > 1.0 else ""
+            return (
+                f"Driven mainly by {drv_txt}{night_bit} — sustained multi-day dips often reflect "
+                f"sleep debt, cognitive overload, or mental fatigue rather than single-task noise."
+            )
+        if ci is not None and ci > 56.0:
+            return (
+                "Vocabulary breadth and retrieval continuity are crisp simultaneously — typical of "
+                "rested, high-focus drafting or well-rehearsed subject matter."
+            )
+        if traj_state == "downward":
+            return (
+                "Overall average is still near baseline, but the downward second-half slope suggests "
+                "accumulating fatigue or heavier task load worth watching."
+            )
+        return "Signals across vocabulary, specificity, and pause flow look balanced and consistent with your usual baseline."
+
+    if metric_key in ("mattr_diversity", "content_density_pct", "lexical_long_word_percent"):
+        if z is not None and z < -0.95:
+            if z_vague > 0.8 or z_pause > 0.8 or z_filler > 0.8:
+                return (
+                    "Narrower word variety is paired with higher hesitation/placeholder load — a pattern "
+                    "that can accompany word-finding fatigue or cognitive fog."
+                )
+            return (
+                "Word variety is narrower while fluency stays clean — typically points to focused "
+                "repetition on one technical topic or short command dictation rather than fatigue."
+            )
+        if z is not None and z > 0.95:
+            return (
+                "Broader, more varied word choice than usual — common during exploratory writing, "
+                "planning across diverse topics, or high mental energy."
+            )
+        return "Vocabulary variety is holding steady — no sign of progressive lexical narrowing in this window."
+
+    if metric_key in ("vague_per_100", "fillers_per_100", "disfluency_per_1k"):
+        if z is not None and z > 0.95:
+            if is_spiky:
+                return (
+                    "Concentrated in a few spiky sessions rather than every day — often caused by "
+                    "thinking aloud on hard problems, unscripted brainstorming, or background noise."
+                )
+            if z_pause > 0.8 or z_mattr < -0.8:
+                return (
+                    "Sustained rise alongside slower pauses or narrower vocabulary — suggests higher "
+                    "working-memory / word-retrieval effort (common with tiredness, stress, or multitasking)."
+                )
+            return (
+                "Higher conversational hesitation without vocabulary loss — usually reflects informal "
+                "improvised dictation rather than deeper retrieval strain."
+            )
+        if z is not None and z < -0.85:
+            return "Markedly cleaner retrieval than usual — characteristic of clear focus or well-structured thoughts."
+        return "Word-finding and verbal repair rates sit comfortably inside your normal personal range."
+
+    if metric_key in ("pause_long_pct", "pause_p90_s", "pause_avg_s", "acoustic_silence_pct"):
+        if z is not None and z > 0.95:
+            if z_vague > 0.8 or z_filler > 0.8 or z_mattr < -0.8:
+                return (
+                    "Longer stalls co-occur with vague words or narrower vocabulary — a classic "
+                    "cognitive-load / brain-fog signature where sentence planning takes extra effort."
+                )
+            return (
+                "Longer gaps appear while vocabulary precision remains sharp — usually reflects "
+                "deliberate thinking pauses (reading code/docs between utterances) or leaving the mic open."
+            )
+        if z is not None and z < -0.85:
+            return "Brisk, continuous utterance flow with very few mid-thought stalls."
+        return "Pause rhythm matches your normal speaking-and-thinking cadence."
+
+    if metric_key in ("pace_words_entry", "words_per_sentence", "acoustic_wpm"):
+        if z is not None and z < -0.95:
+            if z_pause > 0.8 or z_vit < -0.8:
+                return (
+                    "Shorter, more fragmented utterances paired with slower pauses/strain markers — "
+                    "can reflect low energy or cognitive fatigue."
+            )
+            return (
+                "Shorter utterances with clean fluency — typically reflects quick chat replies, "
+                "notes, or terminal/coding commands rather than long-form prose."
+            )
+        if z is not None and z > 0.95:
+            return "Sustained multi-sentence dictation bursts — characteristic of deep drafting or structured explanation."
+        return "Utterance length and elaboration match your typical working style."
+
+    if metric_key == "self_focus_per_100":
+        vit = summary.get("vitality_balance")
+        if z is not None and z > 0.95:
+            if vit is not None and vit < 45.0:
+                return (
+                    "Elevated 'I/ich' self-reference paired with strain/fatigue vocabulary — in "
+                    "psycholinguistic studies, sustained co-elevation can accompany stress or rumination (non-diagnostic)."
+                )
+            return (
+                "Higher 'I/ich' usage with steady/positive vitality — usually reflects personal "
+                "planning, status updates, or reflective journaling rather than distress."
+            )
+        return "Balance between self-reference ('I/ich') and external/collective focus is in your normal band."
+
+    if metric_key == "absolutist_per_100":
+        if z is not None and z > 0.95:
+            if z_vit < -0.8:
+                return (
+                    "More all-or-nothing phrasing ('always/never') alongside strain words — can appear "
+                    "when feeling pressured, frustrated, or cognitively overloaded (non-diagnostic)."
+                )
+            return (
+                "Slightly more categorical quantifiers without affect strain — often comes from "
+                "specifying strict technical rules or requirements ('must', 'all', 'never')."
+            )
+        return " Nuanced, non-rigid phrasing within your personal baseline."
+
+    if metric_key == "hedges_per_100":
+        if z is not None and z > 0.95:
+            return (
+                "More tentative qualifiers ('maybe, perhaps, not sure') — common when weighing "
+                "ambiguous decisions, exploring hypotheses, or feeling uncertain."
+            )
+        if z is not None and z < -0.85:
+            return "Direct, decisive phrasing with minimal hedging."
+        return "Uncertainty qualifiers sit within your usual conversational range."
+
+    if metric_key == "vitality_balance":
+        vit = summary.get("vitality_balance")
+        if vit is not None and vit < 44.0:
+            return (
+                "Fatigue/stress words ('tired, foggy, overwhelmed / müde, erschöpft') outweigh vitality "
+                "markers in this window — check alongside Clarity Index and Late-Night % for recovery cues."
+            )
+        if vit is not None and vit > 56.0:
+            return "Positive energy, progress, and clarity words outweigh strain vocabulary in this slice."
+        return "Affective word balance is neutral-to-steady around your personal baseline."
+
+    if metric_key == "late_night_pct":
+        ln = float(summary.get("late_night_pct") or 0.0)
+        if ln >= 18.0 or (z is not None and z > 1.0):
+            if ci is not None and ci < 46.0:
+                return (
+                    "Elevated 22:00–05:00 dictation coincides with a softer Clarity Index — late-night "
+                    "schedule drift may be carrying over into cognitive sharpness."
+                )
+            return (
+                "More late-night dictation than usual, though lexical clarity has held up so far — "
+                "worth monitoring so multi-day sleep debt doesn't accumulate."
+            )
+        return "Very little late-night speech — activity is concentrated in daytime/evening hours."
+
+    # volume_words fallback
+    return "Reflects your overall dictation engagement across active days in the selected horizon."
+
+
+def interpret_metric_window(
+    slice_data: dict[str, Any] | None,
+    metric_key: str,
+    secondary_key: str | None = None,
+) -> dict[str, str]:
+    """Generate a 100% local, zero-LLM explanation + window pattern reading in <0.5ms."""
+    spec = METRIC_SPECS.get(metric_key) or {
+        "label": metric_key,
+        "short": metric_key,
+        "unit": "",
+        "decimals": 1,
+        "good_direction": "neutral",
+        "description": "Local longitudinal speech indicator.",
+    }
+    explanation = str(spec.get("description", "")).strip()
+    title = str(spec.get("label", metric_key))
+
+    if not slice_data:
+        return {
+            "title": title,
+            "explanation": explanation,
+            "pattern": "Select a time horizon with recorded speech to evaluate your longitudinal pattern.",
+            "correlation": "",
+        }
+
+    summary = slice_data.get("summary") or {}
+    baselines = slice_data.get("baselines") or {}
+    points = slice_data.get("points") or []
+    words = int(summary.get("words", 0))
+
+    if words == 0:
+        return {
+            "title": title,
+            "explanation": explanation,
+            "pattern": "No transcribed words in this time slice yet — switch to 6m, YTD, or All to view history.",
+            "correlation": "",
+        }
+
+    val = summary.get(metric_key)
+    unit = str(spec.get("unit", ""))
+    dec = int(spec.get("decimals", 1))
+    if val is None:
+        if metric_key in ("acoustic_wpm", "acoustic_silence_pct"):
+            pat = (
+                "Recorded forward on new local dictations via ASR segment timestamps — make a new "
+                "Local Live or Batch recording to start populating this curve."
+            )
+        else:
+            pat = "Not enough data points on this dimension in the selected slice yet."
+        return {"title": title, "explanation": explanation, "pattern": pat, "correlation": ""}
+
+    if words < INSIGHTS_MIN_WORDS_CONFIDENT and metric_key != "volume_words":
+        return {
+            "title": title,
+            "explanation": explanation,
+            "pattern": (
+                f"Light sample ({words} words across slice; current {float(val):.{dec}f}{unit}). "
+                f"Dictate ~40+ words or widen the horizon for a reliable baseline & trend reading."
+            ),
+            "correlation": "",
+        }
+
+    # 1. Level vs. 90-day Personal Baseline
+    base = baselines.get(metric_key)
+    z = _z_of(summary, baselines, metric_key)
+    f_val = float(val)
+    if base and z is not None:
+        b_med = float(base.get("median", 0.0))
+        norm_tag = "90d personal norm" if base.get("is_personal") else "reference norm"
+        if abs(z) <= 0.85:
+            lvl_bit = f"Within your {norm_tag} ({f_val:.{dec}f}{unit} vs {b_med:.{dec}f}{unit})"
+        elif abs(z) <= 1.65:
+            dir_w = "moderately above" if z > 0 else "moderately below"
+            lvl_bit = f"{dir_w.capitalize()} your {norm_tag} ({f_val:.{dec}f}{unit} vs {b_med:.{dec}f}{unit}, {z:+.1f}σ)"
+        else:
+            dir_w = "clearly above" if z > 0 else "clearly below"
+            lvl_bit = f"{dir_w.capitalize()} your {norm_tag} ({f_val:.{dec}f}{unit} vs {b_med:.{dec}f}{unit}, {z:+.1f}σ)"
+    else:
+        lvl_bit = f"Window total/mean: {f_val:.{dec}f}{unit} across {slice_data.get('active_days_in_slice', 0)} active day(s)"
+
+    # 2. Trajectory & Volatility across buckets
+    valid_pts = [
+        p for p in points
+        if p.get(metric_key) is not None
+        and math.isfinite(float(p[metric_key]))
+        and (not p.get("low_confidence") or metric_key == "volume_words" or len(points) < 6)
+    ]
+    traj_state = "flat"
+    traj_bit = ""
+    is_spiky = False
+
+    if len(valid_pts) >= 4:
+        p_vals = [float(p[metric_key]) for p in valid_pts]
+        scale = max(float(base["sigma"]) if base else 0.0, statistics.pstdev(p_vals) or 1.0, 1e-3)
+        mid = len(p_vals) // 2
+        m1 = statistics.mean(p_vals[:mid])
+        m2 = statistics.mean(p_vals[mid:])
+        half_z = (m2 - m1) / scale
+
+        if half_z >= 0.55:
+            traj_state = "upward"
+            traj_bit = f"trending upward in the 2nd half ({m1:.{dec}f} → {m2:.{dec}f}{unit})"
+        elif half_z <= -0.55:
+            traj_state = "downward"
+            traj_bit = f"trending downward in the 2nd half ({m1:.{dec}f} → {m2:.{dec}f}{unit})"
+        else:
+            # Check recent 2-point tail vs earlier window mean
+            if len(p_vals) >= 6:
+                early_m = statistics.mean(p_vals[:-2])
+                tail_m = statistics.mean(p_vals[-2:])
+                tail_z = (tail_m - early_m) / scale
+                if abs(tail_z) >= 0.85:
+                    t_dir = "uptick" if tail_z > 0 else "dip"
+                    traj_bit = f"mostly flat with a recent {t_dir} ({tail_m:.{dec}f}{unit})"
+                else:
+                    traj_bit = "steady across the window"
+            else:
+                traj_bit = "steady across the window"
+
+        # Check episodic spikiness vs sustained level
+        if base:
+            b_hi = float(base.get("high", float("inf")))
+            b_lo = float(base.get("low", float("-inf")))
+            excursions = sum(1 for x in p_vals if x > b_hi or x < b_lo)
+            if 1 <= excursions <= max(2, len(p_vals) // 5):
+                is_spiky = True
+                traj_bit += f" ({excursions}/{len(p_vals)} buckets outside band)"
+    elif len(valid_pts) in (2, 3):
+        traj_bit = f"{len(valid_pts)} buckets in view (widen horizon for trend slope)"
+    else:
+        traj_bit = "single bucket in view"
+
+    # 3. Domain synthesis (cross-signal corroboration, zero LLM calls)
+    meaning = _domain_implication(metric_key, z, traj_state, is_spiky, summary, baselines)
+
+    # 4. Outlier status note
+    trim_on = bool(slice_data.get("trim_outliers"))
+    trimmed_n = int((slice_data.get("trimmed_points_by_metric") or {}).get(metric_key, 0))
+    detected_n = int((slice_data.get("detected_outliers_by_metric") or {}).get(metric_key, 0))
+    sigma_lbl = float(slice_data.get("outlier_sigma", INSIGHTS_OUTLIER_SIGMA))
+    outlier_note = ""
+    if trim_on and trimmed_n > 0:
+        outlier_note = f" [✂ {trimmed_n} >{sigma_lbl:.1f}σ spike(s) excluded]"
+    elif (not trim_on) and detected_n > 0:
+        outlier_note = f" [Tip: {detected_n} >{sigma_lbl:.1f}σ spike(s) present — click '✂ >2.5σ' to filter accidental pushes]"
+
+    # 5. Optional Primary vs. Secondary Overlay Correlation
+    corr_txt = ""
+    if secondary_key and secondary_key != metric_key and secondary_key in METRIC_SPECS:
+        r_val, n_pair = compute_series_correlation(points, metric_key, secondary_key)
+        sec_short = METRIC_SPECS[secondary_key].get("short", secondary_key)
+        if r_val is not None:
+            if r_val >= 0.35:
+                rel = "co-move positively"
+            elif r_val <= -0.35:
+                rel = "move inversely"
+            else:
+                rel = "vary mostly independently"
+            corr_txt = f"Overlay vs. {sec_short}: r = {r_val:+.2f} across {n_pair} buckets ({rel})."
+        elif n_pair >= 5:
+            corr_txt = f"Overlay vs. {sec_short}: r = +0.00 across {n_pair} buckets (one series is flat/constant)."
+
+    lead = f"{lvl_bit}, {traj_bit}." if traj_bit else f"{lvl_bit}."
+    pattern_full = f"{lead} {meaning}{outlier_note}".strip()
+    return {
+        "title": title,
+        "explanation": explanation,
+        "pattern": pattern_full,
+        "correlation": corr_txt,
+    }
+
+
+def interpret_categorical_view(
+    view_kind: str,
+    context: dict[str, Any] | None = None,
+    slice_data: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    """Zero-LLM explanation & pattern takeaway for categorical/breakdown/radar/heatmap views."""
+    ctx = context or {}
+    summ = (slice_data or {}).get("summary") or {}
+
+    if view_kind == "pause_breakdown":
+        s_cnt = int(ctx.get("short", 0))
+        m_cnt = int(ctx.get("medium", 0))
+        l_cnt = int(ctx.get("long", 0))
+        tot = max(1, s_cnt + m_cnt + l_cnt)
+        l_pct = (l_cnt * 100.0) / tot
+        expl = (
+            "Splits all within-burst dictation gaps (<=120s) into brisk transitions (<2s), "
+            "clause-planning pauses (2–5s), and extended stalls (>=5s)."
+        )
+        if s_cnt + m_cnt + l_cnt == 0:
+            pat = "Need consecutive utterances within 120s to populate pause buckets."
+        elif l_pct >= 28.0:
+            pat = (
+                f"Extended stalls (>=5s) make up {l_pct:.0f}% of transitions — check whether this "
+                f"coincides with vague words (retrieval load) or deliberate reading/coding pauses."
+            )
+        elif (s_cnt * 100.0 / tot) >= 60.0:
+            pat = f"Brisk <2s transitions dominate ({s_cnt}/{tot}) — fluid, continuous dictation momentum."
+        else:
+            pat = f"Balanced rhythm across brisk ({s_cnt}), medium ({m_cnt}), and long ({l_cnt}) pauses."
+        return {"title": "Pause Duration Breakdown", "explanation": expl, "pattern": pat, "correlation": ""}
+
+    if view_kind == "clarity_breakdown":
+        top_items = ctx.get("top_items") or []
+        expl = (
+            "Ranks your most frequent vocalized hesitation and discourse-filler habits across "
+            "English and German in the selected window."
+        )
+        if not top_items:
+            pat = "Zero filler habits detected in this slice — remarkably clean phrasing."
+        else:
+            lead_k, lead_n = top_items[0]
+            pat = (
+                f"'{lead_k}' is your dominant hesitation habit ({lead_n}x in slice). "
+                f"Acoustic 'um/uh/äh/ähm' spikes often track speech-planning effort, whereas 'like/halt/quasi' reflect conversational style."
+            )
+        return {"title": "Top Filler Habits", "explanation": expl, "pattern": pat, "correlation": ""}
+
+    if view_kind == "lexical_breakdown":
+        top_words = ctx.get("top_words") or []
+        mattr = summ.get("mattr_diversity")
+        expl = (
+            "Highlights your highest-frequency substantive content words (excluding EN/DE stopwords) "
+            "to surface recurring mental themes and active projects."
+        )
+        if not top_words:
+            pat = "Dictate more text in this window to surface recurring content themes."
+        else:
+            names = ", ".join(f"'{w}' ({c})" for w, c in top_words[:4])
+            m_bit = f" with {mattr:.1f}% MATTR-50 diversity" if mattr is not None else ""
+            pat = f"Dominant topical anchors in this window: {names}{m_bit}."
+        return {"title": "Core Content Themes", "explanation": expl, "pattern": pat, "correlation": ""}
+
+    if view_kind == "interventions":
+        oq = int(ctx.get("open_q", 0))
+        rf = int(ctx.get("reflect", 0))
+        af = int(ctx.get("affirm", 0))
+        su = int(ctx.get("summary", 0))
+        sc = int(ctx.get("self_count", 0))
+        wc = int(ctx.get("we_count", 0))
+        expl = (
+            "Counts conversational stance markers — open questions, empathetic reflections, "
+            "affirmations, summaries, and individual ('I/ich') vs. collective ('we/wir') framing."
+        )
+        stance = "collaborative ('we/wir'-leaning)" if wc > sc else "self-directed ('I/ich'-leaning)"
+        if oq + rf + af + su == 0:
+            pat = f"Primarily direct declarative dictation ({stance}, {sc}:{wc} I-to-We ratio) with few explicit Q&A/summary cues."
+        elif oq > (rf + af + su):
+            pat = f"Inquiry-heavy window ({oq} open questions; {stance}) — typical of exploratory problem-solving or prompting."
+        else:
+            pat = f"Structured communicative mix (Open Q {oq}, Affirm {af}, Summary {su}; {stance})."
+        return {"title": "Conversational Stance & Mix", "explanation": expl, "pattern": pat, "correlation": ""}
+
+    if view_kind == "activity":
+        mtype = str(ctx.get("metric_type", "Words (Volume)"))
+        n_days = int(ctx.get("active_days", 0))
+        mean_v = ctx.get("mean_val")
+        expl = (
+            "Calendar heatmap over up to 52 weeks (Mon–Sun rows) revealing weekday habits, "
+            "consistency streaks, and clusters of high clarity or strain."
+        )
+        if n_days == 0:
+            pat = "No active calendar days recorded for this heatmap layer yet."
+        else:
+            m_str = f" (mean {float(mean_v):.1f})" if mean_v is not None else ""
+            pat = f"Spans {n_days} active day(s) on '{mtype}'{m_str} — hover individual squares to spot multi-day clusters vs. isolated off-days."
+        return {"title": f"Calendar Heatmap · {mtype}", "explanation": expl, "pattern": pat, "correlation": ""}
+
+    if view_kind == "profile":
+        axes = ctx.get("axes") or {}
+        expl = (
+            "5-axis fingerprint balancing Vocabulary Variety (MATTR-50), Cognitive Clarity, "
+            "Lexical Vitality, Inquiry Drive (questions), and Sustained Thought (sentence length)."
+        )
+        if not axes:
+            pat = "Need at least 10 words in the selected window to build your 5-axis profile."
+        else:
+            strongest = max(axes.items(), key=lambda kv: kv[1])
+            weakest = min(axes.items(), key=lambda kv: kv[1])
+            pat = (
+                f"Strongest dimension in this window: {strongest[0]} ({strongest[1]:.0f}/100); "
+                f"softest axis: {weakest[0]} ({weakest[1]:.0f}/100)."
+            )
+        return {"title": "5-Axis Speaker Fingerprint", "explanation": expl, "pattern": pat, "correlation": ""}
+
+    if view_kind == "mood":
+        scores = ctx.get("scores") or []
+        vit = summ.get("vitality_balance")
+        expl = (
+            "Optional AI-crunched daily emotional tone (0–100, 50 = neutral). For 100% offline "
+            "zero-LLM affect tracking, check the 'Mind → Vitality' tab anytime."
+        )
+        if not scores:
+            v_hint = f" (Offline Mind Vitality in this window is {vit:.0f}/100.)" if vit is not None else ""
+            pat = f"No cached AI mood scores in this range yet.{v_hint}"
+        else:
+            avg_m = sum(scores) / len(scores)
+            tone = "upbeat/positive" if avg_m >= 58 else "strained/low" if avg_m <= 42 else "steady/balanced"
+            pat = f"Mean AI mood across {len(scores)} crunched day(s) is {avg_m:.0f}/100 ({tone})."
+        return {"title": "Mood Trajectory", "explanation": expl, "pattern": pat, "correlation": ""}
+
+    return {"title": view_kind, "explanation": "", "pattern": "", "correlation": ""}
+

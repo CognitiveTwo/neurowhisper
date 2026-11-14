@@ -423,6 +423,142 @@ class TestLexicalDiskIndexAndSlicing(unittest.TestCase):
 
 
 
+class TestOutlierKickOutAndZeroLlmInterpretations(unittest.TestCase):
+    def test_non_destructive_2_5_sigma_outlier_kickout_and_restore(self):
+        with tempfile.TemporaryDirectory(prefix="nw_lex_outliers_") as tmp:
+            trans_dir = os.path.join(tmp, "transcriptions")
+            os.makedirs(trans_dir, exist_ok=True)
+            cache_path = os.path.join(tmp, "lexical_cache.OUTPC.json")
+
+            rng = random.Random(99)
+            end_date = dt.date(2026, 4, 20)
+            lines_by_month: dict[str, list[str]] = {}
+            outlier_date = end_date - dt.timedelta(days=6)
+
+            for back in range(34, -1, -1):
+                cur = end_date - dt.timedelta(days=back)
+                mkey = cur.strftime("%Y-%m")
+                lines = lines_by_month.setdefault(mkey, [])
+                t0 = dt.datetime.combine(cur, dt.time(10, 0, 0))
+                for k in range(3):
+                    words = [rng.choice(FLUENT_EN_POOL) for _ in range(28)]
+                    ts = t0 + dt.timedelta(seconds=k * 2)
+                    lines.append(f"[{ts.strftime('%Y-%m-%d %H:%M:%S')}] {' '.join(words)}.")
+
+                if cur == outlier_date:
+                    # Simulate accidental open-mic / stuck hotkey: 1,100 words + filler/repeat spike + 88s gap
+                    ts_hot = t0 + dt.timedelta(seconds=92)
+                    hot_words = ["um", "the", "the", "thing", "stuff"] * 220
+                    lines.append(f"[{ts_hot.strftime('%Y-%m-%d %H:%M:%S')}] {' '.join(hot_words)}.")
+
+            file_snapshots: dict[str, bytes] = {}
+            for mkey, lines in lines_by_month.items():
+                fp = os.path.join(trans_dir, f"{mkey}.OUTPC.txt")
+                with open(fp, "w", encoding="utf-8") as fh:
+                    fh.write("\n".join(lines) + "\n")
+                with open(fp, "rb") as fh:
+                    file_snapshots[fp] = fh.read()
+
+            idx = lexical_insights.LexicalDiskIndex(trans_dir, cache_path, hostname="OUTPC")
+            idx.refresh()
+
+            # 1. Untrimmed slice detects >2.5σ spikes and surfaces tip without altering values
+            sl_raw = lexical_insights.query_slice(
+                idx, "30 days", "Daily", "All", today=end_date, trim_outliers=False, outlier_sigma=2.5
+            )
+            self.assertFalse(sl_raw["trim_outliers"])
+            self.assertGreater(sl_raw["total_outlier_buckets"], 0)
+            self.assertGreaterEqual(sl_raw["detected_outliers_by_metric"].get("volume_words", 0), 1)
+            raw_words = sl_raw["summary"]["words"]
+
+            tip_guide = lexical_insights.interpret_metric_window(sl_raw, "volume_words")
+            self.assertIn("Tip:", tip_guide["pattern"])
+            self.assertIn("2.5σ", tip_guide["pattern"])
+
+            # 2. Trimmed slice (>2.5σ) scrubs the open-mic day & bucket spikes non-destructively
+            sl_trim = lexical_insights.query_slice(
+                idx, "30 days", "Daily", "All", today=end_date, trim_outliers=True, outlier_sigma=2.5
+            )
+            self.assertTrue(sl_trim["trim_outliers"])
+            self.assertGreater(sl_trim["total_trimmed_points"], 0)
+            self.assertIn("✂", sl_trim["callout"])
+            # Summary words drops by the ~1,100-word accidental hot-mic day
+            self.assertLess(sl_trim["summary"]["words"], raw_words - 900)
+
+            out_pt = next(p for p in sl_trim["points"] if p["key"] == outlier_date.isoformat())
+            self.assertIsNone(out_pt["volume_words"])
+            self.assertGreater(out_pt["_trimmed_values"]["volume_words"], 1000.0)
+
+            trim_guide = lexical_insights.interpret_metric_window(sl_trim, "volume_words")
+            self.assertIn("✂", trim_guide["pattern"])
+
+            # 3. Raw transcript files on disk are 100% untouched byte-for-byte
+            for fp, orig_bytes in file_snapshots.items():
+                with open(fp, "rb") as fh:
+                    self.assertEqual(fh.read(), orig_bytes)
+
+            # 4. Toggling back to trim_outliers=False restores exact original slice summary
+            sl_restored = lexical_insights.query_slice(
+                idx, "30 days", "Daily", "All", today=end_date, trim_outliers=False, outlier_sigma=2.5
+            )
+            self.assertEqual(sl_restored["summary"]["words"], raw_words)
+            self.assertEqual(sl_restored["summary"]["clarity_index"], sl_raw["summary"]["clarity_index"])
+
+            # 5. Utterance-level filter_outlier_entries removes the 1,100-word hot-mic entry
+            entries = []
+            toks = []
+            base_ts = dt.datetime(2026, 4, 10, 9, 0, 0)
+            for i in range(20):
+                w = FLUENT_EN_POOL[:24]
+                entries.append({"timestamp": base_ts + dt.timedelta(minutes=i), "text": " ".join(w)})
+                toks.append(list(w))
+            hot_toks = ["thing"] * 950
+            entries.append({"timestamp": base_ts + dt.timedelta(minutes=25), "text": " ".join(hot_toks)})
+            toks.append(hot_toks)
+
+            kept_idx, removed_n = lexical_insights.filter_outlier_entries(entries, toks, outlier_sigma=2.5)
+            self.assertEqual(removed_n, 1)
+            self.assertEqual(len(kept_idx), 20)
+            self.assertNotIn(20, kept_idx)
+
+    def test_zero_llm_explanations_and_patterns_cover_all_metrics_and_views(self):
+        with tempfile.TemporaryDirectory(prefix="nw_lex_interp_") as tmp:
+            trans_dir = os.path.join(tmp, "transcriptions")
+            end_date = TestLexicalProxiesAndCrossLanguageNormalization()._write_synthetic_archive(trans_dir)
+            idx = lexical_insights.LexicalDiskIndex(
+                transcriptions_dir=trans_dir,
+                cache_path=os.path.join(tmp, "lexical_cache.INTPC.json"),
+                hostname="INTPC",
+            )
+            idx.refresh()
+            sl = lexical_insights.query_slice(idx, "90 days", "Weekly", "All", today=end_date)
+
+            self.assertGreaterEqual(len(lexical_insights.METRIC_SPECS), 20)
+            for mkey in lexical_insights.METRIC_SPECS:
+                sec = "vague_per_100" if mkey != "vague_per_100" else "clarity_index"
+                res = lexical_insights.interpret_metric_window(sl, mkey, secondary_key=sec)
+                self.assertTrue(res["title"], f"Missing title for {mkey}")
+                self.assertGreater(len(res["explanation"]), 25, f"Short explanation for {mkey}")
+                self.assertGreater(len(res["pattern"]), 20, f"Short pattern for {mkey}")
+                if mkey not in ("acoustic_wpm", "acoustic_silence_pct"):
+                    self.assertIn("r =", res["correlation"], f"Expected correlation for {mkey} vs {sec}")
+
+            cat_cases = [
+                ("pause_breakdown", {"short": 24, "medium": 8, "long": 15}),
+                ("clarity_breakdown", {"top_items": [("um (en)", 14), ("ähm (de)", 9)]}),
+                ("lexical_breakdown", {"top_words": [("architecture", 12), ("pipeline", 9)]}),
+                ("interventions", {"open_q": 6, "reflect": 2, "affirm": 3, "summary": 1, "self_count": 10, "we_count": 18}),
+                ("activity", {"metric_type": "Clarity Index", "active_days": 42, "mean_val": 51.4}),
+                ("profile", {"axes": {"Variety": 68.0, "Clarity": 54.0, "Vitality": 61.0, "Inquiry": 40.0, "Sustained": 58.0}}),
+                ("mood", {"scores": [62.0, 58.0, 65.0]}),
+            ]
+            for vkind, ctx in cat_cases:
+                vres = lexical_insights.interpret_categorical_view(vkind, ctx, sl)
+                self.assertTrue(vres["title"], f"Missing categorical title for {vkind}")
+                self.assertGreater(len(vres["explanation"]), 25, f"Short categorical explanation for {vkind}")
+                self.assertGreater(len(vres["pattern"]), 20, f"Short categorical pattern for {vkind}")
+
+
 @unittest.skipUnless(_tk_available(), "Tk display unavailable (run under xvfb-run on headless Linux)")
 class TestSpeechInsights2GuiIntegration(unittest.TestCase):
     def setUp(self):
@@ -557,6 +693,11 @@ class TestSpeechInsights2GuiIntegration(unittest.TestCase):
             lines.append(f"[{t_base.strftime('%Y-%m-%d %H:%M:%S')}] {en_txt} um sort of thing.")
             t2 = t_base + dt.timedelta(seconds=gap_s)
             lines.append(f"[{t2.strftime('%Y-%m-%d %H:%M:%S')}] {de_txt} ähm irgendwie Ding.")
+            if back == 14:
+                # Seed an accidental stuck-hotkey / open-mic outlier utterance (>2.5σ)
+                t3 = t2 + dt.timedelta(seconds=75)
+                runaway = " ".join(["um", "the", "the", "thing", "stuff"] * 180)
+                lines.append(f"[{t3.strftime('%Y-%m-%d %H:%M:%S')}] {runaway}.")
 
         for mkey, lines in by_month.items():
             with open(os.path.join(trans_dir, f"{mkey}.SEED.txt"), "a", encoding="utf-8") as fh:
@@ -571,20 +712,30 @@ class TestSpeechInsights2GuiIntegration(unittest.TestCase):
         self._pump_tk(0.15)
         self.assertEqual(len(self.app.insight_tab_frames), 12)
 
-        # 2. Cycle through all 12 tabs and verify lazy construction + rendering
+        # 2. Cycle through all 12 tabs and verify lazy construction + rendering + zero-LLM dimension guides
         for tab_idx in range(12):
             self.app._select_insight_tab(tab_idx)
             self._pump_tk(0.04)
             self.assertIn(tab_idx, self.app._insight_tabs_built)
 
+        for prefix in ("fogwatch", "pace", "pause", "clarity", "lexical", "mind", "intervention", "mood", "activity", "profile"):
+            expl_v = getattr(self.app, f"{prefix}_explain_var").get()
+            pat_v = getattr(self.app, f"{prefix}_pattern_var").get()
+            self.assertTrue(expl_v.startswith("What it measures: "), f"Missing explanation on {prefix}: {expl_v!r}")
+            self.assertTrue(pat_v.startswith("Window pattern: "), f"Missing pattern on {prefix}: {pat_v!r}")
+            self.assertGreater(len(expl_v), 35)
+            self.assertGreater(len(pat_v), 30)
+
         self.assertGreater(len(self.app.fogwatch_canvas.find_all()), 5)
         self.assertGreater(len(self.app.mind_canvas.find_all()), 5)
         self.assertGreater(len(self.app.speaker_profile_canvas.find_all()), 5)
 
-        # 3. Toggle metric pills & breakdown bars across tabs (including hover/resize isolation)
+        # 3. Toggle metric pills & breakdown bars across tabs (verifying dynamic explanation updates & hover isolation)
         self.app._select_insight_tab(0)  # FogWatch
+        expl_clarity = self.app.fogwatch_explain_var.get()
         self.app.fogwatch_pill_buttons["vague_per_100"].invoke()
         self._pump_tk(0.03)
+        self.assertNotEqual(self.app.fogwatch_explain_var.get(), expl_clarity)
         self.assertGreater(len(self.app.fogwatch_canvas.find_all()), 5)
         self.app.fogwatch_pill_buttons["clarity_index"].invoke()
         self._pump_tk(0.03)
@@ -592,9 +743,10 @@ class TestSpeechInsights2GuiIntegration(unittest.TestCase):
         self.app._select_insight_tab(2)  # Pauses: line vs breakdown
         self._emit_canvas_motion(self.app.pause_canvas, 80, 40)
         self.assertGreater(len(self.app.pause_canvas.find_withtag("ts_hover")), 0)
-        # Switch to Breakdown bars -> stale hover crosshair & _nw_ts_args must clear
+        # Switch to Breakdown bars -> stale hover crosshair & _nw_ts_args must clear, guide switches to breakdown
         self.app.pause_pill_buttons["breakdown"].invoke()
         self._pump_tk(0.03)
+        self.assertIn("clause-planning", self.app.pause_explain_var.get())
         self.assertGreater(len(self.app.pause_canvas.find_all()), 3)
         self.assertIsNone(getattr(self.app.pause_canvas, "_nw_ts_args", None))
         self.assertIsNone(getattr(self.app.pause_canvas, "_nw_ts_motion_fn", None))
@@ -642,12 +794,25 @@ class TestSpeechInsights2GuiIntegration(unittest.TestCase):
         self._pump_tk(0.04)
         self.assertEqual(self.app._current_lexical_slice["summary"]["de_share_pct"], 100.0)
 
-        self.app.insights_bucket_var.set("Auto")
+        self.app.insights_bucket_var.set("Daily")
         self.app.insights_lang_var.set("All")
         self.app._on_insights_filter_change()
         self._pump_tk(0.04)
 
-        # 5. Exercise interactive crosshair HUD tooltip & edge clamping on FogWatch canvas
+        # 5. Exercise >2.5σ Outlier Kick-Out Button (Main Bar + Wide Explorer + Offline HTML Report)
+        untrimmed_words = self.app._current_lexical_slice["summary"]["words"]
+        self.assertFalse(self.app._is_trim_outliers_enabled())
+        self.assertGreater(self.app._current_lexical_slice["total_outlier_buckets"], 0)
+
+        self.app.btn_trim_outliers.invoke()
+        self._pump_tk(0.06)
+        self.assertTrue(self.app._is_trim_outliers_enabled())
+        self.assertTrue(self.app.config["insights_trim_outliers"])
+        self.assertTrue(self.app._current_lexical_slice["trim_outliers"])
+        self.assertLess(self.app._current_lexical_slice["summary"]["words"], untrimmed_words - 500)
+        self.assertIn("✂", self.app.insights_coverage_var.get())
+
+        # 6. Exercise interactive crosshair HUD tooltip & edge clamping on FogWatch canvas
         self.app._select_insight_tab(0)
         self._pump_tk(0.05)
         cw = max(120, self.app.fogwatch_canvas.winfo_width())
@@ -663,25 +828,22 @@ class TestSpeechInsights2GuiIntegration(unittest.TestCase):
         self._emit_canvas_leave(self.app.fogwatch_canvas)
         self.assertEqual(len(self.app.fogwatch_canvas.find_withtag("ts_hover")), 0)
 
-        # 6. Verify viewport scroll clamping holds with Speech Insights expanded
+        # 7. Verify viewport scroll clamping holds with Speech Insights expanded
         for _ in range(10):
             self.app._on_mousewheel(types.SimpleNamespace(num=4, delta=120, widget=self.root), force_canvas=True)
         self._pump_tk(0.04)
         self.assertAlmostEqual(self.app._scroll_canvas.canvasy(0), 0.0, places=1)
 
-        # 7. Open Wide Longitudinal Trends Explorer + dual-axis overlay + HTML report export
+        # 8. Open Wide Longitudinal Trends Explorer + dual-axis overlay + guide card + HTML report export
         self.app.open_trends_explorer()
         self._pump_tk(0.15)
         self.assertTrue(self.app._explorer_is_open())
+        self.assertTrue(self.app._explorer_explain_var.get().startswith("What it measures: "))
+        self.assertTrue(self.app._explorer_pattern_var.get().startswith("Window pattern: "))
         self.assertGreater(len(self.app._explorer_main_canvas.find_all()), 10)
         self.assertGreater(len(self.app._explorer_vol_canvas.find_all()), 3)
 
-        self.app._select_explorer_primary_metric("mattr_diversity")
-        self.app._explorer_secondary_var.set("None")
-        self.app._refresh_trends_explorer()
-        self._pump_tk(0.05)
-        self.assertGreater(len(self.app._explorer_main_canvas.find_all()), 8)
-
+        # Export HTML report while trim_outliers=True -> verify What it measures, Window pattern, and >2.5σ badge
         report_out = os.path.join(self.tmp_dir.name, "report_out")
         report_html_path = self.app._generate_html_report_sync(out_dir=report_out)
         self.assertTrue(os.path.isfile(report_html_path))
@@ -689,9 +851,28 @@ class TestSpeechInsights2GuiIntegration(unittest.TestCase):
             html = fh.read()
         self.assertIn("Longitudinal Lexical", html)
         self.assertIn("Cognitive Clarity Index", html)
+        self.assertIn("What it measures:", html)
+        self.assertIn("Window pattern:", html)
+        self.assertIn("2.5&sigma; excluded", html)
         self.assertIn("<svg", html)
 
-        # 8. Live chunk inference -> verify forward acoustic metadata sidecar & WPM/silence metrics
+        # Toggle outlier button OFF directly from Wide Explorer and verify original words restore
+        self.app._explorer_trim_btn.invoke()
+        self._pump_tk(0.06)
+        self.assertFalse(self.app._is_trim_outliers_enabled())
+        self.assertEqual(self.app._current_lexical_slice["summary"]["words"], untrimmed_words)
+
+        self.app.insights_bucket_var.set("Auto")
+        self.app._on_insights_filter_change()
+        self._pump_tk(0.04)
+
+        self.app._select_explorer_primary_metric("mattr_diversity")
+        self.app._explorer_secondary_var.set("None")
+        self.app._refresh_trends_explorer()
+        self._pump_tk(0.05)
+        self.assertGreater(len(self.app._explorer_main_canvas.find_all()), 8)
+
+        # 9. Live chunk inference -> verify forward acoustic metadata sidecar & WPM/silence metrics
         chunk_5s = [np.ones((1600, 1), dtype=np.float32) * 0.15 for _ in range(50)]  # 5.0s audio
         self.app.process_live_chunk(chunk_5s)
         self.app._update_gui_loop_body()

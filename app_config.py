@@ -450,6 +450,8 @@ PERSONAL_BASELINE_BAND_FRACTION = 0.25
 # Minimum daily word count for reliable rate/ratio markers (lighter days are
 # still counted in totals and volume, but de-emphasized in rate smoothing).
 INSIGHTS_MIN_WORDS_CONFIDENT = 40
+# Threshold (in standard deviations from personal norm) for optional outlier trimming.
+INSIGHTS_OUTLIER_SIGMA = 2.5
 
 # --- Language-aware filler / stopword lists ---
 
