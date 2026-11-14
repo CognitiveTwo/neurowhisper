@@ -16,7 +16,13 @@ from __future__ import annotations
 import argparse
 import collections
 import datetime as dt
+import os
 import statistics as st
+import sys
+
+_ANALYSIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _ANALYSIS_DIR not in sys.path:
+    sys.path.insert(0, _ANALYSIS_DIR)
 
 import common
 
@@ -38,15 +44,82 @@ def longest_streak(days):
     return best
 
 
-def build(transcripts_dir=None, labels_dir=None):
+def _sanitize_day_label(rec):
+    if not isinstance(rec, dict):
+        return None
+    raw_ms = rec.get("mood_score")
+    clean_ms = None
+    if raw_ms is not None and not isinstance(raw_ms, bool):
+        try:
+            ms_f = float(raw_ms)
+            if 0.0 <= ms_f <= 100.0:
+                clean_ms = int(round(ms_f))
+        except (TypeError, ValueError):
+            clean_ms = None
+    raw_topics = rec.get("topics")
+    if not isinstance(raw_topics, list):
+        raw_topics = rec.get("projects") if isinstance(rec.get("projects"), list) else []
+    raw_acts = rec.get("activities")
+    if not isinstance(raw_acts, list):
+        raw_acts = []
+    return {
+        "mood": str(rec["mood"]).strip() if isinstance(rec.get("mood"), str) else None,
+        "mood_score": clean_ms,
+        "topics": [str(t).strip() for t in raw_topics if str(t).strip()],
+        "activities": [
+            str(a).strip().lower()
+            for a in raw_acts
+            if str(a).strip().lower() in common.ACTIVITIES
+        ],
+    }
+
+
+def _is_iso_day(key) -> bool:
+    if not isinstance(key, str) or len(key) != 10:
+        return False
+    try:
+        dt.date.fromisoformat(key)
+        return True
+    except ValueError:
+        return False
+
+
+def build(
+    transcripts_dir=None,
+    labels_dir=None,
+    cache_path=None,
+    out_dir=None,
+    ai_insights_path=None,
+    trim_outliers=False,
+):
+    import inspect
+
     entries = common.load_entries(transcripts_dir)
     if not entries:
         raise SystemExit("No transcript entries found.")
     by_day = common.group_by_day(entries)
-    labels = common.load_labels(labels_dir)
+    eff_labels_dir = labels_dir or (os.path.join(out_dir, "labels") if out_dir else None)
+    raw_labels = common.load_labels(eff_labels_dir)
+    labels = {}
+    for day_k, rec in (raw_labels or {}).items():
+        if _is_iso_day(day_k):
+            clean_rec = _sanitize_day_label(rec)
+            if clean_rec is not None:
+                labels[day_k] = clean_rec
+    if ai_insights_path and os.path.isfile(ai_insights_path):
+        app_ai = common.read_json(ai_insights_path)
+        daily_ai = (app_ai or {}).get("daily", app_ai) if isinstance(app_ai, dict) else {}
+        if isinstance(daily_ai, dict):
+            for day_k, rec in daily_ai.items():
+                if _is_iso_day(day_k) and day_k not in labels:
+                    clean_rec = _sanitize_day_label(rec)
+                    if clean_rec is not None:
+                        labels[day_k] = clean_rec
 
-    clusters = common.read_json(common.out_path("clusters.json"))
-    cats = common.read_json(common.out_path("categories.json"))
+    clusters_p = os.path.join(out_dir, "clusters.json") if out_dir else common.out_path("clusters.json")
+    cats_p = os.path.join(out_dir, "categories.json") if out_dir else common.out_path("categories.json")
+    clusters = common.read_json(clusters_p)
+    cats = common.read_json(cats_p)
     phrase_cluster = (clusters or {}).get("phrase_cluster") or {}
     cluster_to_category = {str(k): v for k, v
                            in ((cats or {}).get("cluster_to_category") or {}).items()}
@@ -57,7 +130,7 @@ def build(transcripts_dir=None, labels_dir=None):
         counts = collections.Counter()
         if not have_categories:
             return counts
-        for t in label.get("topics", []):
+        for t in label.get("topics") or []:
             t = str(t).strip()
             cid = phrase_cluster.get(t)
             if cid is None:
@@ -66,6 +139,11 @@ def build(transcripts_dir=None, labels_dir=None):
             if cat:
                 counts[cat] += 1
         return counts
+
+    try:
+        _detect_accepts_tokens = len(inspect.signature(common.detect_language).parameters) >= 2
+    except (TypeError, ValueError):
+        _detect_accepts_tokens = False
 
     # ---- single-pass tokenization & per-day aggregation ----------------
     entry_word_counts = []
@@ -78,8 +156,14 @@ def build(transcripts_dir=None, labels_dir=None):
         st_day = by_day_stats[day_key]
         st_day["words"] += n
         st_day["entries"] += 1
-        if n and common.detect_language(e["text"], toks) == "de":
-            st_day["de_words"] += n
+        if n:
+            lang = (
+                common.detect_language(e["text"], toks)
+                if _detect_accepts_tokens
+                else common.detect_language(e["text"])
+            )
+            if lang == "de":
+                st_day["de_words"] += n
 
     daily = []
     for day in sorted(by_day):
@@ -206,6 +290,63 @@ def build(transcripts_dir=None, labels_dir=None):
     busiest = max(range(24), key=lambda h: hour_words[h]) if total_words else None
     moods = [r["mood"] for r in daily if r["mood"] is not None]
 
+    # ---- longitudinal lexical & pause health proxies (100% local) -------
+    lexical_block = None
+    try:
+        import sys as _sys
+        if common.APP_DIR not in _sys.path:
+            _sys.path.insert(0, common.APP_DIR)
+        import lexical_insights as _li
+
+        tx_dir = transcripts_dir or common.TRANSCRIPTIONS_DIR
+        cache_p = (
+            cache_path
+            or (os.path.join(out_dir, "lexical_series_cache.json") if out_dir else None)
+            or common.out_path("lexical_series_cache.json")
+        )
+        idx = _li.LexicalDiskIndex(transcriptions_dir=tx_dir, cache_path=cache_p)
+        idx.refresh(persist=True)
+        last_d = dt.date.fromisoformat(daily[-1]["date"])
+        do_trim = bool(trim_outliers)
+        sl_all = _li.query_slice(idx, "All", "Daily", "All", today=last_d, trim_outliers=do_trim)
+        sl_6m = _li.query_slice(idx, "6 months", "Daily", "All", today=last_d, trim_outliers=do_trim)
+        sl_ytd = _li.query_slice(idx, "This year", "Daily", "All", today=last_d, trim_outliers=do_trim)
+        report_keys = (
+            "clarity_index",
+            "mattr_diversity",
+            "pause_long_pct",
+            "vague_per_100",
+            "vitality_balance",
+        )
+        lexical_block = {
+            "trim_outliers": do_trim,
+            "callout": sl_6m["callout"],
+            "baselines": sl_all["baselines"],
+            "summary_all": sl_all["summary"],
+            "summary_6m": sl_6m["summary"],
+            "summary_ytd": sl_ytd["summary"],
+            "points": sl_all["points"],
+            "rolling": {
+                k: sl_all["rolling"].get(k, [])
+                for k in (
+                    "clarity_index",
+                    "mattr_diversity",
+                    "vague_per_100",
+                    "pause_long_pct",
+                    "fillers_per_100",
+                    "self_focus_per_100",
+                    "absolutist_per_100",
+                    "vitality_balance",
+                    "late_night_pct",
+                )
+            },
+            "interpretations": {
+                k: _li.interpret_metric_window(sl_all, k) for k in report_keys
+            },
+        }
+    except Exception:
+        lexical_block = None
+
     return {
         "generated": dt.date.today().isoformat(),
         "has_categories": have_categories,
@@ -231,6 +372,7 @@ def build(transcripts_dir=None, labels_dir=None):
         "weekdays": weekdays,
         "hours": hours,
         "heat_weekday_hour": heat,
+        "lexical": lexical_block,
     }
 
 
@@ -241,12 +383,17 @@ def build_parser():
     )
     p.add_argument("--transcripts", metavar="DIR", help="transcript archive directory")
     p.add_argument("--labels", metavar="DIR", help="labels directory")
+    p.add_argument(
+        "--trim-outliers",
+        action="store_true",
+        help="exclude >2.5σ outlier spikes non-destructively from lexical series",
+    )
     return p
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    series = build(args.transcripts, args.labels)
+    series = build(args.transcripts, args.labels, trim_outliers=args.trim_outliers)
     path = common.out_path("series.json")
     common.write_json(path, series)
     h = series["headline"]

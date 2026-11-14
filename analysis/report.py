@@ -15,6 +15,11 @@ import argparse
 import datetime as dt
 import html
 import os
+import sys
+
+_ANALYSIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _ANALYSIS_DIR not in sys.path:
+    sys.path.insert(0, _ANALYSIS_DIR)
 
 import common
 
@@ -263,6 +268,106 @@ def table_rows(headers, rows):
     return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
 
 
+def chart_lexical_line(points, rolling_vals, metric_key, baseline, label, unit="",
+                       color="#2dd4bf", height=230):
+    """Longitudinal SVG line chart with shaded personal baseline band & rolling trend."""
+    import math as _math
+
+    valid = []
+    for i, p in enumerate(points or []):
+        v = p.get(metric_key) if isinstance(p, dict) else None
+        if v is not None:
+            try:
+                fv = float(v)
+                if _math.isfinite(fv):
+                    valid.append((i, p, fv))
+            except (TypeError, ValueError):
+                continue
+    if len(valid) < 2:
+        return "<p class='note'>Need at least 2 active days to plot longitudinal trajectory.</p>"
+
+    w, pad_l, pad_r, pad_t, pad_b = 900, 48, 14, 14, 34
+    plot_w, plot_h = w - pad_l - pad_r, height - pad_t - pad_b
+    first_d = dt.date.fromisoformat(valid[0][1]["key"][:10])
+    last_d = dt.date.fromisoformat(valid[-1][1]["key"][:10])
+    span = max(1, (last_d - first_d).days)
+
+    raw_vals = [fv for _, _, fv in valid]
+    raw_low = (baseline or {}).get("low") if isinstance(baseline, dict) else None
+    raw_high = (baseline or {}).get("high") if isinstance(baseline, dict) else None
+    b_low = float(raw_low) if raw_low is not None else min(raw_vals)
+    b_high = float(raw_high) if raw_high is not None else max(raw_vals)
+    vmin = min(min(raw_vals), b_low)
+    vmax = max(max(raw_vals), b_high)
+    margin = max(0.5, (vmax - vmin) * 0.12)
+    vmin = max(0.0, vmin - margin) if min(raw_vals) >= 0 else (vmin - margin)
+    vmax = vmax + margin
+    if vmax <= vmin:
+        vmax = vmin + 1.0
+
+    def x_of(day_iso):
+        d = dt.date.fromisoformat(day_iso[:10])
+        return pad_l + plot_w * (d - first_d).days / span
+
+    def y_of(v):
+        return pad_t + plot_h * (1.0 - (float(v) - vmin) / (vmax - vmin))
+
+    out = [svg_open(w, height, label)]
+    # Shaded personal baseline band
+    by1 = max(pad_t, min(pad_t + plot_h, y_of(b_high)))
+    by2 = max(pad_t, min(pad_t + plot_h, y_of(b_low)))
+    if by2 > by1:
+        out.append(
+            f'<rect x="{pad_l}" y="{by1:.1f}" width="{plot_w}" height="{by2 - by1:.1f}" '
+            f'fill="{color}" opacity="0.11"/>'
+        )
+    for step_i in range(5):
+        gv = vmin + (vmax - vmin) * (4 - step_i) / 4.0
+        gy = y_of(gv)
+        out.append(f'<line x1="{pad_l}" y1="{gy:.1f}" x2="{w - pad_r}" y2="{gy:.1f}" '
+                   f'stroke="var(--grid)" stroke-width="1"/>')
+        lbl_txt = f"{gv:.1f}{unit}" if (vmax - vmin) < 25 else f"{gv:.0f}{unit}"
+        out.append(axis_text(pad_l - 8, gy + 4, lbl_txt, anchor="end"))
+
+    # Raw daily dots (hollow/faint when low word count)
+    for idx, p, val in valid:
+        cx, cy = x_of(p["key"]), y_of(val)
+        op = "0.22" if p.get("low_confidence") else "0.48"
+        de_pct = float(p.get("de_share_pct") or 0.0)
+        out.append(
+            f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="2.2" fill="{color}" opacity="{op}">'
+            f'<title>{esc(p["key"])}: {val:.2f}{esc(unit)} '
+            f'({p.get("words", 0)} words, {de_pct:.0f}% DE)</title></circle>'
+        )
+
+    # Smoothed rolling trend curve
+    roll_pts = []
+    for idx, p in enumerate(points or []):
+        rv = rolling_vals[idx] if rolling_vals and idx < len(rolling_vals) else None
+        if rv is not None and _math.isfinite(float(rv)) and valid[0][1]["key"] <= p["key"] <= valid[-1][1]["key"]:
+            roll_pts.append((x_of(p["key"]), y_of(rv)))
+    if len(roll_pts) >= 2:
+        d_attr = " ".join(
+            f'{"M" if k == 0 else "L"}{rx:.1f},{ry:.1f}' for k, (rx, ry) in enumerate(roll_pts)
+        )
+        out.append(
+            f'<path d="{d_attr}" fill="none" stroke="{color}" '
+            f'stroke-width="2.4" stroke-linejoin="round"/>'
+        )
+
+    months = sorted({p["key"][:7] for _, p, _ in valid})
+    m_step = max(1, len(months) // 12)
+    for m_i, m in enumerate(months):
+        if m_i % m_step != 0:
+            continue
+        day = f"{m}-01"
+        if day < valid[0][1]["key"][:10]:
+            day = valid[0][1]["key"][:10]
+        out.append(axis_text(x_of(day), height - pad_b + 20, m))
+    out.append("</svg>")
+    return "".join(out)
+
+
 # --------------------------------------------------------------------------
 # Page
 # --------------------------------------------------------------------------
@@ -370,6 +475,77 @@ def render(series, calendar=None, title="Dictation report"):
                      f"</div>"
                      + table_rows(["Group", "Days", "Mean mood", "Median"], rows)
                      + "</section>")
+
+    # 9 local longitudinal lexical & pause health proxies (zero API)
+    lex = series.get("lexical")
+    if isinstance(lex, dict) and lex.get("points"):
+        pts = lex["points"]
+        roll = lex.get("rolling") or {}
+        bases = lex.get("baselines") or {}
+        s_all = lex.get("summary_all") or {}
+        s_6m = lex.get("summary_6m") or {}
+        s_ytd = lex.get("summary_ytd") or {}
+
+        def _f(s_dict, k, unit="", nd=1):
+            v = s_dict.get(k)
+            return "-" if v is None else f"{v:.{nd}f}{unit}"
+
+        comp_rows = [
+            ("Cognitive Clarity Index (50=norm)", _f(s_ytd, "clarity_index"), _f(s_6m, "clarity_index"), _f(s_all, "clarity_index")),
+            ("Lexical Diversity (MATTR-50)", _f(s_ytd, "mattr_diversity", "%"), _f(s_6m, "mattr_diversity", "%"), _f(s_all, "mattr_diversity", "%")),
+            ("Word-Finding Placeholders", _f(s_ytd, "vague_per_100", "/100w", 2), _f(s_6m, "vague_per_100", "/100w", 2), _f(s_all, "vague_per_100", "/100w", 2)),
+            ("Long Pauses (>=5s share)", _f(s_ytd, "pause_long_pct", "%"), _f(s_6m, "pause_long_pct", "%"), _f(s_all, "pause_long_pct", "%")),
+            ("Filler Words", _f(s_ytd, "fillers_per_100", "/100w", 2), _f(s_6m, "fillers_per_100", "/100w", 2), _f(s_all, "fillers_per_100", "/100w", 2)),
+            ("Self-Focus ('I / ich')", _f(s_ytd, "self_focus_per_100", "/100w", 2), _f(s_6m, "self_focus_per_100", "/100w", 2), _f(s_all, "self_focus_per_100", "/100w", 2)),
+            ("Absolutist Markers", _f(s_ytd, "absolutist_per_100", "/100w", 2), _f(s_6m, "absolutist_per_100", "/100w", 2), _f(s_all, "absolutist_per_100", "/100w", 2)),
+            ("Lexical Vitality Score", _f(s_ytd, "vitality_balance"), _f(s_6m, "vitality_balance"), _f(s_all, "vitality_balance")),
+            ("Late-Night Speech (22:00-05:00)", _f(s_ytd, "late_night_pct", "%"), _f(s_6m, "late_night_pct", "%"), _f(s_all, "late_night_pct", "%")),
+        ]
+        interps = lex.get("interpretations") or {}
+        trim_badge = (
+            " · Outliers &gt;2.5&sigma; excluded (non-destructive)."
+            if lex.get("trim_outliers")
+            else ""
+        )
+        parts.append(
+            "<section><h2>Longitudinal Lexical &amp; Fluency Signals (Local, Zero-API)</h2>"
+            f"<p class='note'>Personal self-tracking proxies (non-diagnostic){trim_badge} "
+            f"6-month summary: {esc(lex.get('callout', ''))}</p>"
+            + table_rows(["Signal", "This Year (YTD)", "Last 6 Months", "All Time"], comp_rows)
+            + "</section>"
+        )
+        for mkey, title_txt, sub_txt, unit, col in (
+            ("clarity_index", "Cognitive Clarity Index over time",
+             "Composite personal trajectory (50 = your 90-day baseline; shaded band = normal personal range).",
+             "", "#2dd4bf"),
+            ("mattr_diversity", "Lexical Diversity (MATTR-50) over time",
+             "Length-invariant 50-word moving-average vocabulary diversity (language-adjusted across EN/DE).",
+             "%", "#34d399"),
+            ("pause_long_pct", "Long Pauses (>=5s) over time",
+             "Share of within-burst dictation gaps lasting 5 seconds or longer.",
+             "%", "#e15759"),
+            ("vague_per_100", "Word-Finding Placeholder Rate over time",
+             "Placeholder nouns & hedges ('thing, stuff, something / dinge, irgendwas') per 100 words.",
+             "/100w", "#f28e2b"),
+            ("vitality_balance", "Lexical Vitality vs. Strain Balance",
+             "Local vitality/clarity lexicon minus fatigue/overload markers (50 = neutral).",
+             "", "#59a14f"),
+        ):
+            g_info = interps.get(mkey) or {}
+            expl = g_info.get("explanation") or sub_txt
+            pat = g_info.get("pattern") or ""
+            pat_html = (
+                f"<br><strong>Window pattern:</strong> {esc(pat)}"
+                if pat
+                else ""
+            )
+            parts.append(
+                f"<section><h2>{esc(title_txt)}</h2>"
+                f"<p class='note'><strong>What it measures:</strong> {esc(expl)}{pat_html}</p>"
+                f"<div class='chart'>"
+                f"{chart_lexical_line(pts, roll.get(mkey), mkey, bases.get(mkey), title_txt, unit=unit, color=col)}"
+                f"</div></section>"
+            )
 
     parts.append(f"<footer>Generated locally by the dictation analysis toolkit "
                  f"on {esc(series.get('generated', ''))}. No data left this "

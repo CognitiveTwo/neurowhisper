@@ -40,6 +40,13 @@ from app_config import (
     PEER_PROFILE,
     INSIGHTS_RANGE_OPTIONS,
     INSIGHTS_RANGE_DEFAULT,
+    INSIGHTS_QUICK_CHIPS,
+    INSIGHTS_BUCKET_OPTIONS,
+    INSIGHTS_LANG_OPTIONS,
+    INSIGHTS_MIN_WORDS_CONFIDENT,
+    INSIGHTS_OUTLIER_SIGMA,
+    LEXICAL_CACHE_PREFIX,
+    ACOUSTIC_META_SUBDIR,
     PERSONAL_BASELINE_DAYS,
     PERSONAL_BASELINE_MIN_DAYS,
     PERSONAL_BASELINE_BAND_FRACTION,
@@ -58,6 +65,11 @@ from app_config import (
     UI_RUNTIME,
     resolve_backend_display,
 )
+
+try:
+    import lexical_insights
+except Exception:
+    lexical_insights = None
 
 # Resolve app directory from script location (works from any CWD / Dropbox)
 app_dir = os.path.dirname(os.path.abspath(__file__))
@@ -813,10 +825,11 @@ def count_fillers(text, lang):
 
 
 def filter_entries_by_days(entries, days, now=None):
-    """Rolling-window filter over analytics entries.
+    """Rolling- or calendar-window filter over analytics entries.
 
     days is None -> everything; 0 -> the current calendar day; N -> the
-    trailing N days. Returns the list of matching indices.
+    trailing N days; string specs ('ytd', 'prev_6m', 'Year 2025', 'year:2025',
+    'YYYY-MM-DD..YYYY-MM-DD') -> inclusive date range. Returns matching indices.
     """
     if days is None:
         return list(range(len(entries)))
@@ -824,8 +837,20 @@ def filter_entries_by_days(entries, days, now=None):
     if days == 0:
         today = now.date()
         return [i for i, e in enumerate(entries) if e["timestamp"].date() == today]
-    cutoff = now - datetime.timedelta(days=days)
-    return [i for i, e in enumerate(entries) if e["timestamp"] >= cutoff]
+    if isinstance(days, int) and days > 0:
+        cutoff = now - datetime.timedelta(days=days)
+        return [i for i, e in enumerate(entries) if e["timestamp"] >= cutoff]
+    if lexical_insights is not None:
+        first_d = entries[0]["timestamp"].date() if entries else None
+        start_d, end_d = lexical_insights.resolve_date_bounds(
+            days, today=now.date(), first_archive_date=first_d
+        )
+        return [
+            i for i, e in enumerate(entries)
+            if (start_d is None or e["timestamp"].date() >= start_d)
+            and (end_d is None or e["timestamp"].date() <= end_d)
+        ]
+    return list(range(len(entries)))
 
 
 class WhisperApp:
@@ -965,6 +990,12 @@ class WhisperApp:
         self._analytics_tokens_cache = None
         self._analytics_langs_cache = None
         self._insights_refresh_job = None
+        self._lexical_save_job = None
+        self._lexical_index = None
+        self._current_lexical_slice = None
+        self._pending_acoustic_metas = deque(maxlen=64)
+        self._acoustic_meta_lock = threading.Lock()
+        self._trends_explorer_win = None
         self._ai_insights_mem_cache = None
         self._ui_render_cache = {}
         # Personal trailing-baseline metrics (see _compute_metric_snapshot)
@@ -1600,7 +1631,11 @@ class WhisperApp:
                     return None
             except Exception:
                 pass
-            self._on_mousewheel(event, force_canvas=True)
+            try:
+                if combo.winfo_toplevel() is self.root:
+                    self._on_mousewheel(event, force_canvas=True)
+            except Exception:
+                pass
             return "break"
 
         combo.bind("<MouseWheel>", _on_closed_combo_wheel)
@@ -1649,9 +1684,10 @@ class WhisperApp:
     def load_config(self):
         loaded = {}
         config = DEFAULT_CONFIG.copy()
-        if os.path.exists(CONFIG_FILE):
+        cfg_path = os.path.join(app_dir, CONFIG_FILE)
+        if os.path.exists(cfg_path):
             try:
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                with open(cfg_path, 'r', encoding='utf-8') as f:
                     loaded = json.load(f)
                 if "model_size" in loaded:
                     old_val = loaded.pop("model_size")
@@ -1662,7 +1698,7 @@ class WhisperApp:
                 config = {**DEFAULT_CONFIG, **loaded}
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
                 # Never silently overwrite a file we could not parse.
-                self._quarantine_corrupt_file(os.path.join(app_dir, CONFIG_FILE), e)
+                self._quarantine_corrupt_file(cfg_path, e)
                 loaded = {}
                 config = DEFAULT_CONFIG.copy()
             except Exception as e:
@@ -1741,15 +1777,16 @@ class WhisperApp:
         # One-time migration: claim the legacy shared whisper_stats.json as this
         # machine's baseline. The 'claimed_by' marker (synced via Dropbox) stops
         # the other machine from also adopting it, which would double-count.
-        if os.path.exists(STATS_FILE):
+        legacy_stats_path = os.path.join(app_dir, STATS_FILE)
+        if os.path.exists(legacy_stats_path):
             try:
-                with open(STATS_FILE, 'r', encoding='utf-8') as f:
+                with open(legacy_stats_path, 'r', encoding='utf-8') as f:
                     legacy = json.load(f)
                 claimer = legacy.get('claimed_by')
                 if claimer is None or claimer == self._hostname():
                     if claimer is None:
                         legacy['claimed_by'] = self._hostname()
-                        self._write_json_atomic(os.path.join(app_dir, STATS_FILE), legacy)
+                        self._write_json_atomic(legacy_stats_path, legacy)
                     data = {k: v for k, v in legacy.items() if k != 'claimed_by'}
                     data.setdefault('hourly_data', {})
                     # Persist the baseline immediately so a crash before the
@@ -1758,7 +1795,7 @@ class WhisperApp:
                     log.info("[Stats] Claimed legacy stats file as baseline for %s", self._hostname())
                     return data
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                self._quarantine_corrupt_file(os.path.join(app_dir, STATS_FILE), e)
+                self._quarantine_corrupt_file(legacy_stats_path, e)
             except Exception as e:
                 log.error("[Stats] Legacy stats migration skipped: %s", e)
         return {'total_words': 0, 'total_audio_duration': 0.0, 'hourly_data': {}}
@@ -2581,11 +2618,11 @@ class WhisperApp:
             self.toggle_insights, self.insights_collapsed.get())
 
         insights_top = tk.Frame(self.insights_body, bg=COLOR_ACCENT_BG)
-        insights_top.pack(fill="x", padx=self.CARD_PAD, pady=(11, 8))
+        insights_top.pack(fill="x", padx=self.CARD_PAD, pady=(11, 4))
 
-        # Range control (Today / 7 d / 30 d / All), top-right of the body
+        # Row 1: Quick Horizon Chips (1d / 7d / 30d / 90d / 6m / YTD / 1y / All)
         range_value = self.config.get('insights_range', INSIGHTS_RANGE_DEFAULT)
-        if range_value not in INSIGHTS_RANGE_OPTIONS:
+        if not self._is_valid_insights_range(range_value):
             range_value = INSIGHTS_RANGE_DEFAULT
         self.insights_range_var = tk.StringVar(value=range_value)
         range_container = ctk.CTkFrame(insights_top, fg_color=COLOR_BG, corner_radius=9,
@@ -2594,19 +2631,130 @@ class WhisperApp:
         range_inner = ctk.CTkFrame(range_container, fg_color="transparent")
         range_inner.pack(padx=2, pady=2)
         self.insights_range_buttons = {}
-        for key, short in (("Today", "Today"), ("7 days", "7 d"), ("30 days", "30 d"), ("All", "All")):
-            if key not in INSIGHTS_RANGE_OPTIONS:
-                continue
-            btn = ctk.CTkButton(range_inner, text=short, width=40, height=18,
+        chip_tooltips = {
+            "Today": "Today only (intra-day hourly view)",
+            "7 days": "Last 7 days (daily view)",
+            "30 days": "Last 30 days (daily + 7d trend)",
+            "90 days": "Last 90 days (daily + 14d trend)",
+            "6 months": "Last 6 months (trailing 182 days)",
+            "This year": "This calendar year (Jan 1 – Today)",
+            "12 months": "Last 12 months (trailing 365 days)",
+            "All": "Full multi-year transcript archive",
+        }
+        for key, short in INSIGHTS_QUICK_CHIPS:
+            w_chip = max(28, 7 * len(short) + 12)
+            btn = ctk.CTkButton(range_inner, text=short, width=w_chip, height=19,
                                 corner_radius=7, font=ctk.CTkFont(size=10, weight="bold"),
                                 fg_color=COLOR_BG, hover_color=COLOR_TEAL_DIM,
                                 text_color=COLOR_TEXT_FAINT,
                                 command=lambda k=key: self._select_insights_range(k))
             btn.pack(side="left", padx=1)
             self.insights_range_buttons[key] = btn
+            if key in chip_tooltips:
+                self._create_tooltip(btn, chip_tooltips[key])
 
-        tk.Label(insights_top, text="Window", bg=COLOR_ACCENT_BG, fg=COLOR_TEXT_MUTED,
+        tk.Label(insights_top, text="Horizon", bg=COLOR_ACCENT_BG, fg=COLOR_TEXT_MUTED,
                  font=("Arial", 9)).pack(side="left")
+
+        # Row 2: Custom Period/Year + Bucket Granularity + Language Slice + Wide Explorer / Report
+        insights_subbar = tk.Frame(self.insights_body, bg=COLOR_ACCENT_BG)
+        insights_subbar.pack(fill="x", padx=self.CARD_PAD, pady=(0, 8))
+
+        self.insights_trim_outliers_var = tk.BooleanVar(
+            value=bool(self.config.get("insights_trim_outliers", False))
+        )
+
+        # Pack right-side action buttons first so Windows 125%/150% DPI scaling never clips them
+        self.btn_expand_insights = ctk.CTkButton(
+            insights_subbar, text="⤢ Expand", width=62, height=22,
+            corner_radius=7, font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color=COLOR_BG, hover_color=COLOR_TEAL_DIM,
+            border_width=1, border_color=COLOR_TEAL,
+            text_color=COLOR_TEAL,
+            command=self.open_trends_explorer,
+        )
+        self.btn_expand_insights.pack(side="right")
+        self._create_tooltip(
+            self.btn_expand_insights,
+            "Open wide resizable Longitudinal Trends Explorer & HTML Report export",
+        )
+
+        self.btn_html_report = ctk.CTkButton(
+            insights_subbar, text="📄", width=28, height=22,
+            corner_radius=7, font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color=COLOR_BG, hover_color=COLOR_TEAL_DIM,
+            border_width=1, border_color=COLOR_TEAL,
+            text_color=COLOR_TEAL,
+            command=self._export_and_open_html_report,
+        )
+        self.btn_html_report.pack(side="right", padx=(0, 3))
+        self._create_tooltip(
+            self.btn_html_report,
+            "Build & open standalone offline HTML report (analysis/out/report.html) in your browser",
+        )
+
+        self.btn_trim_outliers = ctk.CTkButton(
+            insights_subbar, text="✂ >2.5σ", width=64, height=22,
+            corner_radius=7, font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color=COLOR_BG, hover_color=COLOR_TEAL_DIM,
+            border_width=1, border_color=COLOR_BORDER,
+            text_color=COLOR_TEXT_MUTED,
+            command=self._toggle_trim_outliers,
+        )
+        self.btn_trim_outliers.pack(side="right", padx=(0, 3))
+        self._create_tooltip(
+            self.btn_trim_outliers,
+            "Kick out >2.5σ outliers (non-destructive):\n"
+            "Excludes accidental open-mic pushes, extreme stall spikes,\n"
+            "and runaway utterances from charts & averages without\n"
+            "modifying any transcript files on disk.",
+        )
+
+        tk.Label(insights_subbar, text="Slice:", bg=COLOR_ACCENT_BG, fg=COLOR_TEXT_FAINT,
+                 font=("Arial", 8)).pack(side="left", padx=(0, 3))
+        period_values = list(INSIGHTS_RANGE_OPTIONS.keys())
+        if range_value not in period_values:
+            period_values.append(range_value)
+        self.insights_period_combo = ttk.Combobox(
+            insights_subbar, textvariable=self.insights_range_var,
+            values=period_values, state="readonly", width=9,
+        )
+        self.insights_period_combo.pack(side="left", padx=(0, 3))
+        self.insights_period_combo.bind("<<ComboboxSelected>>", self._on_insights_period_combo_select)
+        self._enhance_combobox(
+            self.insights_period_combo,
+            "Time slice (includes calendar years once archive is scanned)",
+        )
+
+        bucket_val = self.config.get('insights_bucket', 'Auto')
+        if bucket_val not in INSIGHTS_BUCKET_OPTIONS:
+            bucket_val = 'Auto'
+        self.insights_bucket_var = tk.StringVar(value=bucket_val)
+        self.insights_bucket_combo = ttk.Combobox(
+            insights_subbar, textvariable=self.insights_bucket_var,
+            values=list(INSIGHTS_BUCKET_OPTIONS), state="readonly", width=6,
+        )
+        self.insights_bucket_combo.pack(side="left", padx=(0, 3))
+        self.insights_bucket_combo.bind("<<ComboboxSelected>>", self._on_insights_filter_change)
+        self._enhance_combobox(
+            self.insights_bucket_combo,
+            "Time bucket resolution (Auto adapts Daily / Weekly / Monthly)",
+        )
+
+        lang_val = self.config.get('insights_lang', 'All')
+        if lang_val not in INSIGHTS_LANG_OPTIONS:
+            lang_val = 'All'
+        self.insights_lang_var = tk.StringVar(value=lang_val)
+        self.insights_lang_combo = ttk.Combobox(
+            insights_subbar, textvariable=self.insights_lang_var,
+            values=list(INSIGHTS_LANG_OPTIONS), state="readonly", width=4,
+        )
+        self.insights_lang_combo.pack(side="left", padx=(0, 3))
+        self.insights_lang_combo.bind("<<ComboboxSelected>>", self._on_insights_filter_change)
+        self._enhance_combobox(
+            self.insights_lang_combo,
+            "Language filter: All (EN+DE normalized), EN only, or DE only",
+        )
 
         # Coverage / baseline / freshness / profile notes
         notes = tk.Frame(self.insights_body, bg=COLOR_ACCENT_BG)
@@ -2623,15 +2771,15 @@ class WhisperApp:
                  wraplength=420).pack(fill="x")
 
         self.insights_peer_var = tk.StringVar(
-            value=f"Baseline: your trailing {PERSONAL_BASELINE_DAYS}-day average "
-                  f"(falls back to reference bands under {PERSONAL_BASELINE_MIN_DAYS} days of data)."
+            value=f"Baseline: your trailing {PERSONAL_BASELINE_DAYS}-day median & MAD band "
+                  f"(non-diagnostic personal self-tracking)."
         )
         tk.Label(notes, textvariable=self.insights_peer_var, bg=COLOR_ACCENT_BG,
                  fg=COLOR_TEXT_FAINT, font=("Arial", 8), anchor="w", justify="left",
                  wraplength=420).pack(fill="x")
 
         self.insights_profile_summary_var = tk.StringVar(
-            value="Personal profile vs peer midpoint: waiting for enough data."
+            value="Personal profile vs baseline: waiting for enough data."
         )
         tk.Label(notes, textvariable=self.insights_profile_summary_var, bg=COLOR_ACCENT_BG,
                  fg=COLOR_TEAL, font=("Arial", 9, "bold"), anchor="w", justify="left",
@@ -2668,12 +2816,14 @@ class WhisperApp:
         self.histogram_canvas_alltime.pack(fill="x", padx=10, pady=(2, 8))
         self.histogram_bars_alltime = []
 
-        # Tab chips (replaces ttk.Notebook - ten ttk tabs overflow at 480px)
+        # Tab chips (12 tabs in a balanced 3x4 grid)
         self.insight_tab_names = [
+            "FogWatch",
             "Pace",
             "Pauses",
             "Clarity",
             "Lexical",
+            "Mind",
             "Interventions",
             "Timeline",
             "Mood",
@@ -2689,10 +2839,8 @@ class WhisperApp:
             if i % 4 == 0:
                 chip_line = tk.Frame(chip_row, bg=COLOR_ACCENT_BG)
                 chip_line.pack(fill="x", pady=1)
-            # Content-width chips, not expand/fill: the last line only holds
-            # two chips and would otherwise stretch them to half the window.
             chip = ctk.CTkButton(chip_line, text=name, height=22, corner_radius=8,
-                                 width=max(52, 8 * len(name) + 16),
+                                 width=max(50, 7 * len(name) + 16),
                                  font=ctk.CTkFont(size=10),
                                  fg_color=COLOR_BG, hover_color=COLOR_TEAL_DIM,
                                  border_width=1, border_color=COLOR_BORDER,
@@ -2707,10 +2855,12 @@ class WhisperApp:
                                                highlightbackground=COLOR_BORDER)
         self.insights_tab_container.pack(fill="x", padx=self.CARD_PAD, pady=(0, self.CARD_PAD))
 
+        self.fogwatch_tab = tk.Frame(self.insights_tab_container, bg=COLOR_ACCENT_BG)
         self.pace_tab = tk.Frame(self.insights_tab_container, bg=COLOR_ACCENT_BG)
         self.pause_tab = tk.Frame(self.insights_tab_container, bg=COLOR_ACCENT_BG)
         self.clarity_tab = tk.Frame(self.insights_tab_container, bg=COLOR_ACCENT_BG)
         self.lexical_tab = tk.Frame(self.insights_tab_container, bg=COLOR_ACCENT_BG)
+        self.mind_tab = tk.Frame(self.insights_tab_container, bg=COLOR_ACCENT_BG)
         self.intervention_tab = tk.Frame(self.insights_tab_container, bg=COLOR_ACCENT_BG)
         self.ai_timeline_tab = tk.Frame(self.insights_tab_container, bg=COLOR_ACCENT_BG)
         self.ai_mood_tab = tk.Frame(self.insights_tab_container, bg=COLOR_ACCENT_BG)
@@ -2719,18 +2869,20 @@ class WhisperApp:
         self.daily_brief_tab = tk.Frame(self.insights_tab_container, bg=COLOR_ACCENT_BG)
 
         self.insight_tab_frames = [
-            self.pace_tab, self.pause_tab, self.clarity_tab, self.lexical_tab,
-            self.intervention_tab, self.ai_timeline_tab, self.ai_mood_tab,
-            self.activity_matrix_tab, self.speaker_profile_tab, self.daily_brief_tab,
+            self.fogwatch_tab, self.pace_tab, self.pause_tab, self.clarity_tab,
+            self.lexical_tab, self.mind_tab, self.intervention_tab,
+            self.ai_timeline_tab, self.ai_mood_tab, self.activity_matrix_tab,
+            self.speaker_profile_tab, self.daily_brief_tab,
         ]
 
-        # Tab bodies are built lazily on first selection (see
-        # _ensure_insight_tab_built) so setup_ui only creates the shells.
+        # Tab bodies are built lazily on first selection
         self._insight_tab_builders = [
+            self._setup_fogwatch_tab,
             self._setup_pace_tab,
             self._setup_pause_tab,
             self._setup_clarity_tab,
             self._setup_lexical_tab,
+            self._setup_mind_tab,
             self._setup_intervention_tab,
             self._setup_ai_timeline_tab,
             self._setup_ai_mood_tab,
@@ -2739,7 +2891,7 @@ class WhisperApp:
             self._setup_daily_brief_tab,
         ]
         self._insight_tabs_built = set()
-        self.insights_tab_status = tk.StringVar(value="1/10")
+        self.insights_tab_status = tk.StringVar(value="1/12")
         self.insight_tab_index = 0
         self.insight_tab_frames[0].pack(fill="x")
         self._update_chip_styles()
@@ -2748,9 +2900,6 @@ class WhisperApp:
 
         if not self.insights_collapsed.get():
             self.insights_body.pack(fill="x")
-            # Restored expanded from config: build the first tab body now, or
-            # the startup refresh_insights_tabs() early-returns on every tab
-            # and the panel renders empty until the user clicks a chip.
             self._ensure_insight_tab_built(0)
 
         # ==============================================================
@@ -3168,22 +3317,19 @@ Troubleshooting:
     # Insight tab skeleton: intro, metric cell, band track, chart, fine print
     # ------------------------------------------------------------------
     INSIGHT_BAND_METRICS = {
+        "fogwatch": "clarity_index",
         "pace": "pace_avg_words_entry",
-        "pause": "pause_avg_seconds",
+        "pause": "pause_long_pct",
         "clarity": "clarity_fillers_per_100",
-        "lexical": "lexical_diversity_percent",
+        "lexical": "mattr_diversity",
+        "mind": "vitality_balance",
         "intervention": "intervention_open_question_per_100",
     }
 
-    # Known deviation from the InsightsExpanded artboard: only the five
-    # heuristic tabs (Pace/Pauses/Clarity/Lexical/Interventions) use this
-    # skeleton. Timeline, Mood, Activity, Profile and Briefs keep their own
-    # layouts because none of them owns a single scalar metric with a
-    # comparison band, and inventing one would fabricate data. The metric row
-    # is likewise one cell rather than the artboard's 3-up.
     def _build_metric_tab(self, parent, prefix, label, intro,
-                          summary_var, detail_var, peer_var, canvas_height=110):
-        """Shared body for every heuristic insight tab."""
+                          summary_var, detail_var, peer_var,
+                          canvas_height=144, toolbar_builder=None):
+        """Shared body for heuristic & longitudinal insight tabs."""
         tk.Label(parent, text=intro, bg=COLOR_ACCENT_BG, fg=COLOR_TEXT_MUTED,
                  font=("Arial", 8), anchor="w", justify="left",
                  wraplength=400).pack(fill="x", padx=10, pady=(8, 6))
@@ -3191,8 +3337,10 @@ Troubleshooting:
         cell = ctk.CTkFrame(parent, fg_color=COLOR_BG, corner_radius=10,
                             border_width=1, border_color=COLOR_BORDER)
         cell.pack(fill="x", padx=10)
-        tk.Label(cell, text=label.upper(), bg=COLOR_BG, fg=COLOR_TEXT_MUTED,
-                 font=("Arial", 8)).pack(anchor="w", padx=10, pady=(8, 0))
+        hdr_lbl = tk.Label(cell, text=label.upper(), bg=COLOR_BG, fg=COLOR_TEXT_MUTED,
+                           font=("Arial", 8))
+        hdr_lbl.pack(anchor="w", padx=10, pady=(8, 0))
+        setattr(self, f"{prefix}_header_label", hdr_lbl)
         tk.Label(cell, textvariable=summary_var, bg=COLOR_BG, fg=COLOR_TEAL,
                  font=("Arial", 12, "bold"), anchor="w", justify="left",
                  wraplength=370).pack(fill="x", padx=10)
@@ -3201,17 +3349,98 @@ Troubleshooting:
                  wraplength=370).pack(fill="x", padx=10, pady=(0, 8))
 
         band = tk.Canvas(parent, height=12, bg=COLOR_ACCENT_BG, highlightthickness=0)
-        band.pack(fill="x", padx=10, pady=(7, 7))
+        band.pack(fill="x", padx=10, pady=(6, 5))
         setattr(self, f"{prefix}_band_canvas", band)
+
+        if toolbar_builder is not None:
+            tb = tk.Frame(parent, bg=COLOR_ACCENT_BG)
+            tb.pack(fill="x", padx=10, pady=(0, 4))
+            tb_res = toolbar_builder(tb)
+            if isinstance(tb_res, tuple) and len(tb_res) >= 2:
+                setattr(self, f"{prefix}_pill_buttons", tb_res[0])
+                setattr(self, f"{prefix}_sync_pills", tb_res[1])
 
         canvas = tk.Canvas(parent, height=canvas_height, bg=COLOR_TEXT_BG,
                            highlightthickness=1, highlightbackground=COLOR_BORDER)
         canvas.pack(fill="x", padx=10, pady=(0, 6))
 
+        self._build_insight_guide_box(parent, prefix)
+
         tk.Label(parent, textvariable=peer_var, bg=COLOR_ACCENT_BG, fg=COLOR_TEXT_FAINT,
                  font=("Arial", 8), anchor="w", justify="left",
                  wraplength=400).pack(fill="x", padx=10, pady=(0, 8))
         return canvas
+
+    def _build_insight_guide_box(self, parent, prefix):
+        """Compact zero-LLM dimension explanation + window pattern reading card."""
+        box = ctk.CTkFrame(
+            parent, fg_color=COLOR_BG, corner_radius=8,
+            border_width=1, border_color=COLOR_BORDER,
+        )
+        box.pack(fill="x", padx=10, pady=(0, 6))
+        exp_var = tk.StringVar(value="")
+        pat_var = tk.StringVar(value="")
+        setattr(self, f"{prefix}_explain_var", exp_var)
+        setattr(self, f"{prefix}_pattern_var", pat_var)
+        tk.Label(
+            box, textvariable=exp_var, bg=COLOR_BG, fg=COLOR_TEXT_MUTED,
+            font=("Arial", 8), anchor="w", justify="left", wraplength=386,
+        ).pack(fill="x", padx=8, pady=(6, 2))
+        tk.Label(
+            box, textvariable=pat_var, bg=COLOR_BG, fg="#99f6e4",
+            font=("Arial", 8, "bold"), anchor="w", justify="left", wraplength=386,
+        ).pack(fill="x", padx=8, pady=(0, 6))
+        return box
+
+    def _set_tab_guide(self, prefix, guide):
+        """Populate ``{prefix}_explain_var`` and ``{prefix}_pattern_var`` from a guide dict."""
+        if not isinstance(guide, dict):
+            return
+        exp_var = getattr(self, f"{prefix}_explain_var", None)
+        pat_var = getattr(self, f"{prefix}_pattern_var", None)
+        if exp_var is not None:
+            expl = str(guide.get("explanation", "")).strip()
+            exp_var.set(f"What it measures: {expl}" if expl else "")
+        if pat_var is not None:
+            pat = str(guide.get("pattern", "")).strip()
+            corr = str(guide.get("correlation", "")).strip()
+            full_pat = f"{pat}  {corr}".strip() if corr else pat
+            pat_var.set(f"Window pattern: {full_pat}" if full_pat else "")
+
+    def _make_pill_bar(self, parent, options, var, on_change):
+        """Render a row of compact CTk pill buttons bound to ``var``."""
+        btns = {}
+
+        def _sync_styles():
+            cur = var.get()
+            for k, b in btns.items():
+                if k == cur:
+                    b.configure(fg_color=COLOR_TEAL, text_color=COLOR_BG, border_color=COLOR_TEAL)
+                else:
+                    b.configure(fg_color=COLOR_BG, text_color=COLOR_TEXT_MUTED, border_color=COLOR_BORDER)
+
+        def _pick(key):
+            if var.get() == key:
+                return
+            var.set(key)
+            _sync_styles()
+            on_change()
+
+        for key, caption in options:
+            w_btn = max(42, 6 * len(caption) + 14)
+            btn = ctk.CTkButton(
+                parent, text=caption, width=w_btn, height=19, corner_radius=7,
+                font=ctk.CTkFont(size=9, weight="bold"),
+                fg_color=COLOR_BG, hover_color=COLOR_TEAL_DIM,
+                border_width=1, border_color=COLOR_BORDER,
+                text_color=COLOR_TEXT_MUTED,
+                command=lambda k=key: _pick(k),
+            )
+            btn.pack(side="left", padx=(0, 4))
+            btns[key] = btn
+
+        _sync_styles()
+        return btns, _sync_styles
 
     def _draw_metric_band(self, canvas, value, metric_key):
         """10px track: baseline/reference low-high filled COLOR_TEAL_DIM,
@@ -3228,6 +3457,8 @@ Troubleshooting:
         except Exception:
             return
         canvas.create_rectangle(0, 1, w, 11, fill=COLOR_BG, outline=COLOR_BORDER)
+        if value is None:
+            return
         finite = all(v == v and abs(v) != float("inf") for v in (low, high, value))
         if not finite or high <= low:
             return
@@ -3246,45 +3477,170 @@ Troubleshooting:
     def _update_metric_bands(self, snapshot):
         for prefix, key in self.INSIGHT_BAND_METRICS.items():
             canvas = getattr(self, f"{prefix}_band_canvas", None)
-            if canvas is None or key not in snapshot:
+            if canvas is None or key not in snapshot or snapshot[key] is None:
                 continue
             self._draw_metric_band(canvas, snapshot[key], key)
+
+    def _setup_fogwatch_tab(self):
+        self.fogwatch_summary_var = tk.StringVar(value="Scanning cognitive clarity signals...")
+        self.fogwatch_detail_var = tk.StringVar(
+            value="Personal self-tracking proxy (non-diagnostic): MATTR-50 + specificity + fluency + pause stalls."
+        )
+        self.fogwatch_peer_var = tk.StringVar(value="Comparison pending.")
+        self.fogwatch_metric_var = tk.StringVar(value="clarity_index")
+        opts = [
+            ("clarity_index", "Clarity Index"),
+            ("mattr_diversity", "MATTR-50"),
+            ("vague_per_100", "Vague Words"),
+            ("pause_long_pct", "Pauses ≥5s"),
+        ]
+        self.fogwatch_canvas = self._build_metric_tab(
+            self.fogwatch_tab,
+            "fogwatch",
+            "Cognitive Clarity Index",
+            "FogWatch: longitudinal self-tracking of lexical sharpness, word-finding load, and mid-burst stalls (non-diagnostic).",
+            self.fogwatch_summary_var,
+            self.fogwatch_detail_var,
+            self.fogwatch_peer_var,
+            canvas_height=154,
+            toolbar_builder=lambda tb: self._make_pill_bar(
+                tb, opts, self.fogwatch_metric_var,
+                lambda: self._refresh_fogwatch_tab(self._current_lexical_slice),
+            ),
+        )
 
     def _setup_pace_tab(self):
         self.pace_summary_var = tk.StringVar(value="No pace data yet")
         self.pace_detail_var = tk.StringVar(value="Speak a bit and this will populate.")
         self.pace_peer_var = tk.StringVar(value="Comparison pending.")
+        self.pace_metric_var = tk.StringVar(value="pace_words_entry")
+        opts = [
+            ("pace_words_entry", "Words / Entry"),
+            ("words_per_sentence", "Words / Sent"),
+            ("acoustic_wpm", "Acoustic WPM"),
+        ]
         self.pace_canvas = self._build_metric_tab(
-            self.pace_tab, "pace", "Words / entry",
-            "Pace Stability: tracks how your words per entry vary over recent sessions.",
-            self.pace_summary_var, self.pace_detail_var, self.pace_peer_var)
+            self.pace_tab,
+            "pace",
+            "Words / entry",
+            "Pace & Elaboration: tracks sustained utterance length, sentence length, and local acoustic WPM over time.",
+            self.pace_summary_var,
+            self.pace_detail_var,
+            self.pace_peer_var,
+            canvas_height=146,
+            toolbar_builder=lambda tb: self._make_pill_bar(
+                tb, opts, self.pace_metric_var,
+                lambda: self.refresh_insights_tabs(),
+            ),
+        )
 
     def _setup_pause_tab(self):
         self.pause_summary_var = tk.StringVar(value="No pause data yet")
         self.pause_detail_var = tk.StringVar(value="Needs consecutive transcribed entries.")
         self.pause_peer_var = tk.StringVar(value="Comparison pending.")
+        self.pause_view_var = tk.StringVar(value="pause_long_pct")
+        opts = [
+            ("pause_long_pct", "Long ≥5s %"),
+            ("pause_p90_s", "P90 Tail (s)"),
+            ("pause_avg_s", "Avg Pause"),
+            ("acoustic_silence_pct", "VAD Silence"),
+            ("breakdown", "Breakdown"),
+        ]
         self.pause_canvas = self._build_metric_tab(
-            self.pause_tab, "pause", "Avg pause",
-            "Pause Profile: estimates short/medium/long pauses from timestamp gaps between entries.",
-            self.pause_summary_var, self.pause_detail_var, self.pause_peer_var)
+            self.pause_tab,
+            "pause",
+            "Long pauses (≥5s)",
+            "Pause Profile: longitudinal tail stalls (≥5s share & P90 gap), forward VAD silence, or Short/Med/Long breakdown.",
+            self.pause_summary_var,
+            self.pause_detail_var,
+            self.pause_peer_var,
+            canvas_height=146,
+            toolbar_builder=lambda tb: self._make_pill_bar(
+                tb, opts, self.pause_view_var,
+                lambda: self.refresh_insights_tabs(),
+            ),
+        )
 
     def _setup_clarity_tab(self):
         self.clarity_summary_var = tk.StringVar(value="No clarity data yet")
         self.clarity_detail_var = tk.StringVar(value="Detected from the full transcript archive.")
         self.clarity_peer_var = tk.StringVar(value="Comparison pending.")
+        self.clarity_view_var = tk.StringVar(value="fillers_per_100")
+        opts = [
+            ("fillers_per_100", "Fillers"),
+            ("disfluency_per_1k", "Repairs / 1k"),
+            ("vague_per_100", "Vague / 100w"),
+            ("breakdown", "Top Fillers"),
+        ]
         self.clarity_canvas = self._build_metric_tab(
-            self.clarity_tab, "clarity", "Fillers / 100 w",
-            "Clarity Signals: filler words, hedges, and immediate repetition markers.",
-            self.clarity_summary_var, self.clarity_detail_var, self.clarity_peer_var)
+            self.clarity_tab,
+            "clarity",
+            "Fillers / 100 w",
+            "Fluency & Retrieval: longitudinal filler rate, self-repairs/restarts, vague placeholders, or top filler breakdown.",
+            self.clarity_summary_var,
+            self.clarity_detail_var,
+            self.clarity_peer_var,
+            canvas_height=146,
+            toolbar_builder=lambda tb: self._make_pill_bar(
+                tb, opts, self.clarity_view_var,
+                lambda: self.refresh_insights_tabs(),
+            ),
+        )
 
     def _setup_lexical_tab(self):
         self.lexical_summary_var = tk.StringVar(value="No lexical data yet")
         self.lexical_detail_var = tk.StringVar(value="Uses transcript vocabulary from all archived sessions.")
         self.lexical_peer_var = tk.StringVar(value="Comparison pending.")
+        self.lexical_view_var = tk.StringVar(value="mattr_diversity")
+        opts = [
+            ("mattr_diversity", "MATTR-50"),
+            ("content_density_pct", "Content %"),
+            ("lexical_long_word_percent", "7+ Chars %"),
+            ("breakdown", "Core Words"),
+        ]
         self.lexical_canvas = self._build_metric_tab(
-            self.lexical_tab, "lexical", "Diversity",
-            "Lexical Diversity: vocabulary range, unique-word ratio, and frequent content words.",
-            self.lexical_summary_var, self.lexical_detail_var, self.lexical_peer_var)
+            self.lexical_tab,
+            "lexical",
+            "MATTR-50 Diversity",
+            "Lexical Richness: length-invariant MATTR-50 diversity (no sample-size distortion), content density, and core themes.",
+            self.lexical_summary_var,
+            self.lexical_detail_var,
+            self.lexical_peer_var,
+            canvas_height=146,
+            toolbar_builder=lambda tb: self._make_pill_bar(
+                tb, opts, self.lexical_view_var,
+                lambda: self.refresh_insights_tabs(),
+            ),
+        )
+
+    def _setup_mind_tab(self):
+        self.mind_summary_var = tk.StringVar(value="Scanning local well-being & style markers...")
+        self.mind_detail_var = tk.StringVar(
+            value="100% offline lexical proxies: Vitality vs Strain, 1st-person focus, absolutist words, hedges, late-night %."
+        )
+        self.mind_peer_var = tk.StringVar(value="Comparison pending.")
+        self.mind_metric_var = tk.StringVar(value="vitality_balance")
+        opts = [
+            ("vitality_balance", "Vitality"),
+            ("self_focus_per_100", "I-Talk"),
+            ("absolutist_per_100", "Absolutist"),
+            ("hedges_per_100", "Hedges"),
+            ("late_night_pct", "Night %"),
+        ]
+        self.mind_canvas = self._build_metric_tab(
+            self.mind_tab,
+            "mind",
+            "Lexical Vitality vs Strain",
+            "Mind & Circadian (Local, Non-Diagnostic): tracks subtle shifts in affect words, self-focus, rigidity, and night speech.",
+            self.mind_summary_var,
+            self.mind_detail_var,
+            self.mind_peer_var,
+            canvas_height=154,
+            toolbar_builder=lambda tb: self._make_pill_bar(
+                tb, opts, self.mind_metric_var,
+                lambda: self._refresh_mind_tab(self._current_lexical_slice),
+            ),
+        )
 
     def _setup_intervention_tab(self):
         self.intervention_summary_var = tk.StringVar(value="No intervention data yet")
@@ -3294,7 +3650,7 @@ Troubleshooting:
             self.intervention_tab, "intervention", "Open questions / 100 w",
             "Intervention Mix: heuristic counts for open questions, reflections, affirmations, and summaries.",
             self.intervention_summary_var, self.intervention_detail_var,
-            self.intervention_peer_var)
+            self.intervention_peer_var, canvas_height=130)
 
     def _setup_ai_timeline_tab(self):
         # Inline notice: this tab does nothing without a key, so say so here
@@ -3328,21 +3684,21 @@ Troubleshooting:
         )
         self.ai_timeline_desc_label.pack(fill="x", padx=10, pady=(8, 4))
         self._update_api_key_notice()
-        
+
         self.ai_timeline_summary_var = tk.StringVar(value="Waiting to evaluate history...")
         self.ai_timeline_detail_var = tk.StringVar(value="Click 'Crunch History' to backfill daily summaries using OpenAI.")
-        
+
         header_frame = tk.Frame(self.ai_timeline_tab, bg=COLOR_ACCENT_BG)
         header_frame.pack(fill="x", padx=10, pady=0)
-        
+
         tk.Label(header_frame, textvariable=self.ai_timeline_summary_var, bg=COLOR_ACCENT_BG, fg=COLOR_TEAL, font=("Arial", 10, "bold"), anchor="w").pack(side="left")
-        
-        self.ai_timeline_temporal_var = tk.StringVar(value="Last 30 Days")
-        filter_options = ["Last 7 Days", "Last 30 Days", "Previous Month", "All Time"]
+
+        self.ai_timeline_temporal_var = tk.StringVar(value="Follow Horizon")
+        filter_options = ["Follow Horizon", "Last 7 Days", "Last 30 Days", "Previous Month", "All Time"]
         self.ai_timeline_dropdown = tk.OptionMenu(header_frame, self.ai_timeline_temporal_var, *filter_options, command=lambda _: self.refresh_insights_tabs())
         self.ai_timeline_dropdown.config(bg=COLOR_BG, fg=COLOR_FG, font=("Arial", 9), highlightthickness=1)
-        self.ai_timeline_dropdown.pack(side="left", padx=15)
-        
+        self.ai_timeline_dropdown.pack(side="left", padx=8)
+
         self.btn_crunch_history = tk.Button(
             header_frame,
             text="Crunch History",
@@ -3368,7 +3724,7 @@ Troubleshooting:
         auto_cb.pack(fill="x", padx=10, pady=(2, 0))
 
         tk.Label(self.ai_timeline_tab, textvariable=self.ai_timeline_detail_var, bg=COLOR_ACCENT_BG, fg=COLOR_TEXT_FAINT, font=("Arial", 8), anchor="w", justify="left", wraplength=400).pack(fill="x", padx=10, pady=(4, 6))
-        
+
         self.ai_timeline_canvas = tk.Canvas(self.ai_timeline_tab, height=150, bg=COLOR_TEXT_BG, highlightthickness=1, highlightbackground=COLOR_BORDER)
         self.ai_timeline_canvas.pack(fill="x", padx=10, pady=(0, 8))
 
@@ -3392,27 +3748,28 @@ Troubleshooting:
             justify="left",
             wraplength=400,
         ).pack(fill="x", padx=10, pady=(8, 4))
-        
+
         self.ai_mood_summary_var = tk.StringVar(value="Waiting to evaluate history...")
-        
+
         header_frame = tk.Frame(self.ai_mood_tab, bg=COLOR_ACCENT_BG)
         header_frame.pack(fill="x", padx=10, pady=0)
-        
+
         tk.Label(header_frame, textvariable=self.ai_mood_summary_var, bg=COLOR_ACCENT_BG, fg=COLOR_TEAL, font=("Arial", 10, "bold"), anchor="w").pack(side="left")
-        
-        self.ai_mood_temporal_var = tk.StringVar(value="Last 30 Days")
-        filter_options = ["Last 7 Days", "Last 30 Days", "Previous Month", "All Time"]
+
+        self.ai_mood_temporal_var = tk.StringVar(value="Follow Horizon")
+        filter_options = ["Follow Horizon", "Last 7 Days", "Last 30 Days", "Previous Month", "All Time"]
         self.ai_mood_dropdown = tk.OptionMenu(header_frame, self.ai_mood_temporal_var, *filter_options, command=lambda _: self.refresh_insights_tabs())
         self.ai_mood_dropdown.config(bg=COLOR_BG, fg=COLOR_FG, font=("Arial", 9), highlightthickness=1)
-        self.ai_mood_dropdown.pack(side="left", padx=15)
-        
+        self.ai_mood_dropdown.pack(side="left", padx=10)
+
         self.ai_mood_canvas = tk.Canvas(self.ai_mood_tab, height=140, bg=COLOR_TEXT_BG, highlightthickness=1, highlightbackground=COLOR_BORDER)
-        self.ai_mood_canvas.pack(fill="x", padx=10, pady=(10, 8))
+        self.ai_mood_canvas.pack(fill="x", padx=10, pady=(10, 6))
+        self._build_insight_guide_box(self.ai_mood_tab, "mood")
 
     def _setup_activity_matrix_tab(self):
         tk.Label(
             self.activity_matrix_tab,
-            text="Activity Matrix: GitHub-style history of your dictation intensity.",
+            text="Activity Matrix: GitHub-style calendar heatmap of volume, cognitive clarity, diversity, pauses, or mood.",
             bg=COLOR_ACCENT_BG,
             fg=COLOR_TEXT_MUTED,
             font=("Arial", 8),
@@ -3420,21 +3777,29 @@ Troubleshooting:
             justify="left",
             wraplength=400,
         ).pack(fill="x", padx=10, pady=(8, 4))
-        
+
         header_frame = tk.Frame(self.activity_matrix_tab, bg=COLOR_ACCENT_BG)
         header_frame.pack(fill="x", padx=10, pady=0)
-        
+
         self.activity_metric_var = tk.StringVar(value="Words (Volume)")
-        # No per-entry audio duration is recorded (stats only keep aggregate
-        # totals and processing latencies), so a real WPM cannot be computed;
-        # the previously mocked "Speed (WPM)" option was removed.
-        metric_options = ["Words (Volume)", "Mood"]
-        self.activity_metric_dropdown = tk.OptionMenu(header_frame, self.activity_metric_var, *metric_options, command=lambda _: self.refresh_insights_tabs())
+        metric_options = [
+            "Words (Volume)",
+            "Clarity Index",
+            "Lexical Diversity",
+            "Long Pauses %",
+            "Vitality",
+            "Mood",
+        ]
+        self.activity_metric_dropdown = tk.OptionMenu(
+            header_frame, self.activity_metric_var, *metric_options,
+            command=lambda _: self.refresh_insights_tabs(),
+        )
         self.activity_metric_dropdown.config(bg=COLOR_BG, fg=COLOR_FG, font=("Arial", 9), highlightthickness=1)
         self.activity_metric_dropdown.pack(side="left")
-        
+
         self.activity_canvas = tk.Canvas(self.activity_matrix_tab, height=150, bg=COLOR_TEXT_BG, highlightthickness=1, highlightbackground=COLOR_BORDER)
-        self.activity_canvas.pack(fill="x", padx=10, pady=(10, 8))
+        self.activity_canvas.pack(fill="x", padx=10, pady=(10, 6))
+        self._build_insight_guide_box(self.activity_matrix_tab, "activity")
 
     def _setup_speaker_profile_tab(self):
         tk.Label(
@@ -3447,39 +3812,35 @@ Troubleshooting:
             justify="left",
             wraplength=400,
         ).pack(fill="x", padx=10, pady=(8, 4))
-        
+
         self.speaker_profile_canvas = tk.Canvas(self.speaker_profile_tab, height=200, bg=COLOR_TEXT_BG, highlightthickness=1, highlightbackground=COLOR_BORDER)
-        self.speaker_profile_canvas.pack(fill="x", padx=10, pady=(10, 8))
+        self.speaker_profile_canvas.pack(fill="x", padx=10, pady=(10, 6))
+        self._build_insight_guide_box(self.speaker_profile_tab, "profile")
 
     def _setup_daily_brief_tab(self):
-        # Left/right split. A plain tk.Frame pair rather than a
-        # ttk.PanedWindow: the ttk widget draws in the light theme and reads as
-        # a pale block inside the dark card.
         paned = tk.Frame(self.daily_brief_tab, bg=COLOR_ACCENT_BG)
         paned.pack(fill="both", expand=True, padx=5, pady=5)
 
-        # Left frame: Listbox of dates
         list_frame = tk.Frame(paned, bg=COLOR_ACCENT_BG, width=96)
         list_frame.pack(side="left", fill="both")
         list_frame.pack_propagate(False)
-        
+
         tk.Label(list_frame, text="History", bg=COLOR_ACCENT_BG, fg=COLOR_FG, font=("Arial", 9, "bold")).pack(anchor="w", padx=2)
-        
+
         self.brief_listbox = tk.Listbox(list_frame, bg=COLOR_TEXT_BG, fg=COLOR_FG, selectbackground=COLOR_TEAL, selectforeground=COLOR_BG, font=("Arial", 10), bd=0, highlightthickness=1, highlightbackground=COLOR_BORDER)
         self.brief_listbox.pack(side="left", fill="both", expand=True)
-        
+
         scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.brief_listbox.yview)
         scroll.pack(side="right", fill="y")
         self.brief_listbox.config(yscrollcommand=scroll.set)
-        
+
         self.brief_listbox.bind("<<ListboxSelect>>", self._on_brief_date_select)
-        
-        # Right frame: Text details
+
         detail_frame = tk.Frame(paned, bg=COLOR_ACCENT_BG)
         detail_frame.pack(side="left", fill="both", expand=True)
-        
+
         tk.Label(detail_frame, text="AI Daily Brief", bg=COLOR_ACCENT_BG, fg=COLOR_FG, font=("Arial", 9, "bold")).pack(anchor="w", padx=4)
-        
+
         self.brief_text = tk.Text(detail_frame, wrap="word", width=24, height=9, bg=COLOR_TEXT_BG, fg=COLOR_FG, font=("Georgia", 10), bd=0, highlightthickness=1, highlightbackground=COLOR_BORDER)
         self.brief_text.pack(fill="both", expand=True, padx=(4, 0))
         self.brief_text.insert("1.0", "Select a date to view its daily brief.")
@@ -3516,20 +3877,147 @@ Troubleshooting:
         self._on_insight_tab_changed()
         self.root.after(50, self._update_scroll_region)
 
+    @staticmethod
+    def _is_valid_insights_range(val):
+        if not isinstance(val, str) or not val.strip():
+            return False
+        s = val.strip()
+        low = s.lower()
+        if s in INSIGHTS_RANGE_OPTIONS:
+            return True
+        if low.startswith("year ") or low.startswith("year:") or low.startswith("month:"):
+            return True
+        if ".." in s or (len(s) == 4 and s.isdigit()):
+            return True
+        return low in ("ytd", "prev_6m", "last_quarter", "last quarter", "previous month")
+
+    def _sync_period_combo_values(self, daily_map):
+        if lexical_insights is None:
+            return
+        opts = lexical_insights.available_period_options(daily_map or {})
+        cur = self.insights_range_var.get() if hasattr(self, "insights_range_var") else INSIGHTS_RANGE_DEFAULT
+        if cur and cur not in opts:
+            opts.append(cur)
+        if hasattr(self, "insights_period_combo"):
+            try:
+                self.insights_period_combo["values"] = opts
+            except Exception:
+                pass
+        exp_combo = getattr(self, "_explorer_period_combo", None)
+        if exp_combo is not None:
+            try:
+                exp_combo["values"] = opts
+            except Exception:
+                pass
+
     def _select_insights_range(self, key):
-        if key not in INSIGHTS_RANGE_OPTIONS:
+        if not self._is_valid_insights_range(key):
             return
         self.insights_range_var.set(key)
         self._update_range_button_styles()
         self._on_insights_range_change(key)
 
+    def _on_insights_period_combo_select(self, _event=None):
+        self._update_range_button_styles()
+        self._on_insights_range_change()
+
+    def _on_insights_filter_change(self, _event=None):
+        if hasattr(self, "insights_bucket_var"):
+            b_val = self.insights_bucket_var.get()
+            if b_val in INSIGHTS_BUCKET_OPTIONS:
+                self.config["insights_bucket"] = b_val
+        if hasattr(self, "insights_lang_var"):
+            l_val = self.insights_lang_var.get()
+            if l_val in INSIGHTS_LANG_OPTIONS:
+                self.config["insights_lang"] = l_val
+        self._persist_config()
+        self.refresh_insights_tabs()
+
     def _update_range_button_styles(self):
-        current = self.insights_range_var.get()
-        for key, btn in getattr(self, "insights_range_buttons", {}).items():
-            if key == current:
-                btn.configure(fg_color=COLOR_TEAL, text_color=COLOR_BG)
-            else:
-                btn.configure(fg_color=COLOR_BG, text_color=COLOR_TEXT_FAINT)
+        current = self.insights_range_var.get() if hasattr(self, "insights_range_var") else ""
+        for btn_map in (
+            getattr(self, "insights_range_buttons", {}),
+            getattr(self, "_explorer_range_buttons", {}),
+        ):
+            for key, btn in (btn_map or {}).items():
+                try:
+                    if key == current:
+                        btn.configure(fg_color=COLOR_TEAL, text_color=COLOR_BG)
+                    else:
+                        btn.configure(fg_color=COLOR_BG, text_color=COLOR_TEXT_FAINT)
+                except Exception:
+                    pass
+        self._update_trim_outlier_button_styles()
+
+    def _is_trim_outliers_enabled(self):
+        var = getattr(self, "insights_trim_outliers_var", None)
+        if var is not None:
+            return bool(var.get())
+        return bool(self.config.get("insights_trim_outliers", False))
+
+    def _toggle_trim_outliers(self):
+        """Toggle non-destructive >2.5σ outlier filtering across all Speech Insights views."""
+        new_val = not self._is_trim_outliers_enabled()
+        if hasattr(self, "insights_trim_outliers_var"):
+            self.insights_trim_outliers_var.set(new_val)
+        self.config["insights_trim_outliers"] = new_val
+        self._persist_config()
+        self._current_lexical_slice = None
+        self._update_trim_outlier_button_styles()
+        self.refresh_insights_tabs()
+
+    def _update_trim_outlier_button_styles(self):
+        trim_on = self._is_trim_outliers_enabled()
+        sl = getattr(self, "_current_lexical_slice", None)
+        n_out = int(sl.get("total_outlier_buckets", 0)) if isinstance(sl, dict) else 0
+
+        main_btn = getattr(self, "btn_trim_outliers", None)
+        if main_btn is not None:
+            try:
+                if trim_on:
+                    lbl = f"✂ >2.5σ ({n_out})" if n_out > 0 else "✂ >2.5σ ✓"
+                    main_btn.configure(
+                        text=lbl,
+                        fg_color="#78350f",
+                        hover_color="#92400e",
+                        border_color="#f59e0b",
+                        text_color="#fef3c7",
+                    )
+                else:
+                    lbl = f"✂ >2.5σ·{n_out}" if n_out > 0 else "✂ >2.5σ"
+                    main_btn.configure(
+                        text=lbl,
+                        fg_color=COLOR_BG,
+                        hover_color=COLOR_TEAL_DIM,
+                        border_color="#f59e0b" if n_out > 0 else COLOR_BORDER,
+                        text_color="#fbbf24" if n_out > 0 else COLOR_TEXT_MUTED,
+                    )
+            except Exception:
+                pass
+
+        exp_btn = getattr(self, "_explorer_trim_btn", None)
+        if exp_btn is not None:
+            try:
+                if trim_on:
+                    lbl = f"✂ Kick >2.5σ ({n_out})" if n_out > 0 else "✂ Kick >2.5σ ✓"
+                    exp_btn.configure(
+                        text=lbl,
+                        fg_color="#78350f",
+                        hover_color="#92400e",
+                        border_color="#f59e0b",
+                        text_color="#fef3c7",
+                    )
+                else:
+                    lbl = f"✂ Kick >2.5σ ({n_out} found)" if n_out > 0 else "✂ Kick >2.5σ"
+                    exp_btn.configure(
+                        text=lbl,
+                        fg_color=COLOR_BG,
+                        hover_color=COLOR_TEAL_DIM,
+                        border_color="#f59e0b" if n_out > 0 else COLOR_BORDER,
+                        text_color="#fbbf24" if n_out > 0 else COLOR_TEXT_MUTED,
+                    )
+            except Exception:
+                pass
 
     def _update_insights_summary(self, today_words, session_speed):
         """One-line summary on the collapsed Speech Insights header."""
@@ -3537,7 +4025,9 @@ Troubleshooting:
             return
         parts = [f"{today_words:,} w", f"{session_speed} WPM"]
         snap = getattr(self, "_insights_snapshot", None)
-        if snap and "clarity_fillers_per_100" in snap:
+        if snap and snap.get("clarity_index") is not None:
+            parts.append(f"Clarity {snap['clarity_index']:.0f}")
+        elif snap and "clarity_fillers_per_100" in snap:
             parts.append(f"{snap['clarity_fillers_per_100']:.1f} fill")
         self.insights_summary_var.set(" \u00b7 ".join(parts))
 
@@ -3570,9 +4060,10 @@ Troubleshooting:
 
     def _on_insights_range_change(self, _value=None):
         value = self.insights_range_var.get()
-        if value not in INSIGHTS_RANGE_OPTIONS:
+        if not self._is_valid_insights_range(value):
             value = INSIGHTS_RANGE_DEFAULT
             self.insights_range_var.set(value)
+        self._update_range_button_styles()
         self.config['insights_range'] = value
         self._persist_config()
         self.refresh_insights_tabs()
@@ -3580,9 +4071,52 @@ Troubleshooting:
     def _insights_range_days(self):
         var = getattr(self, "insights_range_var", None)
         label = var.get() if var is not None else INSIGHTS_RANGE_DEFAULT
-        if label not in INSIGHTS_RANGE_OPTIONS:
-            label = INSIGHTS_RANGE_DEFAULT
-        return INSIGHTS_RANGE_OPTIONS[label]
+        if label in INSIGHTS_RANGE_OPTIONS:
+            return INSIGHTS_RANGE_OPTIONS[label]
+        if self._is_valid_insights_range(label):
+            return label
+        return INSIGHTS_RANGE_OPTIONS[INSIGHTS_RANGE_DEFAULT]
+
+    def _lexical_cache_file(self):
+        return os.path.join(app_dir, f"{LEXICAL_CACHE_PREFIX}.{self._hostname()}.json")
+
+    def _get_lexical_index(self, force_rebuild=False):
+        """Return the incremental per-machine LexicalDiskIndex (refreshing changed months)."""
+        if lexical_insights is None:
+            return None
+        trans_dir = os.path.join(app_dir, TRANSCRIPTIONS_DIR)
+        cache_path = self._lexical_cache_file()
+        idx = getattr(self, "_lexical_index", None)
+        if idx is None or os.path.abspath(idx.transcriptions_dir) != os.path.abspath(trans_dir):
+            idx = lexical_insights.LexicalDiskIndex(
+                transcriptions_dir=trans_dir,
+                cache_path=cache_path,
+                hostname=self._hostname(),
+            )
+            idx.refresh(force_rebuild=force_rebuild, persist=True)
+            self._lexical_index = idx
+        elif force_rebuild or not idx._loaded_from_disk:
+            idx.refresh(force_rebuild=force_rebuild, persist=True)
+        return idx
+
+    def _schedule_lexical_index_save(self, delay_ms=4000):
+        if self._shutting_down:
+            return
+        if self._lexical_save_job is not None:
+            try:
+                self.root.after_cancel(self._lexical_save_job)
+            except Exception:
+                pass
+        self._lexical_save_job = self._ui_after(delay_ms, self._flush_lexical_index)
+
+    def _flush_lexical_index(self):
+        self._lexical_save_job = None
+        idx = getattr(self, "_lexical_index", None)
+        if idx is not None:
+            try:
+                idx.save()
+            except Exception as exc:
+                self.log_internal(f"Lexical cache save skipped: {exc}")
 
     def _cycle_insight_tab(self, step):
         frames = getattr(self, "insight_tab_frames", None)
@@ -3594,7 +4128,7 @@ Troubleshooting:
         return tokenize_words(text)
 
     def _baseline_active(self):
-        """True once enough history exists to use the personal trailing average."""
+        """True once enough history exists to use the personal trailing baseline."""
         return (
             getattr(self, "_personal_baseline_days", 0) >= PERSONAL_BASELINE_MIN_DAYS
             and bool(getattr(self, "_personal_baseline", None))
@@ -3602,20 +4136,25 @@ Troubleshooting:
 
     def _comparison_prefix(self):
         if self._baseline_active():
-            return f"vs your {PERSONAL_BASELINE_DAYS}-day average"
+            return f"vs your {PERSONAL_BASELINE_DAYS}-day baseline"
         return "vs reference band"
 
     def _metric_band_status(self, value, metric_key):
-        """Classify value against the personal baseline band (or the fallback
-        reference band while there isn't enough history)."""
-        baseline = self._baseline_value(metric_key)
-        if self._baseline_active() and metric_key in self._personal_baseline:
-            spread = abs(baseline) * PERSONAL_BASELINE_BAND_FRACTION
+        """Classify value against the personal MAD baseline band (or fallback reference band)."""
+        lex_base = (getattr(self, "_lexical_baselines", None) or {}).get(metric_key)
+        if lex_base and lex_base.get("is_personal"):
+            low = float(lex_base["low"])
+            high = float(lex_base["high"])
+        elif self._baseline_active() and metric_key in self._personal_baseline:
+            baseline = self._baseline_value(metric_key)
+            spread = max(0.25, abs(baseline) * PERSONAL_BASELINE_BAND_FRACTION)
             low, high = baseline - spread, baseline + spread
         else:
             band = PEER_BENCHMARKS.get(metric_key, {"low": float("-inf"), "high": float("inf")})
             low = band.get("low", float("-inf"))
             high = band.get("high", float("inf"))
+        if value is None:
+            return "within", low, high
         if value < low:
             return "below", low, high
         if value > high:
@@ -3630,8 +4169,10 @@ Troubleshooting:
         return (band.get("low", 0.0) + band.get("high", 0.0)) / 2.0
 
     def _baseline_value(self, metric_key):
-        """Reference value for a metric: the user's own trailing average when
-        available, otherwise the hand-set PEER_BENCHMARKS midpoint."""
+        """Reference value for a metric: personal trailing median/mean when available."""
+        lex_base = (getattr(self, "_lexical_baselines", None) or {}).get(metric_key)
+        if lex_base and lex_base.get("is_personal"):
+            return float(lex_base["median"])
         if self._baseline_active():
             baseline = self._personal_baseline
             if metric_key in baseline:
@@ -3639,6 +4180,8 @@ Troubleshooting:
         return self._peer_midpoint(metric_key)
 
     def _relative_delta_pct(self, value, metric_key):
+        if value is None:
+            return 0.0
         reference = self._baseline_value(metric_key)
         if abs(reference) < 1e-9:
             return 0.0
@@ -3666,6 +4209,10 @@ Troubleshooting:
     def _update_insights_profile_summary(self):
         if not hasattr(self, "insights_profile_summary_var"):
             return
+        sl = getattr(self, "_current_lexical_slice", None)
+        if sl and sl.get("callout") and int((sl.get("summary") or {}).get("words", 0)) >= INSIGHTS_MIN_WORDS_CONFIDENT:
+            self.insights_profile_summary_var.set(sl["callout"])
+            return
         label = f"Current window {self._comparison_prefix()}"
         snapshot = getattr(self, "_peer_snapshot", {})
         if not snapshot:
@@ -3682,7 +4229,358 @@ Troubleshooting:
             return
         self.insights_profile_summary_var.set(f"{label}: " + " | ".join(ordered))
 
-    def _draw_empty_insight_canvas(self, canvas, msg):
+    def _draw_timeseries_chart(
+        self,
+        canvas,
+        slice_data,
+        primary_key,
+        secondary_key=None,
+        show_baseline=True,
+        empty_msg=None,
+    ):
+        """Render a longitudinal development line graph with personal baseline band,
+        confidence-weighted raw bucket points, smooth rolling trajectory, optional
+        dual-metric overlay, and clamped interactive crosshair HUD."""
+        canvas._nw_ts_args = (slice_data, primary_key, secondary_key, show_baseline, empty_msg)
+        if not getattr(canvas, "_nw_ts_resize_bound", False):
+            canvas._nw_ts_resize_bound = True
+
+            def _on_cfg(event, c=canvas):
+                prev_wh = getattr(c, "_nw_ts_last_wh", None)
+                cur_wh = (event.width, event.height)
+                if cur_wh != prev_wh and event.width > 30 and event.height > 30:
+                    c._nw_ts_last_wh = cur_wh
+                    args = getattr(c, "_nw_ts_args", None)
+                    if args is not None:
+                        self._draw_timeseries_chart(c, *args)
+
+            canvas.bind("<Configure>", _on_cfg, add="+")
+
+        canvas.delete("all")
+        if not slice_data or lexical_insights is None:
+            self._draw_empty_insight_canvas(canvas, empty_msg or "No longitudinal data yet", clear_ts=False)
+            return
+
+        points = slice_data.get("points") or []
+        rolling_map = slice_data.get("rolling") or {}
+        baselines = slice_data.get("baselines") or {}
+        spec = lexical_insights.METRIC_SPECS.get(primary_key, {
+            "label": primary_key,
+            "short": primary_key,
+            "unit": "",
+            "decimals": 1,
+            "color": COLOR_TEAL,
+        })
+        sec_spec = (
+            lexical_insights.METRIC_SPECS.get(secondary_key)
+            if secondary_key and secondary_key != "None" and secondary_key != primary_key
+            else None
+        )
+
+        valid_pairs = [(i, float(p[primary_key])) for i, p in enumerate(points) if p.get(primary_key) is not None]
+        if not valid_pairs:
+            default_empty = (
+                "Recorded automatically on new local dictations"
+                if primary_key in ("acoustic_wpm", "acoustic_silence_pct")
+                else "No data in selected horizon"
+            )
+            self._draw_empty_insight_canvas(canvas, empty_msg or default_empty, clear_ts=False)
+            return
+
+        canvas.update_idletasks()
+        w = canvas.winfo_width()
+        h = canvas.winfo_height()
+        if w < 40:
+            w = int(canvas.cget("width") or 380)
+        if h < 40:
+            h = int(canvas.cget("height") or 146)
+        canvas._nw_ts_last_wh = (w, h)
+
+        sec_pairs = []
+        if sec_spec is not None:
+            sec_pairs = [(i, float(p[secondary_key])) for i, p in enumerate(points) if p.get(secondary_key) is not None]
+        has_sec = len(sec_pairs) >= 1
+
+        left = 42
+        right = 44 if has_sec else 12
+        top = 20
+        bottom = 20
+        cw = max(20, w - left - right)
+        ch = max(20, h - top - bottom)
+
+        raw_vals = [v for _, v in valid_pairs]
+        roll_series = rolling_map.get(primary_key) or []
+        roll_vals = [float(v) for v in roll_series if v is not None]
+        all_v = raw_vals + roll_vals
+        base_info = baselines.get(primary_key) if show_baseline else None
+        if base_info:
+            all_v.extend([float(base_info["low"]), float(base_info["high"])])
+
+        y_min = min(all_v)
+        y_max = max(all_v)
+        span = max(y_max - y_min, 1e-3)
+        y_min -= span * 0.12
+        y_max += span * 0.14
+        if min(raw_vals) >= 0.0 and primary_key != "vitality_balance":
+            y_min = max(0.0, y_min)
+        if y_max <= y_min:
+            y_max = y_min + 1.0
+
+        n_pts = len(points)
+
+        def x_of(idx):
+            if n_pts <= 1:
+                return left + cw * 0.5
+            return left + (idx / float(n_pts - 1)) * cw
+
+        def y_of(val):
+            t = (float(val) - y_min) / (y_max - y_min)
+            return top + ch - max(0.0, min(1.0, t)) * ch
+
+        decimals = int(spec.get("decimals", 1))
+        unit = spec.get("unit", "")
+        prim_color = spec.get("color", COLOR_TEAL)
+
+        def fmt_v(v, dec=decimals, u=unit):
+            return f"{v:.{dec}f}{u}"
+
+        # 1. Personal baseline band (drawn underneath gridlines and data)
+        if base_info:
+            by_hi = y_of(base_info["high"])
+            by_lo = y_of(base_info["low"])
+            by_med = y_of(base_info["median"])
+            canvas.create_rectangle(
+                left, by_hi, left + cw, by_lo,
+                fill="#112829", outline="",
+            )
+            canvas.create_line(left, by_hi, left + cw, by_hi, fill="#1b4341")
+            canvas.create_line(left, by_lo, left + cw, by_lo, fill="#1b4341")
+            canvas.create_line(left, by_med, left + cw, by_med, fill="#24635d", dash=(3, 3))
+
+        # 2. Horizontal gridlines + primary Y-axis labels
+        for frac in (0.0, 0.5, 1.0):
+            gy = top + frac * ch
+            gval = y_max - frac * (y_max - y_min)
+            canvas.create_line(left, gy, left + cw, gy, fill="#1e293b", dash=(2, 3))
+            lbl_txt = f"{gval:.0f}" if (y_max - y_min) >= 12 or decimals == 0 else f"{gval:.1f}"
+            canvas.create_text(
+                left - 5, gy, text=lbl_txt, fill="#94a3b8",
+                font=("Consolas", 7), anchor="e",
+            )
+
+        # 3. Optional secondary overlay (independent right-hand scale)
+        sec_y_min, sec_y_max = 0.0, 1.0
+        if has_sec and sec_spec is not None:
+            s_raw = [v for _, v in sec_pairs]
+            s_roll = rolling_map.get(secondary_key) or []
+            s_all = s_raw + [float(v) for v in s_roll if v is not None]
+            sec_y_min = min(s_all)
+            sec_y_max = max(s_all)
+            s_span = max(sec_y_max - sec_y_min, 1e-3)
+            sec_y_min -= s_span * 0.12
+            sec_y_max += s_span * 0.14
+            if min(s_raw) >= 0.0:
+                sec_y_min = max(0.0, sec_y_min)
+            if sec_y_max <= sec_y_min:
+                sec_y_max = sec_y_min + 1.0
+
+            sec_color = sec_spec.get("color", "#f59e0b")
+            sec_dec = int(sec_spec.get("decimals", 1))
+
+            def y_sec(val):
+                t = (float(val) - sec_y_min) / (sec_y_max - sec_y_min)
+                return top + ch - max(0.0, min(1.0, t)) * ch
+
+            for frac in (0.0, 1.0):
+                gy = top + frac * ch
+                gval = sec_y_max - frac * (sec_y_max - sec_y_min)
+                s_lbl = f"{gval:.0f}" if (sec_y_max - sec_y_min) >= 12 or sec_dec == 0 else f"{gval:.1f}"
+                canvas.create_text(
+                    left + cw + 4, gy, text=s_lbl, fill=sec_color,
+                    font=("Consolas", 7), anchor="w",
+                )
+
+            sec_plot = [(i, float(s_roll[i])) for i in range(min(len(points), len(s_roll))) if s_roll[i] is not None]
+            if len(sec_plot) < 2:
+                sec_plot = sec_pairs
+            if len(sec_plot) >= 2:
+                s_coords = []
+                for idx, sval in sec_plot:
+                    s_coords.extend([x_of(idx), y_sec(sval)])
+                canvas.create_line(
+                    *s_coords, fill=sec_color, width=1.6, dash=(4, 2),
+                    smooth=(len(sec_plot) >= 3),
+                )
+
+        # 4. Raw bucket connectors + confidence-styled dots
+        if 2 <= len(valid_pairs) <= 100:
+            raw_coords = []
+            for idx, val in valid_pairs:
+                raw_coords.extend([x_of(idx), y_of(val)])
+            canvas.create_line(*raw_coords, fill="#243547", width=1)
+
+        if len(valid_pairs) == 1:
+            idx0, val0 = valid_pairs[0]
+            px0, py0 = x_of(idx0), y_of(val0)
+            canvas.create_oval(px0 - 4, py0 - 4, px0 + 4, py0 + 4, fill=prim_color, outline="#f0fdfa")
+            canvas.create_text(
+                px0, max(top + 8, py0 - 10), text=fmt_v(val0),
+                fill=prim_color, font=("Arial", 8, "bold"),
+            )
+        elif n_pts <= 140:
+            for idx, val in valid_pairs:
+                px_i, py_i = x_of(idx), y_of(val)
+                if points[idx].get("low_confidence"):
+                    canvas.create_oval(px_i - 1.6, py_i - 1.6, px_i + 1.6, py_i + 1.6, fill="#475569", outline="")
+                else:
+                    canvas.create_oval(px_i - 2.3, py_i - 2.3, px_i + 2.3, py_i + 2.3, fill=prim_color, outline="")
+
+        # 4b. Subtle top-edge amber '×' ticks for >2.5σ buckets kicked out by trim_outliers
+        if n_pts <= 180:
+            for idx, pt_obj in enumerate(points):
+                trimmed_map = pt_obj.get("_trimmed_values")
+                if isinstance(trimmed_map, dict) and primary_key in trimmed_map:
+                    tx_m = x_of(idx)
+                    ty_m = top + 4
+                    canvas.create_line(tx_m - 2.5, ty_m - 2.5, tx_m + 2.5, ty_m + 2.5, fill="#f59e0b", width=1.4)
+                    canvas.create_line(tx_m - 2.5, ty_m + 2.5, tx_m + 2.5, ty_m - 2.5, fill="#f59e0b", width=1.4)
+
+        # 5. Bold rolling trajectory curve
+        roll_pairs = [
+            (i, float(roll_series[i]))
+            for i in range(min(n_pts, len(roll_series)))
+            if roll_series[i] is not None
+        ]
+        if len(roll_pairs) >= 2:
+            r_coords = []
+            for idx, rval in roll_pairs:
+                r_coords.extend([x_of(idx), y_of(rval)])
+            canvas.create_line(
+                *r_coords, fill=prim_color, width=2.3,
+                smooth=(len(roll_pairs) >= 3),
+            )
+
+        # 6. Compact top legend strip
+        roll_lbl = slice_data.get("rolling_label", "trend")
+        legend_bits = [f"━ {spec.get('short', primary_key)} ({roll_lbl})"]
+        if base_info:
+            legend_bits.append("░ 90d norm")
+        if has_sec and sec_spec is not None:
+            legend_bits.append(f"╌ {sec_spec.get('short', secondary_key)}")
+        n_trim_prim = int((slice_data.get("trimmed_points_by_metric") or {}).get(primary_key, 0))
+        if n_trim_prim > 0:
+            legend_bits.append(f"✂ {n_trim_prim} >2.5σ")
+        canvas.create_text(
+            left + cw, 8, text="   ".join(legend_bits),
+            fill="#94a3b8", font=("Arial", 7), anchor="e",
+        )
+
+        # 7. Smart non-overlapping X-axis date ticks
+        max_ticks = max(2, min(6, cw // 82))
+        if n_pts == 1:
+            tick_indices = [0]
+        elif n_pts <= max_ticks:
+            tick_indices = list(range(n_pts))
+        else:
+            tick_indices = sorted({round(i * (n_pts - 1) / float(max_ticks - 1)) for i in range(max_ticks)})
+        for tidx in tick_indices:
+            tx = x_of(tidx)
+            anchor = "w" if tidx == 0 and n_pts > 1 else ("e" if tidx == n_pts - 1 and n_pts > 1 else "center")
+            t_lbl = points[tidx].get("short_date") or points[tidx].get("key", "")
+            canvas.create_text(tx, h - 4, text=t_lbl, fill="#94a3b8", font=("Consolas", 7), anchor=anchor)
+
+        # 8. Interactive <Motion> crosshair & clamped HUD tooltip
+        def _on_motion(event):
+            canvas.delete("ts_hover")
+            if not points:
+                return
+            if n_pts == 1:
+                idx = 0
+            else:
+                rel = (event.x - left) / float(max(1, cw))
+                idx = max(0, min(n_pts - 1, int(round(rel * (n_pts - 1)))))
+
+            pt = points[idx]
+            hx = x_of(idx)
+            canvas.create_line(hx, top, hx, top + ch, fill="#64748b", dash=(2, 2), tags="ts_hover")
+
+            pval = pt.get(primary_key)
+            trimmed_pt = pt.get("_trimmed_values") if isinstance(pt.get("_trimmed_values"), dict) else {}
+            rval = roll_series[idx] if idx < len(roll_series) else None
+            if pval is not None:
+                hy = y_of(pval)
+                canvas.create_oval(
+                    hx - 4, hy - 4, hx + 4, hy + 4,
+                    fill=prim_color, outline="#ffffff", width=1.2, tags="ts_hover",
+                )
+            elif rval is not None:
+                hy = y_of(rval)
+            else:
+                hy = top + ch * 0.4
+
+            lines = [str(pt.get("label") or pt.get("key", ""))]
+            if pval is not None:
+                r_note = f" · trend {fmt_v(rval)}" if rval is not None else ""
+                lines.append(f"{spec.get('short', primary_key)}: {fmt_v(pval)}{r_note}")
+            elif primary_key in trimmed_pt:
+                lines.append(
+                    f"{spec.get('short', primary_key)}: ✂ {fmt_v(float(trimmed_pt[primary_key]))} (>2.5σ excluded)"
+                )
+            else:
+                lines.append(f"{spec.get('short', primary_key)}: n/a")
+
+            if has_sec and sec_spec is not None:
+                s_dec = int(sec_spec.get("decimals", 1))
+                s_unit = sec_spec.get("unit", "")
+                if pt.get(secondary_key) is not None:
+                    lines.append(f"{sec_spec.get('short', secondary_key)}: {pt[secondary_key]:.{s_dec}f}{s_unit}")
+                elif secondary_key in trimmed_pt:
+                    lines.append(
+                        f"{sec_spec.get('short', secondary_key)}: ✂ {float(trimmed_pt[secondary_key]):.{s_dec}f}{s_unit}"
+                    )
+
+            meta_line = f"{int(pt.get('words', 0)):,} w · {int(pt.get('entries', 0))} ent"
+            if pt.get("de_share_pct") is not None:
+                meta_line += f" · {pt['de_share_pct']:.0f}% DE"
+            if pt.get("low_confidence"):
+                meta_line += " (light)"
+            lines.append(meta_line)
+
+            hud_text = "\n".join(lines)
+            tid = canvas.create_text(
+                hx, hy, text=hud_text, fill=COLOR_FG,
+                font=("Arial", 8), justify="left", anchor="nw", tags="ts_hover",
+            )
+            bbox = canvas.bbox(tid)
+            if not bbox:
+                return
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            pad = 5
+            box_x = hx + 10 if (hx + 10 + tw + pad * 2) <= (w - 4) else max(6, hx - tw - 12)
+            box_y = max(4 + pad, min(h - th - pad - 4, hy - th // 2))
+            canvas.coords(tid, box_x, box_y)
+            bbox = canvas.bbox(tid)
+            if bbox:
+                bg_id = canvas.create_rectangle(
+                    bbox[0] - pad, bbox[1] - pad + 1, bbox[2] + pad, bbox[3] + pad - 1,
+                    fill="#0b1117", outline=COLOR_TEAL, width=1, tags="ts_hover",
+                )
+                canvas.tag_raise(tid, bg_id)
+
+        _on_leave = lambda _e: canvas.delete("ts_hover")
+        canvas._nw_ts_motion_fn = _on_motion
+        canvas._nw_ts_leave_fn = _on_leave
+        canvas.bind("<Motion>", _on_motion)
+        canvas.bind("<Leave>", _on_leave)
+
+    def _draw_empty_insight_canvas(self, canvas, msg, clear_ts=True):
+        if clear_ts:
+            canvas._nw_ts_args = None
+        canvas._nw_ts_motion_fn = None
+        canvas._nw_ts_leave_fn = None
+        canvas.unbind("<Motion>")
+        canvas.unbind("<Leave>")
         canvas.delete("all")
         canvas.update_idletasks()
         width = canvas.winfo_width() or 300
@@ -3690,6 +4588,11 @@ Troubleshooting:
         canvas.create_text(width / 2, height / 2, text=msg, fill="#7b8794", font=("Arial", 9))
 
     def _draw_vertical_bars(self, canvas, items, colors=None):
+        canvas._nw_ts_args = None
+        canvas._nw_ts_motion_fn = None
+        canvas._nw_ts_leave_fn = None
+        canvas.unbind("<Motion>")
+        canvas.unbind("<Leave>")
         canvas.delete("all")
         if not items:
             self._draw_empty_insight_canvas(canvas, "No data")
@@ -3816,16 +4719,17 @@ Troubleshooting:
         entries = []
         scanned_files = 0
 
-        if not os.path.exists(TRANSCRIPTIONS_DIR):
+        trans_dir = os.path.join(app_dir, TRANSCRIPTIONS_DIR)
+        if not os.path.exists(trans_dir):
             self._analytics_scanned_files = 0
             return entries
 
-        for filename in sorted(os.listdir(TRANSCRIPTIONS_DIR)):
+        for filename in sorted(os.listdir(trans_dir)):
             if not filename.lower().endswith(".txt"):
                 continue
             if "conflicted copy" in filename.lower():
                 continue  # Dropbox sync debris duplicates entries - skip
-            path = os.path.join(TRANSCRIPTIONS_DIR, filename)
+            path = os.path.join(trans_dir, filename)
             if not os.path.isfile(path):
                 continue
             scanned_files += 1
@@ -3990,14 +4894,13 @@ Troubleshooting:
         days = getattr(self, "_personal_baseline_days", 0)
         if self._baseline_active():
             self.insights_peer_var.set(
-                f"Reference: your own trailing {PERSONAL_BASELINE_DAYS}-day average "
-                f"({days} day(s) of speech); band = +/-{int(PERSONAL_BASELINE_BAND_FRACTION * 100)}%."
+                f"Baseline: your own trailing {PERSONAL_BASELINE_DAYS}-day median & MAD band "
+                f"({days} active day(s) of speech; personal self-tracking, non-diagnostic)."
             )
         else:
             self.insights_peer_var.set(
-                f"Reference: {PEER_PROFILE['label']} until you have "
-                f"{PERSONAL_BASELINE_MIN_DAYS} days of your own speech "
-                f"(you have {days}). {PEER_BENCHMARK_NOTE}"
+                f"Baseline: {PEER_PROFILE['label']} until you reach "
+                f"{PERSONAL_BASELINE_MIN_DAYS} active days (currently {days}). {PEER_BENCHMARK_NOTE}"
             )
 
     def _update_ai_freshness_label(self):
@@ -4007,7 +4910,7 @@ Troubleshooting:
         newest = self._newest_ai_insight_date(cache)
         if newest is None:
             self.insights_ai_age_var.set(
-                "AI insights last crunched: never - use 'Crunch History' on the AI Timeline tab."
+                "AI insights (optional): not crunched yet — all lexical & pause graphs run 100% locally."
             )
             return
         age = (datetime.date.today() - newest).days
@@ -4032,7 +4935,7 @@ Troubleshooting:
 
     def _schedule_insights_refresh(self, delay_ms=2000):
         """Debounced insights refresh: coalesces bursts of transcriptions and
-        defers the (expensive) full-archive tokenization until recording stops."""
+        defers archive refresh until recording stops."""
         if self._insights_refresh_job is not None:
             try:
                 self.root.after_cancel(self._insights_refresh_job)
@@ -4050,34 +4953,118 @@ Troubleshooting:
             return
         self.refresh_insights_tabs()
 
+    def _explorer_is_open(self):
+        win = getattr(self, "_trends_explorer_win", None)
+        if win is None:
+            return False
+        try:
+            return bool(win.winfo_exists())
+        except Exception:
+            return False
+
     def refresh_insights_tabs(self, force_reload=False):
-        if getattr(self, "insights_collapsed", None) is not None and self.insights_collapsed.get():
-            # Panel hidden: defer the full-archive tokenization until it is expanded.
+        panel_collapsed = (
+            getattr(self, "insights_collapsed", None) is not None
+            and self.insights_collapsed.get()
+        )
+        explorer_open = self._explorer_is_open()
+        if panel_collapsed and not explorer_open:
+            # Both accordion and wide explorer hidden: defer refresh until opened.
             self._insights_dirty = True
             if force_reload:
                 self._analytics_entries_cache = None
+                self._lexical_index = None
             return
+
+        # 1. Fast incremental on-disk lexical & pause slice (<5 ms warm)
+        lex_idx = self._get_lexical_index(force_rebuild=force_reload)
+        sl = None
+        range_label = (
+            self.insights_range_var.get()
+            if hasattr(self, "insights_range_var")
+            else INSIGHTS_RANGE_DEFAULT
+        )
+        bucket_mode = (
+            self.insights_bucket_var.get()
+            if hasattr(self, "insights_bucket_var")
+            else "Auto"
+        )
+        lang_mode = (
+            self.insights_lang_var.get()
+            if hasattr(self, "insights_lang_var")
+            else "All"
+        )
+
+        trim_on = self._is_trim_outliers_enabled()
+
+        if lex_idx is not None and lexical_insights is not None:
+            self._analytics_scanned_files = lex_idx.scanned_files
+            self._sync_period_combo_values(lex_idx.daily)
+            sl = lexical_insights.query_slice(
+                lex_idx,
+                range_spec=range_label,
+                bucket_mode=bucket_mode,
+                lang_mode=lang_mode,
+                trim_outliers=trim_on,
+                outlier_sigma=INSIGHTS_OUTLIER_SIGMA,
+            )
+            self._current_lexical_slice = sl
+            self._lexical_baselines = sl.get("baselines") or {}
+            self._personal_baseline_days = sl.get("baseline_days", 0)
+            if self._personal_baseline_days >= PERSONAL_BASELINE_MIN_DAYS:
+                # Populate _personal_baseline medians so _baseline_active() is True
+                for mk, bdict in self._lexical_baselines.items():
+                    if bdict.get("is_personal"):
+                        self._personal_baseline[mk] = float(bdict["median"])
+            self._update_trim_outlier_button_styles()
+
+        if panel_collapsed and explorer_open:
+            self._insights_dirty = True
+            self._refresh_trends_explorer()
+            return
+
         self._insights_dirty = False
         self._peer_snapshot = {}
         entries_all = self._get_analytics_entries(force_reload)
         tokens_all = self._analytics_tokens_cache or []
         langs_all = self._analytics_langs_cache or []
 
-        # Personal reference values come from the trailing baseline window,
-        # independent of the (usually shorter) display window.
+        # Personal reference values for legacy heuristic keys (e.g. interventions)
         self._update_personal_baseline(entries_all, tokens_all, langs_all)
+        if sl is not None and self._lexical_baselines:
+            self._personal_baseline_days = max(
+                self._personal_baseline_days, sl.get("baseline_days", 0)
+            )
+            for mk, bdict in self._lexical_baselines.items():
+                if bdict.get("is_personal"):
+                    self._personal_baseline[mk] = float(bdict["median"])
 
-        # Rolling display window for the non-AI tabs. The AI tabs keep their
-        # own temporal dropdowns, so they still see the whole archive.
+        # Rolling display window + optional EN/DE language filter + optional >2.5σ utterance trim
         window_idx = filter_entries_by_days(entries_all, self._insights_range_days())
+        if lang_mode in ("EN", "DE"):
+            target_l = lang_mode.lower()
+            window_idx = [i for i in window_idx if i < len(langs_all) and langs_all[i] == target_l]
         entries = [entries_all[i] for i in window_idx]
         tokens_per_entry = [tokens_all[i] for i in window_idx]
         langs = [langs_all[i] for i in window_idx]
 
-        if hasattr(self, "insights_coverage_var"):
-            self.insights_coverage_var.set(
-                self._build_analytics_coverage_text(entries, len(entries_all))
+        removed_entry_outliers = 0
+        if trim_on and lexical_insights is not None and entries:
+            kept_rel, removed_entry_outliers = lexical_insights.filter_outlier_entries(
+                entries, tokens_per_entry, INSIGHTS_OUTLIER_SIGMA
             )
+            if removed_entry_outliers > 0:
+                entries = [entries[k] for k in kept_rel]
+                tokens_per_entry = [tokens_per_entry[k] for k in kept_rel]
+                langs = [langs[k] for k in kept_rel]
+
+        if hasattr(self, "insights_coverage_var"):
+            cov_txt = self._build_analytics_coverage_text(entries, len(entries_all))
+            if sl is not None:
+                cov_txt += f" · Bucket: {sl.get('bucket_mode', 'daily')} · Lang: {lang_mode}"
+            if removed_entry_outliers > 0:
+                cov_txt += f" · ✂ {removed_entry_outliers} entry outlier(s) excluded"
+            self.insights_coverage_var.set(cov_txt)
         self._update_baseline_label()
         self._update_ai_freshness_label()
 
@@ -4087,15 +5074,21 @@ Troubleshooting:
         if not sentences and all_text:
             sentences = [all_text]
 
-        # Headline deltas are computed centrally so the summary stays correct
-        # even while some tab bodies have not been built yet.
         current = self._compute_metric_snapshot(entries, tokens_per_entry, langs, sentences)
+        if sl is not None:
+            for mk, mv in (sl.get("summary") or {}).items():
+                if mv is not None:
+                    current[mk] = mv
+            if sl["summary"].get("mattr_diversity") is not None:
+                # Replace sample-length-biased raw TTR with length-invariant MATTR-50
+                current["lexical_diversity_percent"] = sl["summary"]["mattr_diversity"]
         self._insights_snapshot = current
+
         for group, keys in (
             ("pace", ("pace_avg_words_entry", "pace_stability")),
-            ("pause", ("pause_avg_seconds", "pause_long_share")),
+            ("pause", ("pause_avg_seconds", "pause_long_pct")),
             ("clarity", ("clarity_fillers_per_100", "clarity_repetition_per_1k")),
-            ("lexical", ("lexical_diversity_percent", "lexical_long_word_percent")),
+            ("lexical", ("mattr_diversity", "lexical_long_word_percent")),
             ("interventions", (
                 "intervention_open_question_per_100",
                 "intervention_reflection_ratio",
@@ -4103,26 +5096,142 @@ Troubleshooting:
                 "intervention_summary_per_100",
             )),
         ):
-            deltas = [self._relative_delta_pct(current[k], k) for k in keys if k in current]
+            deltas = [self._relative_delta_pct(current[k], k) for k in keys if k in current and current[k] is not None]
             if deltas:
                 self._peer_snapshot[group] = sum(deltas) / len(deltas)
 
-        self._refresh_pace_tab(entries, tokens_per_entry)
-        self._refresh_pause_tab(entries)
-        self._refresh_clarity_tab(entries, tokens_per_entry, langs)
-        self._refresh_lexical_tab(all_tokens, langs)
+        self._refresh_fogwatch_tab(sl)
+        self._refresh_pace_tab(entries, tokens_per_entry, sl)
+        self._refresh_pause_tab(entries, sl)
+        self._refresh_clarity_tab(entries, tokens_per_entry, langs, sl)
+        self._refresh_lexical_tab(all_tokens, langs, sl)
+        self._refresh_mind_tab(sl)
         self._refresh_intervention_tab(sentences)
         self._refresh_ai_timeline_tab(entries_all)
         self._refresh_ai_mood_tab(entries_all)
         self._refresh_activity_matrix_tab(entries, all_text, tokens_per_entry)
-        self._refresh_speaker_profile_tab(entries, all_tokens, sentences)
+        self._refresh_speaker_profile_tab(entries, all_tokens, sentences, sl)
         self._refresh_daily_brief_tab(entries_all)
         self._update_insights_profile_summary()
         self._update_metric_bands(current)
+        if explorer_open:
+            self._refresh_trends_explorer()
 
-    def _refresh_pace_tab(self, entries, tokens_per_entry=None):
+    def _sync_dynamic_tab_band(self, prefix, metric_key, value):
+        self.INSIGHT_BAND_METRICS[prefix] = metric_key
+        if lexical_insights is not None and metric_key in lexical_insights.METRIC_SPECS:
+            hdr = getattr(self, f"{prefix}_header_label", None)
+            if hdr is not None:
+                hdr.config(text=lexical_insights.METRIC_SPECS[metric_key]["label"].upper())
+        band_c = getattr(self, f"{prefix}_band_canvas", None)
+        if band_c is not None and value is not None:
+            self._draw_metric_band(band_c, value, metric_key)
+
+    def _refresh_fogwatch_tab(self, sl=None):
+        if not hasattr(self, "fogwatch_summary_var"):
+            return
+        sl = sl or getattr(self, "_current_lexical_slice", None)
+        mkey = self.fogwatch_metric_var.get()
+        sec_key = "pause_long_pct" if mkey == "clarity_index" else None
+        if lexical_insights is not None:
+            self._set_tab_guide(
+                "fogwatch",
+                lexical_insights.interpret_metric_window(sl, mkey, secondary_key=sec_key),
+            )
+        if not sl or int((sl.get("summary") or {}).get("words", 0)) == 0:
+            self.fogwatch_summary_var.set("No cognitive clarity data in slice")
+            self.fogwatch_detail_var.set("Record or select a broader horizon (e.g. 6m, YTD, All) to inspect trends.")
+            self.fogwatch_peer_var.set("Personal self-tracking indicator (non-diagnostic).")
+            self._draw_empty_insight_canvas(self.fogwatch_canvas, "No transcripts in selected slice")
+            return
+
+        summ = sl["summary"]
+        ci = summ.get("clarity_index")
+        mattr = summ.get("mattr_diversity")
+        vague = summ.get("vague_per_100")
+        lp = summ.get("pause_long_pct")
+
+        ci_txt = f"Clarity {ci:.0f}/100" if ci is not None else "Clarity n/a"
+        mattr_txt = f"MATTR {mattr:.1f}%" if mattr is not None else "MATTR n/a"
+        lp_txt = f"≥5s pauses {lp:.1f}%" if lp is not None else "pauses n/a"
+        self.fogwatch_summary_var.set(f"{ci_txt} · {mattr_txt} · {lp_txt}")
+
+        vague_txt = f"Vague {vague:.2f}/100w · " if vague is not None else ""
+        self.fogwatch_detail_var.set(f"{vague_txt}{sl.get('callout', '')}")
+
+        spec = lexical_insights.METRIC_SPECS.get(mkey, {}) if lexical_insights else {}
+        val = summ.get(mkey)
+        self._sync_dynamic_tab_band("fogwatch", mkey, val)
+        base = (sl.get("baselines") or {}).get(mkey)
+        if base and val is not None:
+            u = spec.get("unit", "")
+            dec = int(spec.get("decimals", 1))
+            self.fogwatch_peer_var.set(
+                f"{spec.get('short', mkey)}: {val:.{dec}f}{u} vs your 90d norm "
+                f"{base['median']:.{dec}f}{u} (band {base['low']:.{dec}f}–{base['high']:.{dec}f}{u}) · non-diagnostic."
+            )
+        else:
+            self.fogwatch_peer_var.set("Personal self-tracking trend (non-diagnostic).")
+
+        self._draw_timeseries_chart(self.fogwatch_canvas, sl, mkey, secondary_key=sec_key)
+
+    def _refresh_mind_tab(self, sl=None):
+        if not hasattr(self, "mind_summary_var"):
+            return
+        sl = sl or getattr(self, "_current_lexical_slice", None)
+        mkey = self.mind_metric_var.get()
+        if lexical_insights is not None:
+            self._set_tab_guide("mind", lexical_insights.interpret_metric_window(sl, mkey))
+        if not sl or int((sl.get("summary") or {}).get("words", 0)) == 0:
+            self.mind_summary_var.set("No local affect/style data in slice")
+            self.mind_detail_var.set("100% local lexical markers populate automatically from your transcripts.")
+            self.mind_peer_var.set("Personal self-tracking only — not a clinical or medical measure.")
+            self._draw_empty_insight_canvas(self.mind_canvas, "No transcripts in selected slice")
+            return
+
+        summ = sl["summary"]
+        vit = summ.get("vitality_balance")
+        italk = summ.get("self_focus_per_100")
+        absw = summ.get("absolutist_per_100")
+        hedg = summ.get("hedges_per_100")
+        night = summ.get("late_night_pct")
+
+        vit_txt = f"Vitality {vit:.0f}/100" if vit is not None else "Vitality n/a"
+        it_txt = f"I-Talk {italk:.1f}/100w" if italk is not None else "I-Talk n/a"
+        nt_txt = f"Night {night:.0f}%" if night is not None else "Night 0%"
+        self.mind_summary_var.set(f"{vit_txt} · {it_txt} · {nt_txt}")
+
+        abs_txt = f"{absw:.2f}/100w" if absw is not None else "0.00"
+        hdg_txt = f"{hedg:.2f}/100w" if hedg is not None else "0.00"
+        we_val = summ.get("we_focus_per_100") or 0.0
+        self.mind_detail_var.set(
+            f"Absolutist {abs_txt} · Hedges {hdg_txt} · Collective 'we/wir' {we_val:.2f}/100w"
+        )
+
+        spec = lexical_insights.METRIC_SPECS.get(mkey, {}) if lexical_insights else {}
+        val = summ.get(mkey)
+        self._sync_dynamic_tab_band("mind", mkey, val)
+        base = (sl.get("baselines") or {}).get(mkey)
+        if base and val is not None:
+            u = spec.get("unit", "")
+            dec = int(spec.get("decimals", 1))
+            self.mind_peer_var.set(
+                f"{spec.get('short', mkey)}: {val:.{dec}f}{u} vs your 90d norm "
+                f"{base['median']:.{dec}f}{u} (band {base['low']:.{dec}f}–{base['high']:.{dec}f}{u}) · non-diagnostic."
+            )
+        else:
+            self.mind_peer_var.set("Local lexical self-tracking (non-diagnostic).")
+
+        self._draw_timeseries_chart(self.mind_canvas, sl, mkey)
+
+    def _refresh_pace_tab(self, entries, tokens_per_entry=None, sl=None):
         if not hasattr(self, "pace_summary_var"):
-            return  # tab body not built yet
+            return
+        sl = sl or getattr(self, "_current_lexical_slice", None)
+        mkey = getattr(self, "pace_metric_var", None)
+        mkey = mkey.get() if mkey is not None else "pace_words_entry"
+        if lexical_insights is not None:
+            self._set_tab_guide("pace", lexical_insights.interpret_metric_window(sl, mkey))
         if not entries:
             self.pace_summary_var.set("No pace data yet")
             self.pace_detail_var.set("Record a few transcriptions to view pace patterns.")
@@ -4133,8 +5242,7 @@ Troubleshooting:
         if tokens_per_entry is None:
             tokens_per_entry = [self._tokenize_words(e["text"]) for e in entries]
 
-        counts = [len(t) for t in tokens_per_entry]
-        counts = [c for c in counts if c > 0]
+        counts = [len(t) for t in tokens_per_entry if len(t) > 0]
         if not counts:
             self.pace_summary_var.set("No pace data yet")
             self.pace_detail_var.set("Record a few transcriptions to view pace patterns.")
@@ -4144,15 +5252,21 @@ Troubleshooting:
 
         avg_words = float(np.mean(counts))
         variability_words = self._robust_variability_band(counts)
-        if avg_words > 0:
-            stability = max(0.0, 100.0 - min(100.0, (variability_words / avg_words) * 100.0 * 2.0))
-        else:
-            stability = 0.0
+        stability = (
+            max(0.0, 100.0 - min(100.0, (variability_words / avg_words) * 100.0 * 2.0))
+            if avg_words > 0
+            else 0.0
+        )
 
-        today = datetime.datetime.now().date()
-        today_words = sum(len(tokens_per_entry[i]) for i, e in enumerate(entries) if e["timestamp"].date() == today)
-        self.pace_summary_var.set(f"Avg {avg_words:.1f} words/entry | Stability {stability:.0f}%")
-        self.pace_detail_var.set(f"Today {today_words:,} words | Variability band +/-{variability_words:.1f} words/entry")
+        summ = (sl or {}).get("summary") or {}
+        ac_wpm = summ.get("acoustic_wpm")
+        wps = summ.get("words_per_sentence")
+        wpm_bit = f" · {ac_wpm:.0f} WPM (acoustic)" if ac_wpm is not None else ""
+        wps_bit = f" · {wps:.1f} w/sentence" if wps is not None else ""
+        self.pace_summary_var.set(f"Avg {avg_words:.1f} w/entry · Stability {stability:.0f}%{wpm_bit}")
+        self.pace_detail_var.set(
+            f"Variability ±{variability_words:.1f} w/entry{wps_bit} · {len(counts):,} entries in slice"
+        )
         _, avg_low, avg_high = self._metric_band_status(avg_words, "pace_avg_words_entry")
         _, stab_low, stab_high = self._metric_band_status(stability, "pace_stability")
         avg_phrase, avg_delta = self._more_less_phrase(avg_words, "pace_avg_words_entry")
@@ -4163,104 +5277,135 @@ Troubleshooting:
         )
         self._peer_snapshot["pace"] = (avg_delta + stab_delta) / 2.0
 
-        series = counts[-20:]
-        self.pace_canvas.delete("all")
-        self.pace_canvas.update_idletasks()
-        w = self.pace_canvas.winfo_width() or 300
-        h = self.pace_canvas.winfo_height() or 110
-        left, right, top, bottom = 10, 10, 10, 20
-        cw = w - left - right
-        ch = h - top - bottom
-        if len(series) < 2:
-            self._draw_empty_insight_canvas(self.pace_canvas, "Need at least 2 entries for trend")
-            return
-        max_v = max(series) if series else 1
-        max_v = max(max_v, 1)
-        step = cw / (len(series) - 1)
-        pts = []
-        for i, v in enumerate(series):
-            x = left + i * step
-            y = top + ch - (v / max_v) * ch
-            pts.extend([x, y])
-        self.pace_canvas.create_line(*pts, fill=COLOR_TEAL, width=2, smooth=True)
-        for i, v in enumerate(series):
-            x = left + i * step
-            y = top + ch - (v / max_v) * ch
-            self.pace_canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill="#99f6e4", outline="")
-        self.pace_canvas.create_text(left, h - 10, text="oldest", anchor="w", fill="#94a3b8", font=("Arial", 7))
-        self.pace_canvas.create_text(w - right, h - 10, text="latest", anchor="e", fill="#94a3b8", font=("Arial", 7))
+        if sl is not None:
+            self._sync_dynamic_tab_band("pace", mkey, summ.get(mkey, avg_words))
+            self._draw_timeseries_chart(self.pace_canvas, sl, mkey)
+        else:
+            self._draw_empty_insight_canvas(self.pace_canvas, "No longitudinal slice")
 
-    def _refresh_pause_tab(self, entries):
+    def _refresh_pause_tab(self, entries, sl=None):
         if not hasattr(self, "pause_summary_var"):
-            return  # tab body not built yet
-        if len(entries) < 2:
-            self.pause_summary_var.set("No pause data yet")
-            self.pause_detail_var.set("Need at least two timestamped entries.")
-            self.pause_peer_var.set("Comparison unavailable (need at least 2 entries).")
-            self._draw_empty_insight_canvas(self.pause_canvas, "No pause intervals")
+            return
+        sl = sl or getattr(self, "_current_lexical_slice", None)
+        summ = (sl or {}).get("summary") or {}
+        gap_count = int(summ.get("gap_count", 0))
+
+        # Fall back to direct entry delta scan if lexical index was bypassed
+        if gap_count == 0 and len(entries) >= 2:
+            gaps = []
+            prev_ts = entries[0]["timestamp"]
+            for entry in entries[1:]:
+                delta = (entry["timestamp"] - prev_ts).total_seconds()
+                prev_ts = entry["timestamp"]
+                if 0 < delta <= 120:
+                    gaps.append(delta)
+            short = sum(1 for g in gaps if g < 2.0)
+            medium = sum(1 for g in gaps if 2.0 <= g < 5.0)
+            long_c = sum(1 for g in gaps if g >= 5.0)
+            gap_count = len(gaps)
+            avg_gap = float(np.mean(gaps)) if gaps else 0.0
+            p90_gap = float(np.percentile(gaps, 90)) if gaps else 0.0
+            long_pct = (long_c / gap_count * 100.0) if gap_count else 0.0
+        else:
+            short = int(summ.get("gap_short", 0))
+            medium = int(summ.get("gap_med", 0))
+            long_c = int(summ.get("gap_long", 0))
+            avg_gap = float(summ.get("pause_avg_s") or 0.0)
+            p90_gap = float(summ.get("pause_p90_s") or 0.0)
+            long_pct = float(summ.get("pause_long_pct") or 0.0)
+
+        view_mode = getattr(self, "pause_view_var", None)
+        view_mode = view_mode.get() if view_mode is not None else "pause_long_pct"
+        if lexical_insights is not None:
+            if view_mode == "breakdown":
+                self._set_tab_guide(
+                    "pause",
+                    lexical_insights.interpret_categorical_view(
+                        "pause_breakdown", {"short": short, "medium": medium, "long": long_c}, sl
+                    ),
+                )
+            else:
+                self._set_tab_guide("pause", lexical_insights.interpret_metric_window(sl, view_mode))
+
+        if gap_count == 0 and view_mode != "acoustic_silence_pct":
+            self.pause_summary_var.set("No burst pause intervals in slice")
+            self.pause_detail_var.set("Needs consecutive utterances within 120 seconds.")
+            self.pause_peer_var.set("Comparison unavailable (no burst gaps ≤120s in slice).")
+            self._draw_empty_insight_canvas(self.pause_canvas, "No pause gaps ≤120s in slice")
             return
 
-        gaps = []
-        prev_ts = entries[0]["timestamp"]
-        for entry in entries[1:]:
-            ts = entry["timestamp"]
-            delta = (ts - prev_ts).total_seconds()
-            prev_ts = ts
-            if 0 < delta <= 120:
-                gaps.append(delta)
+        vad_sil = summ.get("acoustic_silence_pct")
+        vad_bit = f" · VAD silence {vad_sil:.1f}%" if vad_sil is not None else ""
+        self.pause_summary_var.set(
+            f"Long ≥5s: {long_pct:.1f}% · P90 {p90_gap:.1f}s · Avg {avg_gap:.1f}s"
+        )
+        self.pause_detail_var.set(
+            f"Short <2s: {short} · Med 2–5s: {medium} · Long ≥5s: {long_c}{vad_bit}"
+        )
 
-        if not gaps:
-            self.pause_summary_var.set("No pause profile yet")
-            self.pause_detail_var.set("No short/medium/long gaps detected in range.")
-            self.pause_peer_var.set("Comparison unavailable (no comparable pause gaps).")
-            self._draw_empty_insight_canvas(self.pause_canvas, "No pause gaps under 120s")
-            return
-
-        short = sum(1 for g in gaps if g < 2.0)
-        medium = sum(1 for g in gaps if 2.0 <= g < 5.0)
-        long = sum(1 for g in gaps if g >= 5.0)
-        avg_gap = float(np.mean(gaps))
-        self.pause_summary_var.set(f"Avg pause {avg_gap:.1f}s | Short {short} / Medium {medium} / Long {long}")
-        self.pause_detail_var.set("Short <2s, Medium 2-5s, Long >=5s (from transcription gaps).")
-        long_share = long / len(gaps) if gaps else 0.0
         _, avg_low, avg_high = self._metric_band_status(avg_gap, "pause_avg_seconds")
-        _, long_low, long_high = self._metric_band_status(long_share, "pause_long_share")
+        _, long_low, long_high = self._metric_band_status(long_pct, "pause_long_pct")
         avg_phrase, avg_delta = self._more_less_phrase(avg_gap, "pause_avg_seconds")
-        long_phrase, long_delta = self._more_less_phrase(long_share, "pause_long_share")
+        long_phrase, long_delta = self._more_less_phrase(long_pct, "pause_long_pct")
         self.pause_peer_var.set(
-            f"{self._comparison_prefix()}: {avg_phrase} pause duration and {long_phrase} long-pause share "
-            f"({self._fmt_band(avg_low, avg_high, 's')}; {self._fmt_band(long_low * 100, long_high * 100, '%')})."
+            f"{self._comparison_prefix()}: {long_phrase} ≥5s stall share and {avg_phrase} mean gap "
+            f"({self._fmt_band(long_low, long_high, '%')}; {self._fmt_band(avg_low, avg_high, 's')})."
         )
         self._peer_snapshot["pause"] = (avg_delta + long_delta) / 2.0
-        self._draw_vertical_bars(
-            self.pause_canvas,
-            [("Short", short), ("Medium", medium), ("Long", long)],
-            colors=["#22c55e", "#f59e0b", "#ef4444"],
-        )
 
-    def _refresh_clarity_tab(self, entries=None, tokens_per_entry=None, langs=None):
-        """Filler/repetition signals, with the filler list chosen per entry
-        from its detected language."""
+        if view_mode == "breakdown":
+            self._sync_dynamic_tab_band("pause", "pause_long_pct", long_pct)
+            self._draw_vertical_bars(
+                self.pause_canvas,
+                [("Short <2s", short), ("Med 2-5s", medium), ("Long ≥5s", long_c)],
+                colors=["#22c55e", "#f59e0b", "#ef4444"],
+            )
+        else:
+            self._sync_dynamic_tab_band("pause", view_mode, summ.get(view_mode, long_pct))
+            self._draw_timeseries_chart(self.pause_canvas, sl, view_mode)
+
+    def _refresh_clarity_tab(self, entries=None, tokens_per_entry=None, langs=None, sl=None):
+        """Fluency, self-repairs & vague placeholder trends + per-language filler breakdown."""
         if not hasattr(self, "clarity_summary_var"):
-            return  # tab body not built yet
+            return
+        sl = sl or getattr(self, "_current_lexical_slice", None)
         entries = entries or []
         tokens_per_entry = tokens_per_entry or []
         langs = langs or []
         tokens = [t for toks in tokens_per_entry for t in toks]
+        view_mode = getattr(self, "clarity_view_var", None)
+        view_mode = view_mode.get() if view_mode is not None else "fillers_per_100"
 
         total_words = len(tokens)
         if total_words == 0:
+            if lexical_insights is not None:
+                if view_mode == "breakdown":
+                    self._set_tab_guide(
+                        "clarity",
+                        lexical_insights.interpret_categorical_view("clarity_breakdown", {"top_items": []}, sl),
+                    )
+                else:
+                    self._set_tab_guide("clarity", lexical_insights.interpret_metric_window(sl, view_mode))
             self.clarity_summary_var.set("No clarity data yet")
-            self.clarity_detail_var.set("Transcribe more speech to estimate clarity signals.")
+            self.clarity_detail_var.set("Transcribe more speech to estimate fluency & retrieval signals.")
             self.clarity_peer_var.set("Comparison unavailable (no words detected).")
-            self._draw_empty_insight_canvas(self.clarity_canvas, "No tokens")
+            self._draw_empty_insight_canvas(self.clarity_canvas, "No words in selected slice")
             return
 
         counts, per_lang = self._filler_stats(entries, tokens_per_entry, langs)
+        summ = (sl or {}).get("summary") or {}
         filler_total = sum(b["fillers"] for b in per_lang.values())
-        filler_per_100 = (filler_total * 100.0) / total_words
-        repeated_word_pairs = sum(1 for i in range(len(tokens) - 1) if tokens[i] == tokens[i + 1])
-        repetition_per_1k = (repeated_word_pairs * 1000.0) / total_words if total_words else 0.0
+        filler_per_100 = (
+            float(summ["fillers_per_100"])
+            if summ.get("fillers_per_100") is not None
+            else (filler_total * 100.0) / total_words
+        )
+        repairs_per_1k = (
+            float(summ["disfluency_per_1k"])
+            if summ.get("disfluency_per_1k") is not None
+            else (sum(1 for i in range(len(tokens) - 1) if tokens[i] == tokens[i + 1]) * 1000.0) / total_words
+        )
+        vague_per_100 = float(summ.get("vague_per_100") or 0.0)
 
         per_lang_bits = []
         for lang in ("de", "en"):
@@ -4268,81 +5413,128 @@ Troubleshooting:
             if not bucket or not bucket["words"]:
                 continue
             rate = (bucket["fillers"] * 100.0) / bucket["words"]
-            per_lang_bits.append(f"{lang.upper()} {rate:.1f}/100w ({bucket['words']:,} words)")
-        lang_note = " | ".join(per_lang_bits) if per_lang_bits else "n/a"
+            per_lang_bits.append(f"{lang.upper()} {rate:.1f}/100w ({bucket['words']:,}w)")
+        lang_note = " · ".join(per_lang_bits) if per_lang_bits else f"{total_words:,} words"
 
         self.clarity_summary_var.set(
-            f"Fillers {filler_per_100:.1f}/100 words combined | Repetitions {repeated_word_pairs}"
+            f"Fillers {filler_per_100:.2f}/100w · Repairs {repairs_per_1k:.1f}/1k · Vague {vague_per_100:.2f}/100w"
         )
-        self.clarity_detail_var.set(
-            f"Total words analyzed: {total_words:,} | By language: {lang_note}"
-        )
+        self.clarity_detail_var.set(f"By language: {lang_note}")
         _, filler_low, filler_high = self._metric_band_status(filler_per_100, "clarity_fillers_per_100")
-        _, rep_low, rep_high = self._metric_band_status(repetition_per_1k, "clarity_repetition_per_1k")
+        _, rep_low, rep_high = self._metric_band_status(repairs_per_1k, "clarity_repetition_per_1k")
         filler_phrase, filler_delta = self._more_less_phrase(filler_per_100, "clarity_fillers_per_100")
-        rep_phrase, rep_delta = self._more_less_phrase(repetition_per_1k, "clarity_repetition_per_1k")
+        rep_phrase, rep_delta = self._more_less_phrase(repairs_per_1k, "clarity_repetition_per_1k")
         self.clarity_peer_var.set(
-            f"{self._comparison_prefix()}: {filler_phrase} fillers and {rep_phrase} repetition density "
+            f"{self._comparison_prefix()}: {filler_phrase} fillers and {rep_phrase} repair density "
             f"({self._fmt_band(filler_low, filler_high, '/100w')}; {self._fmt_band(rep_low, rep_high, '/1k')})."
         )
         self._peer_snapshot["clarity"] = (filler_delta + rep_delta) / 2.0
-        items = Counter(counts).most_common(5)
-        if not items:
-            self._draw_empty_insight_canvas(self.clarity_canvas, "No fillers detected in range")
-            return
-        self._draw_vertical_bars(
-            self.clarity_canvas,
-            items,
-            colors=["#38bdf8", "#22d3ee", "#2dd4bf", "#f59e0b", "#f97316"],
-        )
 
-    def _refresh_lexical_tab(self, tokens=None, langs=None):
+        if view_mode == "breakdown":
+            self._sync_dynamic_tab_band("clarity", "clarity_fillers_per_100", filler_per_100)
+            items = Counter(counts).most_common(5)
+            if lexical_insights is not None:
+                self._set_tab_guide(
+                    "clarity",
+                    lexical_insights.interpret_categorical_view("clarity_breakdown", {"top_items": items}, sl),
+                )
+            if not items:
+                self._draw_empty_insight_canvas(self.clarity_canvas, "No fillers detected in slice")
+                return
+            self._draw_vertical_bars(
+                self.clarity_canvas,
+                items,
+                colors=["#38bdf8", "#22d3ee", "#2dd4bf", "#f59e0b", "#f97316"],
+            )
+        else:
+            if lexical_insights is not None:
+                self._set_tab_guide("clarity", lexical_insights.interpret_metric_window(sl, view_mode))
+            self._sync_dynamic_tab_band("clarity", view_mode, summ.get(view_mode, filler_per_100))
+            self._draw_timeseries_chart(self.clarity_canvas, sl, view_mode)
+
+    def _refresh_lexical_tab(self, tokens=None, langs=None, sl=None):
         if not hasattr(self, "lexical_summary_var"):
-            return  # tab body not built yet
-        if tokens is None:
-            tokens = []
+            return
+        sl = sl or getattr(self, "_current_lexical_slice", None)
+        tokens = tokens or []
+        view_mode = getattr(self, "lexical_view_var", None)
+        view_mode = view_mode.get() if view_mode is not None else "mattr_diversity"
         if not tokens:
+            if lexical_insights is not None:
+                if view_mode == "breakdown":
+                    self._set_tab_guide(
+                        "lexical",
+                        lexical_insights.interpret_categorical_view("lexical_breakdown", {"top_words": []}, sl),
+                    )
+                else:
+                    self._set_tab_guide("lexical", lexical_insights.interpret_metric_window(sl, view_mode))
             self.lexical_summary_var.set("No vocabulary data yet")
             self.lexical_detail_var.set("Start dictating to populate vocabulary metrics.")
             self.lexical_peer_var.set("Comparison unavailable (no vocabulary sample).")
             self._draw_empty_insight_canvas(self.lexical_canvas, "No vocabulary data")
             return
 
-        unique = len(set(tokens))
         total = len(tokens)
-        diversity = (unique / total) * 100.0 if total > 0 else 0.0
-        
+        summ = (sl or {}).get("summary") or {}
+        if summ.get("mattr_diversity") is not None:
+            diversity = float(summ["mattr_diversity"])
+        elif lexical_insights is not None:
+            m_sum, m_w = lexical_insights.compute_mattr(tokens)
+            diversity = (m_sum / m_w) * 100.0 if m_w > 0 else (len(set(tokens)) / total * 100.0)
+        else:
+            diversity = (len(set(tokens)) / total) * 100.0
+
         counts = Counter(tokens)
         long_word_count = sum(c for w, c in counts.items() if len(w) >= 7)
-        long_ratio = (long_word_count / total) * 100.0 if total > 0 else 0.0
-        
-        self.lexical_summary_var.set(f"Vocabulary Richness {diversity:.1f}% | Expressive Depth {long_ratio:.1f}%")
-        _, div_low, div_high = self._metric_band_status(diversity, "lexical_diversity_percent")
+        long_ratio = (
+            float(summ["lexical_long_word_percent"])
+            if summ.get("lexical_long_word_percent") is not None
+            else (long_word_count / total) * 100.0
+        )
+        content_pct = summ.get("content_density_pct")
+        cont_bit = f" · Content {content_pct:.1f}%" if content_pct is not None else ""
+
+        self.lexical_summary_var.set(
+            f"MATTR-50 {diversity:.1f}%{cont_bit} · Depth {long_ratio:.1f}%"
+        )
+        _, div_low, div_high = self._metric_band_status(diversity, "mattr_diversity")
         _, long_low, long_high = self._metric_band_status(long_ratio, "lexical_long_word_percent")
-        div_phrase, div_delta = self._more_less_phrase(diversity, "lexical_diversity_percent")
+        div_phrase, div_delta = self._more_less_phrase(diversity, "mattr_diversity")
         long_phrase, long_delta = self._more_less_phrase(long_ratio, "lexical_long_word_percent")
         self.lexical_peer_var.set(
-            f"{self._comparison_prefix()}: {div_phrase} vocabulary richness and {long_phrase} expressive depth "
+            f"{self._comparison_prefix()}: {div_phrase} MATTR-50 diversity and {long_phrase} 7+ char depth "
             f"({self._fmt_band(div_low, div_high, '%')}; {self._fmt_band(long_low, long_high, '%')})."
         )
         self._peer_snapshot["lexical"] = (div_delta + long_delta) / 2.0
 
-        # Core themes: strip the stopwords of every language present in the
-        # window, so a mixed DE/EN archive doesn't surface "der"/"the".
-        langs_present = set(langs or [])
-        if not langs_present:
-            langs_present = {"en"}
+        langs_present = set(langs or []) or {"en"}
         stop_words = set()
         for lang in langs_present:
             stop_words |= stopwords_for(lang)
         content_freq = {w: c for w, c in counts.items() if len(w) > 2 and w not in stop_words}
         top = Counter(content_freq).most_common(5)
-        self.lexical_detail_var.set("Core Themes: " + (", ".join(w for w, _ in top) if top else "n/a"))
-        self._draw_vertical_bars(
-            self.lexical_canvas,
-            [(w, c) for w, c in top],
-            colors=["#34d399", "#2dd4bf", "#14b8a6", "#0ea5e9", "#22d3ee"],
+        self.lexical_detail_var.set(
+            "Core Themes: " + (", ".join(w for w, _ in top) if top else "n/a")
+            + f" ({total:,} words)"
         )
+
+        if view_mode == "breakdown":
+            if lexical_insights is not None:
+                self._set_tab_guide(
+                    "lexical",
+                    lexical_insights.interpret_categorical_view("lexical_breakdown", {"top_words": top}, sl),
+                )
+            self._sync_dynamic_tab_band("lexical", "mattr_diversity", diversity)
+            self._draw_vertical_bars(
+                self.lexical_canvas,
+                [(w, c) for w, c in top],
+                colors=["#34d399", "#2dd4bf", "#14b8a6", "#0ea5e9", "#22d3ee"],
+            )
+        else:
+            if lexical_insights is not None:
+                self._set_tab_guide("lexical", lexical_insights.interpret_metric_window(sl, view_mode))
+            self._sync_dynamic_tab_band("lexical", view_mode, summ.get(view_mode, diversity))
+            self._draw_timeseries_chart(self.lexical_canvas, sl, view_mode)
 
     _OPEN_QUESTION_RX = re.compile(
         r"\b(what|how|when|where|who|why|could|would|can|tell me|"
@@ -4390,7 +5582,19 @@ Troubleshooting:
     def _refresh_intervention_tab(self, sentences=None):
         if not hasattr(self, "intervention_summary_var"):
             return  # tab body not built yet
+        sl = getattr(self, "_current_lexical_slice", None)
         if not sentences:
+            if lexical_insights is not None:
+                self._set_tab_guide(
+                    "intervention",
+                    {
+                        "explanation": (
+                            "Counts conversational stance markers — open questions, empathetic reflections, "
+                            "affirmations, summaries, and individual ('I/ich') vs. collective ('we/wir') framing."
+                        ),
+                        "pattern": "No sentence samples in this slice yet — widen horizon to inspect stance.",
+                    },
+                )
             self.intervention_summary_var.set("No intervention data yet")
             self.intervention_detail_var.set("Heuristic language tag counts will appear here.")
             self.intervention_peer_var.set("Comparison unavailable (no sentence samples).")
@@ -4406,15 +5610,32 @@ Troubleshooting:
             self_count += len(self._SELF_WORDS_RX.findall(sentence))
             collective_count += len(self._COLLECTIVE_WORDS_RX.findall(sentence))
 
+        if lexical_insights is not None:
+            self._set_tab_guide(
+                "intervention",
+                lexical_insights.interpret_categorical_view(
+                    "interventions",
+                    {
+                        "open_q": open_questions,
+                        "reflect": reflections,
+                        "affirm": affirmations,
+                        "summary": summaries,
+                        "self_count": self_count,
+                        "we_count": collective_count,
+                    },
+                    sl,
+                ),
+            )
+
         total = len(sentences)
         self.intervention_summary_var.set(
             f"Open Q {open_questions} | Reflections {reflections} | Affirmations {affirmations} | Summaries {summaries}"
         )
-        
+
         focus_ratio = f"{self_count} vs {collective_count}"
         if collective_count > 0:
             focus_ratio = f"{(self_count/collective_count):.1f}:1"
-            
+
         self.intervention_detail_var.set(f"Across {total} sentence(s) | Self vs Collective Focus: ({focus_ratio})")
         open_q_per_100 = (open_questions * 100.0) / total if total else 0.0
         reflect_ratio = reflections / max(open_questions, 1)
@@ -4430,11 +5651,10 @@ Troubleshooting:
             f"{af_phrase} affirmations, {su_phrase} summaries."
         )
         self._peer_snapshot["interventions"] = (oq_delta + rr_delta + af_delta + su_delta) / 4.0
-        
-        # Determine the 5th bar (Self vs Collective focus)
+
         focus_val = self_count - collective_count
         focus_label = "Focus: I" if focus_val >= 0 else "Focus: We"
-        
+
         self._draw_vertical_bars(
             self.intervention_canvas,
             [("Open Q", open_questions), ("Reflect", reflections), ("Affirm", affirmations), ("Summary", summaries), (focus_label, abs(focus_val))],
@@ -4445,14 +5665,15 @@ Troubleshooting:
         if self._ai_insights_mem_cache is not None:
             return self._ai_insights_mem_cache
         data = {}
+        ai_path = os.path.join(app_dir, AI_INSIGHTS_FILE)
         try:
-            if os.path.exists(AI_INSIGHTS_FILE):
-                with open(AI_INSIGHTS_FILE, 'r', encoding='utf-8') as f:
+            if os.path.exists(ai_path):
+                with open(ai_path, 'r', encoding='utf-8') as f:
                     loaded = json.load(f)
                 if isinstance(loaded, dict):
                     data = loaded
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            self._quarantine_corrupt_file(os.path.join(app_dir, AI_INSIGHTS_FILE), e)
+            self._quarantine_corrupt_file(ai_path, e)
         except Exception as e:
             self.log_internal(f"Failed to load AI Insights cache: {e}")
         self._ai_insights_mem_cache = data
@@ -4487,7 +5708,12 @@ Troubleshooting:
             self.btn_crunch_history.config(state="disabled", text="Working...")
         if hasattr(self, "ai_timeline_detail_var"):
             self.ai_timeline_detail_var.set("Batch processing transcripts through OpenAI... See System Log.")
-        threading.Thread(target=self._batch_process_ai_insights, args=(api_key,), daemon=True).start()
+        entries_snapshot = list(self._get_analytics_entries())
+        threading.Thread(
+            target=self._batch_process_ai_insights,
+            args=(api_key, entries_snapshot),
+            daemon=True,
+        ).start()
 
     def _maybe_auto_crunch_ai_insights(self):
         """Once per app start, refresh the AI insight cache in the background if
@@ -4496,15 +5722,12 @@ Troubleshooting:
         self._auto_crunch_job = None
         if self._shutting_down or self._ai_auto_crunch_done:
             return
-        # Opt-in only: this uploads transcript text to OpenAI, so it must never
-        # happen just because an API key happens to be configured.
         if not self.config.get('ai_insights_auto', False):
             return
         api_key = self.config.get('openai_api_key', '').strip()
         if not api_key:
             return
         if self.mode is not None:
-            # Recording/typing right now - retry in a few minutes
             if not self._shutting_down:
                 self._auto_crunch_job = self.root.after(300000, self._maybe_auto_crunch_ai_insights)
             return
@@ -4518,26 +5741,29 @@ Troubleshooting:
         self.log_internal("AI insights are stale - running an automatic history crunch in the background.")
         if hasattr(self, "btn_crunch_history"):
             self.btn_crunch_history.config(state="disabled", text="Working...")
-        threading.Thread(target=self._batch_process_ai_insights, args=(api_key,), daemon=True).start()
+        entries_snapshot = list(self._get_analytics_entries())
+        threading.Thread(
+            target=self._batch_process_ai_insights,
+            args=(api_key, entries_snapshot),
+            daemon=True,
+        ).start()
 
-    def _batch_process_ai_insights(self, api_key):
+    def _batch_process_ai_insights(self, api_key, entries_snapshot=None):
         try:
-            self._batch_process_ai_insights_inner(api_key)
+            self._batch_process_ai_insights_inner(api_key, entries_snapshot=entries_snapshot)
         except Exception as e:
-            # Never leave the single-run guard stuck on an unexpected failure
             msg = f"AI insight crunch failed: {e}"
             self._ui_after(0, lambda: self._on_crunch_finished(msg))
 
-    def _batch_process_ai_insights_inner(self, api_key):
+    def _batch_process_ai_insights_inner(self, api_key, entries_snapshot=None):
         import openai
         client = openai.OpenAI(api_key=api_key, timeout=45.0)
 
-        entries = self._get_analytics_entries()
+        entries = list(entries_snapshot) if entries_snapshot is not None else self._load_analytics_entries()
         if not entries:
             self._ui_after(0, lambda: self._on_crunch_finished("No transcript entries found to process."))
             return
 
-        # Group entries by day
         from collections import defaultdict
         daily_text = defaultdict(list)
         for e in entries:
@@ -4566,29 +5792,29 @@ Troubleshooting:
                 continue
 
             combined_text = " ".join(texts)
-            if len(combined_text) < 50: # Skip very empty days
+            if len(combined_text) < 50:
                 continue
-                
+
             self.log_internal(f"Analyzing AI Insights for {day_str}...")
-            
+
             try:
                 response = client.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[
                         {"role": "system", "content": prompt},
-                        {"role": "user", "content": combined_text[:12000]} # Limit to roughly last hours
+                        {"role": "user", "content": combined_text[:12000]}
                     ],
-                    response_format={ "type": "json_object" },
+                    response_format={"type": "json_object"},
                     temperature=0.2
                 )
                 result = json.loads(response.choices[0].message.content)
                 cache[day_str] = result
                 self._save_daily_insights_cache(cache)
                 processed_days += 1
-                time.sleep(1) # Rate limiting
+                time.sleep(1)
             except Exception as e:
                 self.log_internal(f"Failed AI Analysis for {day_str}: {e}")
-                
+
         self._ui_after(0, lambda: self._on_crunch_finished(f"Processed {processed_days} new days of insights."))
 
     def _on_crunch_finished(self, message):
@@ -4606,6 +5832,24 @@ Troubleshooting:
         if not dates:
             return []
         today = datetime.date.today()
+        if filter_str == "Follow Horizon" and lexical_insights is not None:
+            first_d = None
+            try:
+                first_d = datetime.date.fromisoformat(sorted(dates)[0])
+            except Exception:
+                pass
+            range_lbl = (
+                self.insights_range_var.get()
+                if hasattr(self, "insights_range_var")
+                else INSIGHTS_RANGE_DEFAULT
+            )
+            start_d, end_d = lexical_insights.resolve_date_bounds(
+                range_lbl, today=today, first_archive_date=first_d
+            )
+            s_iso = start_d.isoformat() if start_d else "0000-01-01"
+            e_iso = end_d.isoformat() if end_d else "9999-12-31"
+            return [d for d in dates if s_iso <= d <= e_iso]
+
         prev_month_date = today.replace(day=1) - datetime.timedelta(days=1)
         filtered = []
         for d in dates:
@@ -4629,10 +5873,10 @@ Troubleshooting:
 
     def _refresh_ai_timeline_tab(self, entries):
         if not hasattr(self, "ai_timeline_summary_var"):
-            return  # tab body not built yet
+            return
         self.ai_timeline_summary_var.set("Loading timeline cache...")
         self.ai_timeline_canvas.update_idletasks()
-        
+
         cache = self._get_daily_insights_cache()
         if not cache:
             self._draw_empty_insight_canvas(self.ai_timeline_canvas, "No AI history to plot yet.")
@@ -4640,7 +5884,7 @@ Troubleshooting:
 
         dates = sorted(cache.keys())
         dates = self._filter_ai_dates(dates, self.ai_timeline_temporal_var.get())
-        
+
         if not dates:
             self.ai_timeline_summary_var.set("No data for selected time frame.")
             self._draw_empty_insight_canvas(self.ai_timeline_canvas, "No valid AI history data in timeframe.")
@@ -4651,19 +5895,31 @@ Troubleshooting:
 
     def _refresh_ai_mood_tab(self, entries):
         if not hasattr(self, "ai_mood_summary_var"):
-            return  # tab body not built yet
+            return
         self.ai_mood_summary_var.set("Loading mood cache...")
         self.ai_mood_canvas.update_idletasks()
-        
+        sl = getattr(self, "_current_lexical_slice", None)
+
         cache = self._get_daily_insights_cache()
         if not cache:
+            if lexical_insights is not None:
+                self._set_tab_guide(
+                    "mood",
+                    lexical_insights.interpret_categorical_view("mood", {"scores": []}, sl),
+                )
             self._draw_empty_insight_canvas(self.ai_mood_canvas, "No AI history to plot yet.")
             return
 
         dates = sorted(cache.keys())
         dates = self._filter_ai_dates(dates, self.ai_mood_temporal_var.get())
-        
+
         valid_dates = [d for d in dates if "mood_score" in cache[d]]
+        scores = [float(cache[d].get("mood_score", 50)) for d in valid_dates]
+        if lexical_insights is not None:
+            self._set_tab_guide(
+                "mood",
+                lexical_insights.interpret_categorical_view("mood", {"scores": scores}, sl),
+            )
         if len(valid_dates) < 2:
             self.ai_mood_summary_var.set("Not enough scored days.")
             self._draw_empty_insight_canvas(self.ai_mood_canvas, "Need at least 2 days of scored Moods.")
@@ -4682,24 +5938,22 @@ Troubleshooting:
         left, right, top, bottom = 100, 10, 15, 20
         cw = w - left - right
         ch = h - top - bottom
-        
+
         if cw <= 0 or ch <= 0:
             return
 
-        # Extract top 4 recurring themes/projects
         from collections import Counter
         all_tags = []
         for d in dates:
             all_tags.extend(cache[d].get("projects", []))
             all_tags.extend(cache[d].get("themes", []))
-            
-        top_tags = [tag.title() for tag, _ in Counter(tag.lower() for tag in all_tags if len(tag)>2).most_common(4)]
-        
+
+        top_tags = [tag.title() for tag, _ in Counter(tag.lower() for tag in all_tags if len(tag) > 2).most_common(4)]
+
         if not top_tags:
             self._draw_empty_insight_canvas(canvas, "No recurring projects/themes detected.")
             return
 
-        # Draw Y-axis labels
         row_h = ch / len(top_tags)
         for i, tag in enumerate(top_tags):
             y_center = top + i * row_h + (row_h / 2)
@@ -4707,21 +5961,19 @@ Troubleshooting:
             canvas.create_text(left - 8, y_center, text=short_tag, fill=COLOR_FG, font=("Arial", 9), anchor="e")
             canvas.create_line(left, y_center, left + cw, y_center, fill=COLOR_BORDER, dash=(2, 2))
 
-        # Draw Gantt blocks on X-axis (days)
         day_w = cw / max(len(dates), 1)
         colors = ["#2dd4bf", "#818cf8", "#f472b6", "#fbbf24"]
 
         for d_i, day_str in enumerate(dates):
             day_data = cache[day_str]
             day_tags = [t.lower() for t in day_data.get("projects", [])] + [t.lower() for t in day_data.get("themes", [])]
-            
+
             x1 = left + d_i * day_w
             x2 = x1 + day_w - 1 if day_w > 2 else x1 + day_w
-            
-            # Hover text tooltip transparent trigger column
+
             mood = day_data.get("mood", "Neutral")
             canvas.create_rectangle(x1, top, x2, top + ch, fill="", outline="", tags=("ai_col", f"ai_col_{d_i}"))
-            
+
             def bind_hover(tag_id, hover_text):
                 canvas.tag_bind(tag_id, "<Enter>", lambda e, text=hover_text: self._on_hist_hover_simple(canvas, e, text))
                 canvas.tag_bind(tag_id, "<Leave>", lambda e: canvas.delete("tooltip", "tooltip_bg"))
@@ -4733,10 +5985,9 @@ Troubleshooting:
                     y1 = top + i * row_h + 4
                     y2 = top + (i + 1) * row_h - 4
                     col = colors[i % len(colors)]
-                    
+
                     canvas.create_rectangle(x1, y1, x2, y2, fill=col, outline="", tags=("ai_col", f"ai_col_{d_i}"))
 
-        # X-axis labels (first and last date)
         canvas.create_text(left, h - 5, text=dates[0][-5:], fill="#94a3b8", font=("Arial", 7), anchor="sw")
         canvas.create_text(left + cw, h - 5, text=dates[-1][-5:], fill="#94a3b8", font=("Arial", 7), anchor="se")
 
@@ -4750,25 +6001,24 @@ Troubleshooting:
         left, right, top, bottom = 40, 10, 15, 20
         cw = w - left - right
         ch = h - top - bottom
-        
-        if cw <= 0 or ch <= 0: return
-        
-        # Guidelines (Y-axis 0-100)
-        canvas.create_text(left-5, top, text="100", fill=COLOR_FG, font=("Arial", 8), anchor="e")
-        canvas.create_line(left, top, left+cw, top, fill=COLOR_BORDER, dash=(2,2))
-        
-        mid_y = top + ch/2
-        canvas.create_text(left-5, mid_y, text="50", fill="#94a3b8", font=("Arial", 8), anchor="e")
-        canvas.create_line(left, mid_y, left+cw, mid_y, fill=COLOR_BORDER, dash=(2,2))
-        
-        canvas.create_text(left-5, top+ch, text="0", fill=COLOR_FG, font=("Arial", 8), anchor="e")
-        canvas.create_line(left, top+ch, left+cw, top+ch, fill=COLOR_BORDER, dash=(2,2))
-        
-        # Plot points
+
+        if cw <= 0 or ch <= 0:
+            return
+
+        canvas.create_text(left - 5, top, text="100", fill=COLOR_FG, font=("Arial", 8), anchor="e")
+        canvas.create_line(left, top, left + cw, top, fill=COLOR_BORDER, dash=(2, 2))
+
+        mid_y = top + ch / 2
+        canvas.create_text(left - 5, mid_y, text="50", fill="#94a3b8", font=("Arial", 8), anchor="e")
+        canvas.create_line(left, mid_y, left + cw, mid_y, fill=COLOR_BORDER, dash=(2, 2))
+
+        canvas.create_text(left - 5, top + ch, text="0", fill=COLOR_FG, font=("Arial", 8), anchor="e")
+        canvas.create_line(left, top + ch, left + cw, top + ch, fill=COLOR_BORDER, dash=(2, 2))
+
         step = cw / max(len(dates) - 1, 1)
         pts = []
-        point_data = [] # for tooltips
-        
+        point_data = []
+
         for i, d in enumerate(dates):
             score = cache[d].get("mood_score", 50)
             score = max(0, min(100, score))
@@ -4776,23 +6026,20 @@ Troubleshooting:
             y = top + ch - (score / 100.0) * ch
             pts.extend([x, y])
             point_data.append((x, y, d, score, cache[d].get("mood", "")))
-            
-        # Draw line
+
         canvas.create_line(*pts, fill="#ec4899", width=2, smooth=True)
-        
-        # Draw interactive points
+
         for x, y, d, score, mood in point_data:
-            pt_id = canvas.create_oval(x-3, y-3, x+3, y+3, fill="#fbcfe8", outline="#be185d", tags="mood_pt")
-            
+            pt_id = canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#fbcfe8", outline="#be185d", tags="mood_pt")
+
             def bind_hover(tag_id, px, py, p_date, p_score, p_mood):
                 canvas.tag_bind(tag_id, "<Enter>", lambda e, text=f"{p_date}\n{p_mood} ({p_score})": self._on_hist_hover_simple(canvas, type('obj', (object,), {'x': px, 'y': py}), text))
                 canvas.tag_bind(tag_id, "<Leave>", lambda e: canvas.delete("tooltip", "tooltip_bg"))
 
             bind_hover(pt_id, x, y, d, score, mood)
-            
-        # X-axis labels
-        canvas.create_text(left, h-5, text=dates[0][-5:], fill="#94a3b8", font=("Arial", 7), anchor="sw")
-        canvas.create_text(left+cw, h-5, text=dates[-1][-5:], fill="#94a3b8", font=("Arial", 7), anchor="se")
+
+        canvas.create_text(left, h - 5, text=dates[0][-5:], fill="#94a3b8", font=("Arial", 7), anchor="sw")
+        canvas.create_text(left + cw, h - 5, text=dates[-1][-5:], fill="#94a3b8", font=("Arial", 7), anchor="se")
 
     def _on_hist_hover_simple(self, canvas, event, text):
         canvas.delete("tooltip", "tooltip_bg")
@@ -4807,120 +6054,193 @@ Troubleshooting:
 
     def _refresh_activity_matrix_tab(self, entries, all_text, tokens_per_entry=None):
         if not hasattr(self, "activity_canvas"):
-            return  # tab body not built yet
+            return
         self.activity_canvas.delete("all")
         self.activity_canvas.update_idletasks()
-        if not entries:
-            self._draw_empty_insight_canvas(self.activity_canvas, "No data yet.")
-            return
 
         from collections import defaultdict
-        
-        # Group entries by day
         metric_type = self.activity_metric_var.get()
         daily_vals = defaultdict(float)
-        
+
+        lex_idx = self._get_lexical_index() if lexical_insights is not None else None
+        lang_mode = self.insights_lang_var.get() if hasattr(self, "insights_lang_var") else "All"
+        sl = getattr(self, "_current_lexical_slice", None)
+        key_map = {
+            "Clarity Index": "clarity_index",
+            "Lexical Diversity": "mattr_diversity",
+            "Long Pauses %": "pause_long_pct",
+            "Vitality": "vitality_balance",
+        }
+        mapped_mkey = key_map.get(metric_type)
+
         if metric_type == "Mood":
             cache = self._get_daily_insights_cache()
             for d, data in cache.items():
                 if "mood_score" in data:
                     daily_vals[d] = float(data["mood_score"])
+        elif lex_idx is not None and mapped_mkey is not None:
+            offsets = lexical_insights._compute_language_offsets(lex_idx.daily)
+            baselines = getattr(self, "_lexical_baselines", None) or {}
+            for d_iso, rec in lex_idx.daily.items():
+                m = lexical_insights.compute_record_metrics(rec, lang_mode=lang_mode, lang_offsets=offsets)
+                if m["words"] <= 0:
+                    continue
+                if mapped_mkey == "clarity_index":
+                    val = lexical_insights.score_clarity_index(m, baselines)
+                else:
+                    val = m.get(mapped_mkey)
+                if val is not None:
+                    daily_vals[d_iso] = float(val)
         elif tokens_per_entry is not None and len(tokens_per_entry) == len(entries):
             for e, toks in zip(entries, tokens_per_entry):
                 d = e["timestamp"].strftime("%Y-%m-%d")
                 daily_vals[d] += len(toks)
-        else:  # Words (Volume) fallback
+        else:
             for e in entries:
                 d = e["timestamp"].strftime("%Y-%m-%d")
                 daily_vals[d] += len(self._tokenize_words(e["text"]))
-                
+
+        if self._is_trim_outliers_enabled() and lexical_insights is not None and len(daily_vals) >= 6:
+            cut_key = mapped_mkey or "volume_words"
+            base_ref = (getattr(self, "_lexical_baselines", None) or {}).get(cut_key)
+            lo_c, hi_c, _, _ = lexical_insights.compute_outlier_cutoff(
+                list(daily_vals.values()), base_ref, cut_key, INSIGHTS_OUTLIER_SIGMA
+            )
+            if lo_c is not None or hi_c is not None:
+                for d_k in list(daily_vals.keys()):
+                    dv = daily_vals[d_k]
+                    if (hi_c is not None and dv > hi_c) or (lo_c is not None and dv < lo_c):
+                        del daily_vals[d_k]
+
+        if lexical_insights is not None:
+            mean_v = (sum(daily_vals.values()) / len(daily_vals)) if daily_vals else None
+            cat_g = lexical_insights.interpret_categorical_view(
+                "activity",
+                {"metric_type": metric_type, "active_days": len(daily_vals), "mean_val": mean_v},
+                sl,
+            )
+            if mapped_mkey is not None and sl is not None:
+                m_g = lexical_insights.interpret_metric_window(sl, mapped_mkey)
+                cat_g["explanation"] = f"{cat_g['explanation']} Layer: {m_g['explanation']}"
+                cat_g["pattern"] = m_g["pattern"]
+            self._set_tab_guide("activity", cat_g)
+
+        if not daily_vals:
+            self._draw_empty_insight_canvas(self.activity_canvas, "No data in selected metric yet.")
+            return
+
         self._draw_github_heatmap(self.activity_canvas, daily_vals, metric_type)
 
-    def _refresh_speaker_profile_tab(self, entries, all_tokens, sentences):
+    def _refresh_speaker_profile_tab(self, entries, all_tokens, sentences, sl=None):
         if not hasattr(self, "speaker_profile_canvas"):
-            return  # tab body not built yet
+            return
         self.speaker_profile_canvas.delete("all")
         self.speaker_profile_canvas.update_idletasks()
+        sl = sl or getattr(self, "_current_lexical_slice", None)
         if not entries or len(all_tokens) < 10:
+            if lexical_insights is not None:
+                self._set_tab_guide(
+                    "profile",
+                    lexical_insights.interpret_categorical_view("profile", {"axes": {}}, sl),
+                )
             self._draw_empty_insight_canvas(self.speaker_profile_canvas, "Need more spoken data to build profile.")
             return
 
-        import math
-        # Axis 1: Lexical Diversity
-        unique_words = len(set(t.lower() for t in all_tokens))
-        diversity_score = min(100, (unique_words / max(len(all_tokens), 1)) * 300) # heuristic
-        
-        # Axis 2: Engagement Volume
-        today_words = self.today_words
-        volume_score = min(100, (today_words / 2000.0) * 100) # baseline 2000 words a day = 100%
-        
-        # Axis 3: Positivity (Mood)
+        summ = (sl or {}).get("summary") or {}
+
+        # Axis 1: Length-invariant MATTR-50 diversity (scaled 45%->15 .. 80%->95)
+        if summ.get("mattr_diversity") is not None:
+            mattr = float(summ["mattr_diversity"])
+            diversity_score = max(10.0, min(100.0, (mattr - 40.0) * 2.2))
+        else:
+            unique_words = len(set(t.lower() for t in all_tokens))
+            diversity_score = min(100.0, (unique_words / max(len(all_tokens), 1)) * 300.0)
+
+        # Axis 2: Cognitive Clarity / Fluency
+        if summ.get("clarity_index") is not None:
+            clarity_score = max(10.0, min(100.0, float(summ["clarity_index"])))
+        else:
+            clarity_score = 50.0
+
+        # Axis 3: Vitality / Mood (AI mood if crunched, else 100% local lexical vitality)
         cache = self._get_daily_insights_cache()
         mood_scores = [d.get("mood_score", 50) for d in cache.values() if "mood_score" in d]
-        positivity_score = sum(mood_scores) / len(mood_scores) if mood_scores else 50
-        
+        if mood_scores:
+            positivity_score = sum(mood_scores) / len(mood_scores)
+        elif summ.get("vitality_balance") is not None:
+            positivity_score = float(summ["vitality_balance"])
+        else:
+            positivity_score = 50.0
+
         # Axis 4: Inquiry (Questions)
         questions = sum(1 for s in sentences if s.strip().endswith('?'))
-        inquiry_score = min(100, (questions / max(len(sentences), 1)) * 500) # heuristic
-        
+        inquiry_score = min(100.0, (questions / max(len(sentences), 1)) * 500.0)
+
         # Axis 5: Sustained Thought (Sentence Length)
         avg_len = len(all_tokens) / max(len(sentences), 1)
-        thought_score = min(100, (avg_len / 25.0) * 100)
-        
+        thought_score = min(100.0, (avg_len / 25.0) * 100.0)
+
         axes_data = {
-            "Lexical Diversity": max(10, diversity_score),
-            "Daily Engagement": max(10, volume_score),
-            "Positivity": max(10, positivity_score),
-            "Inquiry Drive": max(10, inquiry_score),
-            "Sustained Thought": max(10, thought_score)
+            "MATTR Diversity": max(10.0, diversity_score),
+            "Cognitive Clarity": max(10.0, clarity_score),
+            "Vitality / Mood": max(10.0, positivity_score),
+            "Inquiry Drive": max(10.0, inquiry_score),
+            "Sustained Thought": max(10.0, thought_score),
         }
-        
+
+        if lexical_insights is not None:
+            self._set_tab_guide(
+                "profile",
+                lexical_insights.interpret_categorical_view("profile", {"axes": axes_data}, sl),
+            )
+
         self._draw_radar_chart(self.speaker_profile_canvas, axes_data)
 
     def _refresh_daily_brief_tab(self, entries):
         if not hasattr(self, "brief_listbox"):
-            return  # tab body not built yet
+            return
         cache = self._get_daily_insights_cache()
         self.brief_listbox.delete(0, tk.END)
         if not cache:
             self.brief_listbox.insert(tk.END, "No AI history available.")
             return
-            
+
         dates = sorted(cache.keys(), reverse=True)
         for d in dates:
             score = cache[d].get("mood_score", "?")
             self.brief_listbox.insert(tk.END, f"{d}  [M: {score}]")
-            
-        # Select first by default if available
+
         if dates:
             self.brief_listbox.selection_set(0)
             self._on_brief_date_select()
 
     def _on_brief_date_select(self, event=None):
         sel = self.brief_listbox.curselection()
-        if not sel: return
-        
+        if not sel:
+            return
+
         item_text = self.brief_listbox.get(sel[0])
-        if "available" in item_text: return
-        
+        if "available" in item_text:
+            return
+
         date_str = item_text.split()[0]
         cache = self._get_daily_insights_cache()
         data = cache.get(date_str, {})
-        
+
         self.brief_text.config(state="normal")
         self.brief_text.delete("1.0", tk.END)
-        
+
         if not data:
             self.brief_text.insert(tk.END, "Data missing for this date.")
             self.brief_text.config(state="disabled")
             return
-            
+
         mood = data.get("mood", "Neutral")
         score = data.get("mood_score", "N/A")
         brief = data.get("daily_brief", "No brief generated for this date. Delete the ai_insights.json file and crunch history again to generate briefs.")
         projects = ", ".join(data.get("projects", []))
         themes = ", ".join(data.get("themes", []))
-        
+
         display_text = f"DATE: {date_str}\n"
         display_text += f"{'='*30}\n\n"
         display_text += f"MOOD: {mood} (Score: {score}/100)\n\n"
@@ -4928,91 +6248,110 @@ Troubleshooting:
         display_text += f"{'-'*30}\n"
         display_text += f"PROJECTS: {projects}\n"
         display_text += f"THEMES: {themes}\n"
-        
+
         self.brief_text.insert(tk.END, display_text)
         self.brief_text.config(state="disabled")
 
     def _draw_github_heatmap(self, canvas, data_dict, metric_type):
-        import datetime
         w = canvas.winfo_width()
-        w = w if w > 10 else 600
+        w = w if w > 10 else 420
         h = canvas.winfo_height()
-        h = h if h > 10 else 180
-        left, top = 40, 20
-        sq_size = 12
-        pad = 3
-        
-        if not data_dict: return
-        
+        h = h if h > 10 else 150
+        left, top = 36, 18
+        sq_size = 11
+        pad = 2
+
+        if not data_dict:
+            return
+
         dates = sorted(data_dict.keys())
         try:
-            start_date = datetime.datetime.strptime(dates[0], "%Y-%m-%d").date()
+            first_data_date = datetime.datetime.strptime(dates[0], "%Y-%m-%d").date()
             end_date = datetime.date.today()
+            sl = getattr(self, "_current_lexical_slice", None)
+            if sl and sl.get("end_date") and sl["end_date"] != "9999-12-31":
+                end_date = min(end_date, datetime.date.fromisoformat(sl["end_date"]))
         except Exception:
             return
-            
-        # Limit to max 52 weeks (approx 1 year backward from end_date)
-        start_date = max(start_date, end_date - datetime.timedelta(days=365))
-        
-        # Adjust start_date to a Monday
+
+        start_date = max(first_data_date, end_date - datetime.timedelta(days=364))
         while start_date.weekday() != 0:
             start_date -= datetime.timedelta(days=1)
-            
-        total_days = (end_date - start_date).days + 1
-        num_cols = (total_days // 7) + 1
-        
-        # Draw Y-Axis (Days)
+
         day_labels = ["Mon", "", "Wed", "", "Fri", "", "Sun"]
         for i, lbl in enumerate(day_labels):
-            y = top + i * (sq_size + pad) + (sq_size/2)
-            canvas.create_text(left - 5, y, text=lbl, fill="#94a3b8", font=("Arial", 8), anchor="e")
-            
-        max_val = max(data_dict.values()) if data_dict else 1
-        if max_val == 0: max_val = 1
-        
+            y = top + i * (sq_size + pad) + (sq_size / 2)
+            canvas.create_text(left - 5, y, text=lbl, fill="#94a3b8", font=("Arial", 7), anchor="e")
+
+        in_window_vals = [
+            v for d_s, v in data_dict.items()
+            if start_date.isoformat() <= d_s <= end_date.isoformat()
+        ]
+        max_val = max(in_window_vals) if in_window_vals else (max(data_dict.values()) or 1.0)
+        if max_val <= 0:
+            max_val = 1.0
+
         curr_date = start_date
         col = 0
-        point_data = [] # for tooltips
-        
+        point_data = []
+
         while curr_date <= end_date:
             d_str = curr_date.strftime("%Y-%m-%d")
-            val = data_dict.get(d_str, 0)
-            
-            row = curr_date.weekday() # 0 = Mon, 6 = Sun
+            has_day = d_str in data_dict
+            val = data_dict.get(d_str, 0.0)
+
+            row = curr_date.weekday()
             x = left + col * (sq_size + pad)
             y = top + row * (sq_size + pad)
-            
-            # Colors
-            if val == 0:
-                color = "#1e293b" # Empty dark
+
+            if not has_day or (metric_type == "Words (Volume)" and val <= 0):
+                color = "#1e293b"
+            elif metric_type in ("Mood", "Clarity Index", "Vitality"):
+                if val < 42:
+                    color = "#dc2626" if val < 34 else "#ef4444"
+                elif val < 54:
+                    color = "#ca8a04" if val < 48 else "#eab308"
+                else:
+                    color = "#16a34a" if val < 62 else "#22c55e"
+            elif metric_type == "Long Pauses %":
+                # Lower long-pause % is smoother (green), high is stall-heavy (amber/red)
+                if val <= 8.0:
+                    color = "#22c55e"
+                elif val <= 18.0:
+                    color = "#f59e0b"
+                else:
+                    color = "#ef4444"
+            elif metric_type == "Lexical Diversity":
+                if val < 58.0:
+                    color = "#0e4429"
+                elif val < 65.0:
+                    color = "#006d32"
+                elif val < 72.0:
+                    color = "#26a641"
+                else:
+                    color = "#39d353"
             else:
                 ratio = val / max_val
-                if metric_type == "Mood":
-                    # Red to Green
-                    if val < 40: color = "#ef4444" 
-                    elif val < 60: color = "#eab308"
-                    else: color = "#22c55e"
-                    # Add intensity
-                    if ratio > 0.8: color = "#16a34a" if val >= 60 else "#dc2626"
+                if ratio < 0.25:
+                    color = "#0e4429"
+                elif ratio < 0.5:
+                    color = "#006d32"
+                elif ratio < 0.75:
+                    color = "#26a641"
                 else:
-                    # GitHub Greens
-                    if ratio < 0.25: color = "#0e4429"
-                    elif ratio < 0.5: color = "#006d32"
-                    elif ratio < 0.75: color = "#26a641"
-                    else: color = "#39d353"
-                    
-            r_id = canvas.create_rectangle(x, y, x+sq_size, y+sq_size, fill=color, outline="#0f172a")
-            
-            if val > 0:
+                    color = "#39d353"
+
+            r_id = canvas.create_rectangle(x, y, x + sq_size, y + sq_size, fill=color, outline="#0f172a")
+            if has_day and (val > 0 or metric_type == "Long Pauses %"):
                 point_data.append((r_id, x, y, d_str, val))
-                
-            if row == 6: col += 1
+
+            if row == 6:
+                col += 1
             curr_date += datetime.timedelta(days=1)
-            
-        # Tooltips
+
         for r_id, x, y, d, v in point_data:
             def bind_hover(tag_id, px, py, p_date, p_val):
-                lbl_text = f"{p_date}: {p_val:.1f} {metric_type}"
+                lbl_text = f"{p_date}: {p_val:.1f} ({metric_type})"
                 canvas.tag_bind(tag_id, "<Enter>", lambda e, text=lbl_text: self._on_hist_hover_simple(canvas, type('obj', (object,), {'x': px, 'y': py}), text))
                 canvas.tag_bind(tag_id, "<Leave>", lambda e: canvas.delete("tooltip", "tooltip_bg"))
             bind_hover(r_id, x, y, d, v)
@@ -5023,47 +6362,669 @@ Troubleshooting:
         w = w if w > 10 else 600
         h = canvas.winfo_height()
         h = h if h > 10 else 220
-        cx, cy = w/2, h/2
-        radius = min(w/2, h/2) - 40
-        
+        cx, cy = w / 2, h / 2
+        radius = min(w / 2, h / 2) - 40
+
         labels = list(data_dict.keys())
         values = list(data_dict.values())
         num_axes = len(labels)
         angle_step = 2 * math.pi / num_axes
-        
-        # Grid layers (polygons)
+
         for r_ratio in [0.25, 0.5, 0.75, 1.0]:
             r = radius * r_ratio
             pts = []
             for i in range(num_axes):
-                a = i * angle_step - math.pi/2 # Start at top
+                a = i * angle_step - math.pi / 2
                 pts.extend([cx + r * math.cos(a), cy + r * math.sin(a)])
-            canvas.create_polygon(pts, fill="", outline="#334155", dash=(2,2))
-            
-        # Draw axes and labels
+            canvas.create_polygon(pts, fill="", outline="#334155", dash=(2, 2))
+
         axis_pts = []
         for i in range(num_axes):
-            a = i * angle_step - math.pi/2
+            a = i * angle_step - math.pi / 2
             x, y = cx + radius * math.cos(a), cy + radius * math.sin(a)
             canvas.create_line(cx, cy, x, y, fill="#475569")
-            
-            # Label
-            lx, ly = cx + (radius+15) * math.cos(a), cy + (radius+15) * math.sin(a)
+
+            lx, ly = cx + (radius + 15) * math.cos(a), cy + (radius + 15) * math.sin(a)
             anchor = "center"
-            if math.cos(a) > 0.1: anchor = "w"
-            elif math.cos(a) < -0.1: anchor = "e"
+            if math.cos(a) > 0.1:
+                anchor = "w"
+            elif math.cos(a) < -0.1:
+                anchor = "e"
             canvas.create_text(lx, ly, text=labels[i], fill="#94a3b8", font=("Arial", 8, "bold"), anchor=anchor)
-            
-            # Data point (cap between 0.1 and 1.0)
+
             val = max(0.1, min(1.0, values[i] / 100.0))
             dx, dy = cx + (radius * val) * math.cos(a), cy + (radius * val) * math.sin(a)
             axis_pts.extend([dx, dy])
-            
-        # Data Polygon
+
         if axis_pts:
             canvas.create_polygon(axis_pts, fill="#2dd4bf", outline="#14b8a6", width=2, stipple="gray50")
             for i in range(0, len(axis_pts), 2):
-                canvas.create_oval(axis_pts[i]-3, axis_pts[i+1]-3, axis_pts[i]+3, axis_pts[i+1]+3, fill="#f0fdfa", outline="#0d9488")
+                canvas.create_oval(axis_pts[i] - 3, axis_pts[i + 1] - 3, axis_pts[i] + 3, axis_pts[i + 1] + 3, fill="#f0fdfa", outline="#0d9488")
+
+    # ------------------------------------------------------------------
+    # Wide Resizable Longitudinal Trends Explorer + Offline HTML Report
+    # ------------------------------------------------------------------
+
+    def open_trends_explorer(self):
+        """Open (or focus) the wide resizable Longitudinal Speech Insights Explorer."""
+        if lexical_insights is None:
+            return
+        if self._explorer_is_open():
+            try:
+                self._trends_explorer_win.deiconify()
+                self._trends_explorer_win.lift()
+                self._trends_explorer_win.focus_force()
+                self._refresh_trends_explorer()
+            except Exception:
+                pass
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("neurowhisper · Longitudinal Speech & Cognitive Clarity Explorer")
+        win.geometry("1060x725")
+        win.minsize(780, 540)
+        win.configure(bg=COLOR_BG)
+        self._trends_explorer_win = win
+
+        def _close_explorer():
+            self._trends_explorer_win = None
+            self._explorer_range_buttons = {}
+            self._explorer_period_combo = None
+            self._explorer_main_canvas = None
+            self._explorer_vol_canvas = None
+            self._explorer_report_btn = None
+            self._explorer_trim_btn = None
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        win.protocol("WM_DELETE_WINDOW", _close_explorer)
+
+        # 1. Top Control Bar (synced with main Speech Insights horizon/bucket/lang/outliers)
+        top_bar = tk.Frame(win, bg=COLOR_ACCENT_BG, highlightthickness=1, highlightbackground=COLOR_BORDER)
+        top_bar.pack(fill="x", padx=14, pady=(12, 8))
+
+        # Pack right-side buttons first so Windows high-DPI scaling never clips them
+        self._explorer_report_btn = ctk.CTkButton(
+            top_bar, text="📄 HTML Report", width=116, height=24, corner_radius=7,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color=COLOR_BG, hover_color=COLOR_TEAL_DIM,
+            border_width=1, border_color=COLOR_TEAL, text_color=COLOR_TEAL,
+            command=self._export_and_open_html_report,
+        )
+        self._explorer_report_btn.pack(side="right", padx=(4, 10), pady=8)
+        self._create_tooltip(
+            self._explorer_report_btn,
+            "Build & open standalone offline HTML report (analysis/out/report.html) in your default browser.\n"
+            "100% local — no data leaves this machine.",
+        )
+
+        self._explorer_trim_btn = ctk.CTkButton(
+            top_bar, text="✂ Kick >2.5σ", width=132, height=24, corner_radius=7,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color=COLOR_BG, hover_color=COLOR_TEAL_DIM,
+            border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT_MUTED,
+            command=self._toggle_trim_outliers,
+        )
+        self._explorer_trim_btn.pack(side="right", padx=(4, 2), pady=8)
+        self._create_tooltip(
+            self._explorer_trim_btn,
+            "Kick out >2.5σ outlier spikes (e.g. accidental hot-mic / stuck hotkey).\n"
+            "100% non-destructive — raw transcript files on disk are never modified.",
+        )
+
+        chip_wrap = tk.Frame(top_bar, bg=COLOR_ACCENT_BG)
+        chip_wrap.pack(side="left", padx=(10, 8), pady=8)
+        tk.Label(chip_wrap, text="Horizon:", bg=COLOR_ACCENT_BG, fg=COLOR_TEXT_MUTED,
+                 font=("Arial", 9, "bold")).pack(side="left", padx=(0, 6))
+
+        self._explorer_range_buttons = {}
+        for key, short in INSIGHTS_QUICK_CHIPS:
+            w_c = max(32, 7 * len(short) + 14)
+            b = ctk.CTkButton(
+                chip_wrap, text=short, width=w_c, height=22, corner_radius=7,
+                font=ctk.CTkFont(size=10, weight="bold"),
+                fg_color=COLOR_BG, hover_color=COLOR_TEAL_DIM,
+                text_color=COLOR_TEXT_FAINT,
+                command=lambda k=key: self._select_insights_range(k),
+            )
+            b.pack(side="left", padx=1)
+            self._explorer_range_buttons[key] = b
+
+        lex_idx = self._get_lexical_index()
+        period_opts = lexical_insights.available_period_options(lex_idx.daily if lex_idx else {})
+        if self.insights_range_var.get() not in period_opts:
+            period_opts.append(self.insights_range_var.get())
+
+        sel_wrap = tk.Frame(top_bar, bg=COLOR_ACCENT_BG)
+        sel_wrap.pack(side="left", padx=4, pady=8)
+
+        self._explorer_period_combo = ttk.Combobox(
+            sel_wrap, textvariable=self.insights_range_var,
+            values=period_opts, state="readonly", width=13,
+        )
+        self._explorer_period_combo.pack(side="left", padx=(0, 6))
+        self._explorer_period_combo.bind("<<ComboboxSelected>>", self._on_insights_period_combo_select)
+        self._enhance_combobox(self._explorer_period_combo, "Select horizon or specific calendar year")
+
+        exp_bucket = ttk.Combobox(
+            sel_wrap, textvariable=self.insights_bucket_var,
+            values=list(INSIGHTS_BUCKET_OPTIONS), state="readonly", width=8,
+        )
+        exp_bucket.pack(side="left", padx=(0, 6))
+        exp_bucket.bind("<<ComboboxSelected>>", self._on_insights_filter_change)
+        self._enhance_combobox(exp_bucket, "Aggregation resolution (Auto / Daily / Weekly / Monthly)")
+
+        exp_lang = ttk.Combobox(
+            sel_wrap, textvariable=self.insights_lang_var,
+            values=list(INSIGHTS_LANG_OPTIONS), state="readonly", width=5,
+        )
+        exp_lang.pack(side="left", padx=(0, 6))
+        exp_lang.bind("<<ComboboxSelected>>", self._on_insights_filter_change)
+        self._enhance_combobox(exp_lang, "Language filter (All = cross-language normalized)")
+
+        # 2. Callout & Coverage Strip
+        callout_frame = tk.Frame(win, bg=COLOR_BG)
+        callout_frame.pack(fill="x", padx=16, pady=(0, 6))
+        self._explorer_callout_var = tk.StringVar(value="")
+        self._explorer_sub_var = tk.StringVar(value="")
+        tk.Label(
+            callout_frame, textvariable=self._explorer_callout_var,
+            bg=COLOR_BG, fg=COLOR_TEAL, font=("Arial", 10, "bold"),
+            anchor="w", justify="left",
+        ).pack(fill="x")
+        tk.Label(
+            callout_frame, textvariable=self._explorer_sub_var,
+            bg=COLOR_BG, fg=COLOR_TEXT_FAINT, font=("Arial", 8),
+            anchor="w", justify="left",
+        ).pack(fill="x")
+
+        # 3. 6 Clickable KPI Summary Cards
+        kpi_row = tk.Frame(win, bg=COLOR_BG)
+        kpi_row.pack(fill="x", padx=14, pady=(0, 8))
+        self._explorer_kpi_vars = {}
+        kpi_defs = [
+            ("clarity_index", "CLARITY INDEX"),
+            ("mattr_diversity", "MATTR-50 DIVERSITY"),
+            ("vague_per_100", "WORD-FINDING (VAGUE)"),
+            ("pause_long_pct", "LONG PAUSES ≥5s"),
+            ("fillers_per_100", "FILLERS / REPAIRS"),
+            ("vitality_balance", "VITALITY & NIGHT %"),
+        ]
+        for col_i, (m_key, title_txt) in enumerate(kpi_defs):
+            kpi_row.grid_columnconfigure(col_i, weight=1)
+            card = tk.Frame(
+                kpi_row, bg=COLOR_ACCENT_BG, highlightthickness=1,
+                highlightbackground=COLOR_BORDER, cursor="hand2",
+            )
+            card.grid(row=0, column=col_i, sticky="nsew", padx=3)
+            v_main = tk.StringVar(value="—")
+            v_sub = tk.StringVar(value="")
+            self._explorer_kpi_vars[m_key] = (v_main, v_sub)
+            l1 = tk.Label(card, text=title_txt, bg=COLOR_ACCENT_BG, fg=COLOR_TEXT_FAINT, font=("Arial", 7, "bold"))
+            l1.pack(anchor="w", padx=8, pady=(6, 0))
+            l2 = tk.Label(card, textvariable=v_main, bg=COLOR_ACCENT_BG, fg=COLOR_FG, font=("Arial", 13, "bold"))
+            l2.pack(anchor="w", padx=8)
+            l3 = tk.Label(card, textvariable=v_sub, bg=COLOR_ACCENT_BG, fg=COLOR_TEXT_MUTED, font=("Arial", 8))
+            l3.pack(anchor="w", padx=8, pady=(0, 6))
+            for wdg in (card, l1, l2, l3):
+                wdg.bind("<Button-1>", lambda _e, mk=m_key: self._select_explorer_primary_metric(mk))
+
+        # 4. Primary & Secondary Metric Selector Row
+        metric_bar = tk.Frame(win, bg=COLOR_BG)
+        metric_bar.pack(fill="x", padx=16, pady=(0, 4))
+
+        self._explorer_label_to_key = {
+            spec["label"]: k for k, spec in lexical_insights.METRIC_SPECS.items()
+        }
+        self._explorer_key_to_label = {
+            k: spec["label"] for k, spec in lexical_insights.METRIC_SPECS.items()
+        }
+        metric_labels = list(self._explorer_label_to_key.keys())
+
+        tk.Label(metric_bar, text="Primary Curve:", bg=COLOR_BG, fg=COLOR_TEXT_MUTED,
+                 font=("Arial", 9, "bold")).pack(side="left", padx=(0, 5))
+        self._explorer_primary_var = tk.StringVar(
+            value=self._explorer_key_to_label["clarity_index"]
+        )
+        prim_cb = ttk.Combobox(
+            metric_bar, textvariable=self._explorer_primary_var,
+            values=metric_labels, state="readonly", width=30,
+        )
+        prim_cb.pack(side="left", padx=(0, 14))
+        prim_cb.bind("<<ComboboxSelected>>", lambda _e: self._refresh_trends_explorer())
+        self._enhance_combobox(prim_cb, "Primary longitudinal metric (left Y-axis + 90-day personal baseline band)")
+
+        tk.Label(metric_bar, text="Overlay (Right Axis):", bg=COLOR_BG, fg=COLOR_TEXT_MUTED,
+                 font=("Arial", 9)).pack(side="left", padx=(0, 5))
+        self._explorer_secondary_var = tk.StringVar(
+            value=self._explorer_key_to_label["pause_long_pct"]
+        )
+        sec_cb = ttk.Combobox(
+            metric_bar, textvariable=self._explorer_secondary_var,
+            values=["None"] + metric_labels, state="readonly", width=28,
+        )
+        sec_cb.pack(side="left", padx=(0, 12))
+        sec_cb.bind("<<ComboboxSelected>>", lambda _e: self._refresh_trends_explorer())
+        self._enhance_combobox(sec_cb, "Optional second metric plotted on independent right Y-axis")
+
+        self._explorer_desc_var = tk.StringVar(value="")
+        tk.Label(
+            metric_bar, textvariable=self._explorer_desc_var,
+            bg=COLOR_BG, fg=COLOR_TEXT_FAINT, font=("Arial", 8), anchor="w",
+        ).pack(side="left", fill="x", expand=True)
+
+        # 4b. Local Zero-LLM Dimension Explanation + Window Pattern Card
+        guide_card = tk.Frame(
+            win, bg=COLOR_ACCENT_BG, highlightthickness=1, highlightbackground="#1f2937"
+        )
+        guide_card.pack(fill="x", padx=14, pady=(0, 6))
+        self._explorer_explain_var = tk.StringVar(value="")
+        self._explorer_pattern_var = tk.StringVar(value="")
+        exp_lbl = tk.Label(
+            guide_card, textvariable=self._explorer_explain_var,
+            bg=COLOR_ACCENT_BG, fg=COLOR_TEXT_MUTED, font=("Arial", 8),
+            anchor="w", justify="left", wraplength=980,
+        )
+        exp_lbl.pack(fill="x", padx=10, pady=(4, 1))
+        pat_lbl = tk.Label(
+            guide_card, textvariable=self._explorer_pattern_var,
+            bg=COLOR_ACCENT_BG, fg="#99f6e4", font=("Arial", 9, "bold"),
+            anchor="w", justify="left", wraplength=980,
+        )
+        pat_lbl.pack(fill="x", padx=10, pady=(0, 5))
+
+        def _sync_exp_guide_wrap(ev, l_a=exp_lbl, l_b=pat_lbl):
+            wl = max(320, int(ev.width) - 24)
+            if wl != getattr(guide_card, "_nw_last_wl", None):
+                guide_card._nw_last_wl = wl
+                l_a.configure(wraplength=wl)
+                l_b.configure(wraplength=wl)
+
+        guide_card.bind("<Configure>", _sync_exp_guide_wrap)
+
+        # 5. Main Longitudinal Line Graph Canvas (expands with window)
+        self._explorer_main_canvas = tk.Canvas(
+            win, height=320, bg=COLOR_TEXT_BG,
+            highlightthickness=1, highlightbackground=COLOR_BORDER,
+        )
+        self._explorer_main_canvas.pack(fill="both", expand=True, padx=14, pady=(0, 6))
+
+        # 6. Bottom Volume + Late-Night Share Context Sub-Chart
+        self._explorer_vol_canvas = tk.Canvas(
+            win, height=84, bg=COLOR_TEXT_BG,
+            highlightthickness=1, highlightbackground=COLOR_BORDER,
+        )
+        self._explorer_vol_canvas.pack(fill="x", padx=14, pady=(0, 12))
+        def _on_vol_cfg(event, c=self._explorer_vol_canvas):
+            cur_wh = (event.width, event.height)
+            if cur_wh != getattr(c, "_nw_vol_last_wh", None) and event.width > 30 and event.height > 20:
+                c._nw_vol_last_wh = cur_wh
+                self._draw_explorer_volume_strip(self._current_lexical_slice)
+
+        self._explorer_vol_canvas.bind("<Configure>", _on_vol_cfg)
+
+        self._update_range_button_styles()
+        self._update_trim_outlier_button_styles()
+        if self._current_lexical_slice is None:
+            self.refresh_insights_tabs()
+        else:
+            self._refresh_trends_explorer()
+
+    def _select_explorer_primary_metric(self, metric_key):
+        lbl = (getattr(self, "_explorer_key_to_label", {}) or {}).get(metric_key)
+        if lbl and hasattr(self, "_explorer_primary_var"):
+            self._explorer_primary_var.set(lbl)
+            self._refresh_trends_explorer()
+
+    def _refresh_trends_explorer(self):
+        if not self._explorer_is_open() or lexical_insights is None:
+            return
+        self._update_range_button_styles()
+        trim_on = self._is_trim_outliers_enabled()
+        sl = self._current_lexical_slice
+        if sl is None or bool(sl.get("trim_outliers", False)) != trim_on:
+            lex_idx = self._get_lexical_index()
+            if lex_idx is not None:
+                sl = lexical_insights.query_slice(
+                    lex_idx,
+                    range_spec=self.insights_range_var.get(),
+                    bucket_mode=self.insights_bucket_var.get(),
+                    lang_mode=self.insights_lang_var.get(),
+                    trim_outliers=trim_on,
+                    outlier_sigma=INSIGHTS_OUTLIER_SIGMA,
+                )
+                self._current_lexical_slice = sl
+        self._update_trim_outlier_button_styles()
+
+        if not sl:
+            return
+
+        summ = sl.get("summary") or {}
+        bases = sl.get("baselines") or {}
+        self._explorer_callout_var.set(sl.get("callout", ""))
+        self._explorer_sub_var.set(
+            f"Slice: {sl.get('start_date')} → {sl.get('end_date')}  ·  "
+            f"{sl.get('active_days_in_slice', 0)} active day(s)  ·  "
+            f"{int(summ.get('words', 0)):,} words ({int(summ.get('entries', 0)):,} entries, "
+            f"{summ.get('de_share_pct', 0.0):.0f}% DE)  ·  "
+            f"Personal self-tracking only (non-diagnostic)."
+        )
+
+        def _fmt_kpi(mk, fmt_str, suffix=""):
+            v = summ.get(mk)
+            if v is None:
+                return "—", "no sample"
+            b = bases.get(mk)
+            sub = f"90d norm {b['median']:{fmt_str}}{suffix}" if b else ""
+            return f"{v:{fmt_str}}{suffix}", sub
+
+        kpis = getattr(self, "_explorer_kpi_vars", {})
+        if "clarity_index" in kpis:
+            m_txt, s_txt = _fmt_kpi("clarity_index", ".1f", "")
+            kpis["clarity_index"][0].set(m_txt)
+            kpis["clarity_index"][1].set(s_txt or "50 = personal norm")
+        if "mattr_diversity" in kpis:
+            m_txt, s_txt = _fmt_kpi("mattr_diversity", ".1f", "%")
+            kpis["mattr_diversity"][0].set(m_txt)
+            kpis["mattr_diversity"][1].set(s_txt)
+        if "vague_per_100" in kpis:
+            m_txt, s_txt = _fmt_kpi("vague_per_100", ".2f", "/100w")
+            kpis["vague_per_100"][0].set(m_txt)
+            kpis["vague_per_100"][1].set(s_txt)
+        if "pause_long_pct" in kpis:
+            m_txt, s_txt = _fmt_kpi("pause_long_pct", ".1f", "%")
+            p90 = summ.get("pause_p90_s")
+            kpis["pause_long_pct"][0].set(m_txt)
+            kpis["pause_long_pct"][1].set(f"P90 {p90:.1f}s · {s_txt}" if p90 is not None else s_txt)
+        if "fillers_per_100" in kpis:
+            m_txt, _ = _fmt_kpi("fillers_per_100", ".2f", "/100w")
+            rep = summ.get("disfluency_per_1k")
+            kpis["fillers_per_100"][0].set(m_txt)
+            kpis["fillers_per_100"][1].set(f"Repairs {rep:.1f}/1k" if rep is not None else "")
+        if "vitality_balance" in kpis:
+            m_txt, _ = _fmt_kpi("vitality_balance", ".1f", "")
+            ln = summ.get("late_night_pct")
+            kpis["vitality_balance"][0].set(m_txt)
+            kpis["vitality_balance"][1].set(f"Late-night {ln:.1f}%" if ln is not None else "")
+
+        p_key = self._explorer_label_to_key.get(self._explorer_primary_var.get(), "clarity_index")
+        s_lbl = self._explorer_secondary_var.get()
+        s_key = self._explorer_label_to_key.get(s_lbl) if s_lbl != "None" else None
+
+        guide = lexical_insights.interpret_metric_window(sl, p_key, secondary_key=s_key)
+        corr_txt = guide.get("correlation") or ""
+        self._explorer_desc_var.set(corr_txt)
+        if hasattr(self, "_explorer_explain_var"):
+            self._explorer_explain_var.set(f"What it measures: {guide.get('explanation', '')}")
+        if hasattr(self, "_explorer_pattern_var"):
+            pat_txt = guide.get("pattern", "")
+            self._explorer_pattern_var.set(
+                f"Window pattern: {pat_txt}" + (f"  ·  {corr_txt}" if corr_txt else "")
+            )
+
+        self._draw_timeseries_chart(
+            self._explorer_main_canvas, sl, p_key, secondary_key=s_key, show_baseline=True
+        )
+        self._draw_explorer_volume_strip(sl)
+
+    def _draw_explorer_volume_strip(self, sl):
+        canvas = getattr(self, "_explorer_vol_canvas", None)
+        if canvas is None:
+            return
+        try:
+            if not canvas.winfo_exists():
+                return
+        except Exception:
+            return
+        canvas.delete("all")
+        pts = (sl or {}).get("points") or []
+        if not pts:
+            self._draw_empty_insight_canvas(canvas, "No volume bars in slice")
+            return
+        canvas.update_idletasks()
+        w = canvas.winfo_width() or 980
+        h = canvas.winfo_height() or 84
+        left, right, top, bottom = 42, 44, 16, 16
+        cw = max(20, w - left - right)
+        ch = max(16, h - top - bottom)
+
+        kept_vols = [
+            float(p.get("words", 0))
+            for p in pts
+            if "volume_words" not in (p.get("_trimmed_values") or {}) and float(p.get("words", 0)) > 0
+        ]
+        max_w = max(kept_vols) if kept_vols else 1.0
+        n = len(pts)
+        slot = cw / float(max(1, n))
+        bar_w = max(1.5, min(18.0, slot * 0.72))
+
+        canvas.create_text(
+            left, 8,
+            text="Dictation Volume per Bucket (purple cap = 22:00–05:00 late-night share)",
+            fill="#94a3b8", font=("Arial", 7), anchor="w",
+        )
+        canvas.create_text(
+            left - 5, top, text=f"{int(max_w):,}", fill="#94a3b8",
+            font=("Consolas", 7), anchor="e",
+        )
+        canvas.create_line(left, top + ch, left + cw, top + ch, fill="#1e293b")
+
+        for i, p in enumerate(pts):
+            cx = (left + cw * 0.5) if n == 1 else (left + (i / float(n - 1)) * cw)
+            if "volume_words" in (p.get("_trimmed_values") or {}):
+                canvas.create_text(cx, top + 5, text="×", fill="#f59e0b", font=("Arial", 8, "bold"))
+                continue
+            words = float(p.get("words", 0))
+            if words <= 0:
+                continue
+            bh = max(2.0, min(1.0, words / max_w) * ch)
+            x0, x1 = cx - bar_w / 2.0, cx + bar_w / 2.0
+            y1 = top + ch
+            y0 = y1 - bh
+            canvas.create_rectangle(x0, y0, x1, y1, fill="#1d4e5f", outline="")
+            ln_pct = float(p.get("late_night_pct") or 0.0)
+            if ln_pct > 0.0:
+                nh = max(1.5, bh * min(1.0, ln_pct / 100.0))
+                canvas.create_rectangle(x0, y0, x1, y0 + nh, fill="#a855f7", outline="")
+
+    def _generate_html_report_sync(self, out_dir=None, trim_outliers=None):
+        """Build standalone offline HTML report (series.json + report.html) and return report path."""
+        script_root = os.path.dirname(os.path.abspath(__file__))
+        for root_cand in (app_dir, script_root):
+            if os.path.isdir(root_cand) and root_cand not in sys.path:
+                sys.path.insert(0, root_cand)
+        for candidate_dir in (os.path.join(app_dir, "analysis"), os.path.join(script_root, "analysis")):
+            if os.path.isdir(candidate_dir) and candidate_dir not in sys.path:
+                sys.path.insert(0, candidate_dir)
+        from analysis import build_series, report as analysis_report
+
+        target_out = os.path.abspath(out_dir or os.path.join(app_dir, "analysis", "out"))
+        os.makedirs(target_out, exist_ok=True)
+        trans_dir = os.path.join(app_dir, TRANSCRIPTIONS_DIR)
+        ai_path = os.path.join(app_dir, AI_INSIGHTS_FILE)
+
+        # Only touch Tk variables / scheduled flush when invoked on the Tk main thread
+        is_main = threading.current_thread() is threading.main_thread()
+        if is_main:
+            self._flush_lexical_index()
+        if trim_outliers is None:
+            trim_outliers = (
+                self._is_trim_outliers_enabled()
+                if is_main
+                else bool(self.config.get("insights_trim_outliers", False))
+            )
+
+        cache_p = (
+            self._lexical_cache_file()
+            if out_dir is None
+            else os.path.join(target_out, f"lexical_series_cache.{self._hostname()}.json")
+        )
+        series = build_series.build(
+            transcripts_dir=trans_dir,
+            cache_path=cache_p,
+            out_dir=target_out,
+            ai_insights_path=ai_path,
+            trim_outliers=bool(trim_outliers),
+        )
+        series_path = os.path.join(target_out, "series.json")
+        build_series.common.write_json(series_path, series)
+
+        cal_path = os.path.join(target_out, "calendar_features.json")
+        calendar = build_series.common.read_json(cal_path) if os.path.isfile(cal_path) else None
+        html_text = analysis_report.render(series, calendar=calendar)
+        report_path = os.path.join(target_out, "report.html")
+        tmp_html = f"{report_path}.{os.getpid()}.{int(time.time() * 1000) % 1000000}.tmp"
+        try:
+            with open(tmp_html, "w", encoding="utf-8") as fh:
+                fh.write(html_text)
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+            for attempt in range(5):
+                try:
+                    os.replace(tmp_html, report_path)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.02 * (attempt + 1))
+        finally:
+            try:
+                if os.path.exists(tmp_html):
+                    os.remove(tmp_html)
+            except OSError:
+                pass
+        return report_path
+
+    @staticmethod
+    def _open_local_file_in_browser(filepath):
+        """Open a local HTML file reliably across Windows (os.startfile / rundll32) and POSIX (webbrowser)."""
+        import pathlib
+
+        abs_p = os.path.normpath(os.path.abspath(filepath))
+        if hasattr(os, "startfile"):
+            try:
+                os.startfile(abs_p)  # type: ignore[attr-defined]
+                return True
+            except OSError:
+                pass
+        uri = pathlib.Path(abs_p).as_uri()
+        try:
+            if webbrowser.open(uri, new=2):
+                return True
+        except Exception:
+            pass
+        if sys.platform == "win32":
+            try:
+                subprocess.Popen(["rundll32", "url.dll,FileProtocolHandler", abs_p])
+                return True
+            except OSError:
+                pass
+        return False
+
+    def _export_and_open_html_report(self):
+        if getattr(self, "_html_report_building", False):
+            return
+        self._html_report_building = True
+
+        exp_btn = getattr(self, "_explorer_report_btn", None)
+        main_btn = getattr(self, "btn_html_report", None)
+        if exp_btn is not None:
+            try:
+                exp_btn.configure(state="disabled", text="Building...")
+            except Exception:
+                pass
+        if main_btn is not None:
+            try:
+                main_btn.configure(state="disabled", text="…")
+            except Exception:
+                pass
+        if hasattr(self, "_explorer_sub_var") and self._explorer_is_open():
+            self._explorer_sub_var.set("Building offline HTML report...")
+
+        # Read Tk state & flush lexical index safely on the Tk main thread before starting worker
+        trim_flag = self._is_trim_outliers_enabled()
+        try:
+            self._flush_lexical_index()
+        except Exception:
+            pass
+
+        job = {"done": False, "path": None, "err": None}
+
+        def _worker():
+            try:
+                job["path"] = self._generate_html_report_sync(trim_outliers=trim_flag)
+                self.log_internal(f"📄 Exported longitudinal HTML report: {job['path']}")
+            except (Exception, SystemExit) as exc:
+                job["err"] = str(exc) or exc.__class__.__name__
+                self.log_internal(f"HTML report export failed: {job['err']}")
+            finally:
+                job["done"] = True
+
+        def _poll_report_job():
+            if self._shutting_down:
+                self._html_report_building = False
+                return
+            if not job["done"]:
+                self._ui_after(25, _poll_report_job)
+                return
+
+            self._html_report_building = False
+            report_path = job["path"]
+            err_msg = job["err"]
+            cur_exp_btn = getattr(self, "_explorer_report_btn", None)
+            cur_main_btn = getattr(self, "btn_html_report", None)
+
+            if report_path and not err_msg:
+                if not NO_DIALOGS:
+                    try:
+                        self._open_local_file_in_browser(report_path)
+                    except Exception as open_exc:
+                        self.log_internal(f"Could not auto-launch browser for {report_path}: {open_exc}")
+                if hasattr(self, "_explorer_sub_var") and self._explorer_is_open():
+                    self._explorer_sub_var.set(f"✓ Saved & opened offline HTML report: {report_path}")
+                if cur_exp_btn is not None:
+                    try:
+                        cur_exp_btn.configure(state="normal", text="✓ Opened Report")
+                        self._ui_after(
+                            2400,
+                            lambda b=cur_exp_btn: b.configure(text="📄 HTML Report")
+                            if getattr(self, "_explorer_report_btn", None) is b
+                            else None,
+                        )
+                    except Exception:
+                        pass
+                if cur_main_btn is not None:
+                    try:
+                        cur_main_btn.configure(state="normal", text="✓")
+                        self._ui_after(
+                            2400,
+                            lambda b=cur_main_btn: b.configure(text="📄")
+                            if getattr(self, "btn_html_report", None) is b and not self._shutting_down
+                            else None,
+                        )
+                    except Exception:
+                        pass
+            else:
+                if hasattr(self, "_explorer_sub_var") and self._explorer_is_open():
+                    self._explorer_sub_var.set(f"⚠ HTML report export failed: {err_msg}")
+                if cur_exp_btn is not None:
+                    try:
+                        cur_exp_btn.configure(state="normal", text="📄 HTML Report")
+                    except Exception:
+                        pass
+                if cur_main_btn is not None:
+                    try:
+                        cur_main_btn.configure(state="normal", text="📄")
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+        self._ui_after(25, _poll_report_job)
 
     def toggle_insights(self):
         """Toggle the collapsible Speech Insights accordion; compute lazily."""
@@ -5074,8 +7035,6 @@ Troubleshooting:
             built = self._ensure_insight_tab_built(self.insight_tab_index)
             if self._insights_dirty or built:
                 self.refresh_insights_tabs()
-            # The histograms live in this body, so they were drawn against an
-            # unmapped (1px) canvas until now.
             self.root.after(80, self.update_histogram)
             self.root.after(80, lambda: self._update_metric_bands(
                 getattr(self, "_insights_snapshot", None) or {}))
@@ -5892,6 +7851,7 @@ Troubleshooting:
                     self.total_audio_duration += total_audio_duration
                     self.today_audio_duration += total_audio_duration
                     self.last_transcription_latency = total_latency
+                    self._push_pending_acoustic_meta(result_text, None, latency_ms=total_latency)
                     self.result_queue.put(f"[ONLINE] {result_text}")
 
                     word_count = len(result_text.split())
@@ -6529,6 +8489,11 @@ Troubleshooting:
             with self.batch_segment_lock:
                 ordered = sorted(segments_snapshot, key=lambda x: x['seq'])
                 results = [s['result'] for s in ordered if s['result'] and not s['result'].startswith('[Error')]
+                seg_metas = [
+                    s.get('acoustic_meta')
+                    for s in ordered
+                    if s.get('result') and not s['result'].startswith('[Error') and s.get('acoustic_meta')
+                ]
                 total_latency = sum(s.get('latency_ms', 0) for s in ordered)
                 full_text = " ".join(results).strip()
 
@@ -6536,6 +8501,13 @@ Troubleshooting:
             if full_text:
                 self.log_internal(f"✅ Batch complete: {len(ordered)} segments stitched")
                 self.last_transcription_latency = total_latency
+                w_count = len(tokenize_words(full_text))
+                batch_meta = (
+                    lexical_insights.merge_batch_acoustic_metas(seg_metas, total_words=w_count)
+                    if (lexical_insights is not None and seg_metas)
+                    else None
+                )
+                self._push_pending_acoustic_meta(full_text, batch_meta, latency_ms=total_latency)
                 self.result_queue.put(f"[BATCH] {full_text}")
 
                 def deliver():
@@ -7007,25 +8979,26 @@ Troubleshooting:
 
                 # Zero-disk in-memory inference whenever supported by the backend
                 if self.backend and hasattr(self.backend, 'transcribe_audio'):
-                    segments = self.backend.transcribe_audio(
+                    segments = list(self.backend.transcribe_audio(
                         audio_np,
                         sample_rate=AUDIO_RUNTIME["sample_rate"],
                         beam_size=1,
                         vad_filter=True,
                         language=lang,
-                    )
+                    ))
                     text = "".join([s.text for s in segments]).strip()
                 elif self.backend and hasattr(self.backend, 'transcribe'):
                     temp_path = self._temp_audio_path("live")
                     wav.write(temp_path, AUDIO_RUNTIME["sample_rate"], audio_np)
-                    segments = self.backend.transcribe(temp_path, beam_size=1)
+                    segments = list(self.backend.transcribe(temp_path, beam_size=1))
                     text = "".join([s.text for s in segments]).strip()
                 else:
                     temp_path = self._temp_audio_path("live")
                     wav.write(temp_path, AUDIO_RUNTIME["sample_rate"], audio_np)
-                    segments, _ = self.model.transcribe(
+                    raw_segments, _ = self.model.transcribe(
                         temp_path, beam_size=1, vad_filter=True, language=lang
                     )
+                    segments = list(raw_segments)
                     text = "".join([s.text for s in segments]).strip()
 
             latency_ms = (time.perf_counter() - start_time) * 1000
@@ -7038,6 +9011,14 @@ Troubleshooting:
             self._live_session_texts.append(text)
             self.log_internal(f"🎤 LIVE ⚡{latency_ms:.0f}ms")
             self.last_transcription_latency = latency_ms
+            ac_meta = (
+                lexical_insights.extract_acoustic_meta(
+                    duration, segments, words_count=len(tokenize_words(text))
+                )
+                if (lexical_insights is not None and duration > 0)
+                else None
+            )
+            self._push_pending_acoustic_meta(text, ac_meta, latency_ms=latency_ms)
             self.result_queue.put(f"[LIVE] {text}")
             if keyboard is not None:
                 try:
@@ -7101,6 +9082,7 @@ Troubleshooting:
         temp_file = None
         try:
             audio_np = np.concatenate(segment['audio'], axis=0).flatten()
+            seg_duration = len(audio_np) / AUDIO_RUNTIME["sample_rate"]
             lang = self._local_language_arg()
 
             with self._model_lock:
@@ -7109,33 +9091,42 @@ Troubleshooting:
                 start_time = time.perf_counter()
 
                 if self.backend and hasattr(self.backend, 'transcribe_audio'):
-                    segments = self.backend.transcribe_audio(
+                    segments = list(self.backend.transcribe_audio(
                         audio_np,
                         sample_rate=AUDIO_RUNTIME["sample_rate"],
                         beam_size=5,
                         vad_filter=True,
                         language=lang,
-                    )
+                    ))
                     text = " ".join([s.text for s in segments]).strip()
                 elif self.backend and hasattr(self.backend, 'transcribe'):
                     temp_file = self._temp_audio_path(f"batch_seg_{seq}")
                     wav.write(temp_file, AUDIO_RUNTIME["sample_rate"], audio_np)
-                    segments = self.backend.transcribe(temp_file)
+                    segments = list(self.backend.transcribe(temp_file))
                     text = " ".join([s.text for s in segments]).strip()
                 else:
                     temp_file = self._temp_audio_path(f"batch_seg_{seq}")
                     wav.write(temp_file, AUDIO_RUNTIME["sample_rate"], audio_np)
-                    segments, _ = self.model.transcribe(
+                    raw_segments, _ = self.model.transcribe(
                         temp_file, beam_size=5, vad_filter=True, language=lang
                     )
+                    segments = list(raw_segments)
                     text = " ".join([s.text for s in segments]).strip()
 
             latency_ms = (time.perf_counter() - start_time) * 1000
+            seg_ac_meta = (
+                lexical_insights.extract_acoustic_meta(
+                    seg_duration, segments, words_count=len(tokenize_words(text))
+                )
+                if (lexical_insights is not None and text and seg_duration > 0)
+                else None
+            )
 
             with self.batch_segment_lock:
                 segment['result'] = text
                 segment['status'] = 'done'
                 segment['latency_ms'] = latency_ms
+                segment['acoustic_meta'] = seg_ac_meta
                 segment['audio'] = None  # Free the raw audio - no longer needed
 
             self.log_internal(f"✅ Segment {seq + 1} ⚡{latency_ms:.0f}ms")
@@ -7340,8 +9331,27 @@ Troubleshooting:
         self.root.update()
         messagebox.showinfo("Copied", "Text copied to clipboard!")
 
-    def save_transcription(self, text, latency_ms=0):
-        """Save transcription to monthly log file and add to history"""
+    def _push_pending_acoustic_meta(self, clean_text, meta, latency_ms=None):
+        """Thread-safe handoff of per-utterance acoustic metadata & latency from worker threads."""
+        if not clean_text or (meta is None and latency_ms is None):
+            return
+        with self._acoustic_meta_lock:
+            self._pending_acoustic_metas.append((clean_text, meta, latency_ms))
+
+    def _pop_pending_acoustic_meta(self, clean_text):
+        """Pop the first matching ``(meta, latency_ms)`` tuple for ``clean_text``."""
+        if not clean_text:
+            return None, None
+        with self._acoustic_meta_lock:
+            for idx, item in enumerate(self._pending_acoustic_metas):
+                ptxt, pmeta, plat = item if len(item) == 3 else (item[0], item[1], None)
+                if ptxt == clean_text:
+                    del self._pending_acoustic_metas[idx]
+                    return pmeta, plat
+        return None, None
+
+    def save_transcription(self, text, latency_ms=0, acoustic_meta=None):
+        """Save transcription to monthly log file, record optional acoustic sidecar, and update history."""
         if not text.strip():
             return
             
@@ -7352,20 +9362,45 @@ Troubleshooting:
         self.current_transcription = text
         self.current_latency = latency_ms
         self.history_index = len(self.history) - 1  # Point to the latest
-        
+
+        # Update loaded LexicalDiskIndex BEFORE appending to disk so any mid-day
+        # tail seed from disk only reads strictly prior entries (zero double-counting).
+        if self._lexical_index is not None:
+            try:
+                self._lexical_index.record_live_entry(timestamp, text, acoustic_meta)
+            except Exception as e:
+                self.log_internal(f"Lexical index live update skipped: {e}")
+
+        trans_dir = os.path.join(app_dir, TRANSCRIPTIONS_DIR)
+        host = self._hostname()
+
         # Save to per-machine monthly file: each machine appends only to its own
         # file, so simultaneous use on two machines can't produce Dropbox
         # 'conflicted copy' duplicates. Readers merge all month files.
         try:
-            os.makedirs(TRANSCRIPTIONS_DIR, exist_ok=True)
-            filename = f"{timestamp.strftime('%Y-%m')}.{self._hostname()}.txt"
-            filepath = os.path.join(TRANSCRIPTIONS_DIR, filename)
+            os.makedirs(trans_dir, exist_ok=True)
+            filename = f"{timestamp.strftime('%Y-%m')}.{host}.txt"
+            filepath = os.path.join(trans_dir, filename)
             
             timestamp_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
             with open(filepath, 'a', encoding='utf-8') as f:
                 f.write(f"[{timestamp_str}] {text}\n")
         except Exception as e:
             self.log_internal(f"Error saving transcription: {e}")
+
+        # Forward sidecar for VAD speech ratio, internal pauses, and acoustic WPM
+        if acoustic_meta and lexical_insights is not None:
+            try:
+                lexical_insights.append_acoustic_meta(trans_dir, host, timestamp, acoustic_meta)
+            except Exception as e:
+                self.log_internal(f"Acoustic metadata sidecar skipped: {e}")
+
+        if self._lexical_index is not None:
+            try:
+                self._lexical_index.sync_host_watermarks(timestamp)
+                self._schedule_lexical_index_save()
+            except Exception:
+                pass
 
         # Keep the analytics cache in sync without re-reading the archive.
         # Tokens/language are appended too so refresh_insights_tabs never has to
@@ -7388,9 +9423,10 @@ Troubleshooting:
         cutoff_date = today - datetime.timedelta(days=TRANSCRIPTION_HISTORY_DAYS)
         cutoff_month = cutoff_date.strftime("%Y-%m")
         cutoff_dt = datetime.datetime.combine(cutoff_date, datetime.time.min)
+        trans_dir = os.path.join(app_dir, TRANSCRIPTIONS_DIR)
 
         try:
-            if not os.path.exists(TRANSCRIPTIONS_DIR):
+            if not os.path.exists(trans_dir):
                 return
 
             all_entries = []
@@ -7399,12 +9435,12 @@ Troubleshooting:
 
             # Merge all month files: legacy shared ("YYYY-MM.txt") and
             # per-machine ("YYYY-MM.HOSTNAME.txt"); skip Dropbox conflict debris
-            for filename in sorted(os.listdir(TRANSCRIPTIONS_DIR)):
+            for filename in sorted(os.listdir(trans_dir)):
                 if not filename.lower().endswith('.txt'):
                     continue
                 if 'conflicted copy' in filename.lower():
                     continue
-                filepath = os.path.join(TRANSCRIPTIONS_DIR, filename)
+                filepath = os.path.join(trans_dir, filename)
                 if not os.path.isfile(filepath):
                     continue
                 scanned_files += 1
@@ -7906,7 +9942,13 @@ Troubleshooting:
                 self.today_words += count
                 self.record_hourly_words(count)  # Track hourly activity
                 self.save_stats()  # Persist stats after each transcription
-                self.save_transcription(clean_text, self.last_transcription_latency)
+                ac_meta, item_latency = self._pop_pending_acoustic_meta(clean_text)
+                eff_latency = self.last_transcription_latency if item_latency is None else item_latency
+                self.save_transcription(
+                    clean_text,
+                    eff_latency,
+                    acoustic_meta=ac_meta,
+                )
                 self.last_transcription_latency = 0  # Reset after use
                 self._schedule_histogram_refresh()  # Refresh histogram (debounced)
             # -------------------
@@ -8614,6 +10656,7 @@ Troubleshooting:
             "_gui_loop_job",
             "_hotkey_watchdog_job",
             "_insights_refresh_job",
+            "_lexical_save_job",
             "_histogram_job",
             "_init_histogram_job",
             "_welcome_job",
@@ -8637,6 +10680,18 @@ Troubleshooting:
         if hasattr(self, "_active_tooltips"):
             self._active_tooltips.clear()
 
+        if getattr(self, "_trends_explorer_win", None) is not None:
+            try:
+                self._trends_explorer_win.destroy()
+            except Exception:
+                pass
+            self._trends_explorer_win = None
+        self._explorer_range_buttons = {}
+        self._explorer_period_combo = None
+        self._explorer_main_canvas = None
+        self._explorer_vol_canvas = None
+        self._explorer_report_btn = None
+
         # Stop whatever is recording. Done inline rather than via
         # _stop_any_recording(): that spawns the async finalisation threads,
         # which would sleep, transcribe and then touch widgets that this
@@ -8653,9 +10708,13 @@ Troubleshooting:
         except Exception:
             pass
 
-        # Persist any debounced stats right now
+        # Persist any debounced stats & lexical index cache right now
         try:
             self.flush_stats()
+        except Exception:
+            pass
+        try:
+            self._flush_lexical_index()
         except Exception:
             pass
 
