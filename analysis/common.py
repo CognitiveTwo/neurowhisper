@@ -291,6 +291,8 @@ def read_json(path, default=None):
 
 
 def write_json(path, data, indent=1):
+    import time as _time
+
     abs_path = os.path.abspath(path)
     os.makedirs(os.path.dirname(abs_path), exist_ok=True)
     tmp_path = f"{abs_path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
@@ -302,14 +304,20 @@ def write_json(path, data, indent=1):
                 os.fsync(fh.fileno())
             except OSError:
                 pass
-        os.replace(tmp_path, abs_path)
-    except Exception:
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, abs_path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                _time.sleep(0.02 * (attempt + 1))
+    finally:
         try:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
         except OSError:
             pass
-        raise
 
 
 def load_labels(labels_dir: str | None = None):

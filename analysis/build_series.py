@@ -44,6 +44,46 @@ def longest_streak(days):
     return best
 
 
+def _sanitize_day_label(rec):
+    if not isinstance(rec, dict):
+        return None
+    raw_ms = rec.get("mood_score")
+    clean_ms = None
+    if raw_ms is not None and not isinstance(raw_ms, bool):
+        try:
+            ms_f = float(raw_ms)
+            if 0.0 <= ms_f <= 100.0:
+                clean_ms = int(round(ms_f))
+        except (TypeError, ValueError):
+            clean_ms = None
+    raw_topics = rec.get("topics")
+    if not isinstance(raw_topics, list):
+        raw_topics = rec.get("projects") if isinstance(rec.get("projects"), list) else []
+    raw_acts = rec.get("activities")
+    if not isinstance(raw_acts, list):
+        raw_acts = []
+    return {
+        "mood": str(rec["mood"]).strip() if isinstance(rec.get("mood"), str) else None,
+        "mood_score": clean_ms,
+        "topics": [str(t).strip() for t in raw_topics if str(t).strip()],
+        "activities": [
+            str(a).strip().lower()
+            for a in raw_acts
+            if str(a).strip().lower() in common.ACTIVITIES
+        ],
+    }
+
+
+def _is_iso_day(key) -> bool:
+    if not isinstance(key, str) or len(key) != 10:
+        return False
+    try:
+        dt.date.fromisoformat(key)
+        return True
+    except ValueError:
+        return False
+
+
 def build(
     transcripts_dir=None,
     labels_dir=None,
@@ -52,24 +92,29 @@ def build(
     ai_insights_path=None,
     trim_outliers=False,
 ):
+    import inspect
+
     entries = common.load_entries(transcripts_dir)
     if not entries:
         raise SystemExit("No transcript entries found.")
     by_day = common.group_by_day(entries)
     eff_labels_dir = labels_dir or (os.path.join(out_dir, "labels") if out_dir else None)
-    labels = common.load_labels(eff_labels_dir)
+    raw_labels = common.load_labels(eff_labels_dir)
+    labels = {}
+    for day_k, rec in (raw_labels or {}).items():
+        if _is_iso_day(day_k):
+            clean_rec = _sanitize_day_label(rec)
+            if clean_rec is not None:
+                labels[day_k] = clean_rec
     if ai_insights_path and os.path.isfile(ai_insights_path):
         app_ai = common.read_json(ai_insights_path)
         daily_ai = (app_ai or {}).get("daily", app_ai) if isinstance(app_ai, dict) else {}
         if isinstance(daily_ai, dict):
             for day_k, rec in daily_ai.items():
-                if day_k not in labels and isinstance(rec, dict):
-                    labels[day_k] = {
-                        "mood": rec.get("mood"),
-                        "mood_score": rec.get("mood_score"),
-                        "topics": rec.get("topics", []),
-                        "activities": rec.get("activities", []),
-                    }
+                if _is_iso_day(day_k) and day_k not in labels:
+                    clean_rec = _sanitize_day_label(rec)
+                    if clean_rec is not None:
+                        labels[day_k] = clean_rec
 
     clusters_p = os.path.join(out_dir, "clusters.json") if out_dir else common.out_path("clusters.json")
     cats_p = os.path.join(out_dir, "categories.json") if out_dir else common.out_path("categories.json")
@@ -85,7 +130,7 @@ def build(
         counts = collections.Counter()
         if not have_categories:
             return counts
-        for t in label.get("topics", []):
+        for t in label.get("topics") or []:
             t = str(t).strip()
             cid = phrase_cluster.get(t)
             if cid is None:
@@ -94,6 +139,11 @@ def build(
             if cat:
                 counts[cat] += 1
         return counts
+
+    try:
+        _detect_accepts_tokens = len(inspect.signature(common.detect_language).parameters) >= 2
+    except (TypeError, ValueError):
+        _detect_accepts_tokens = False
 
     # ---- single-pass tokenization & per-day aggregation ----------------
     entry_word_counts = []
@@ -106,8 +156,14 @@ def build(
         st_day = by_day_stats[day_key]
         st_day["words"] += n
         st_day["entries"] += 1
-        if n and common.detect_language(e["text"], toks) == "de":
-            st_day["de_words"] += n
+        if n:
+            lang = (
+                common.detect_language(e["text"], toks)
+                if _detect_accepts_tokens
+                else common.detect_language(e["text"])
+            )
+            if lang == "de":
+                st_day["de_words"] += n
 
     daily = []
     for day in sorted(by_day):

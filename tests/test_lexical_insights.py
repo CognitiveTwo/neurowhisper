@@ -843,10 +843,43 @@ class TestSpeechInsights2GuiIntegration(unittest.TestCase):
         self.assertGreater(len(self.app._explorer_main_canvas.find_all()), 10)
         self.assertGreater(len(self.app._explorer_vol_canvas.find_all()), 3)
 
-        # Export HTML report while trim_outliers=True -> verify What it measures, Window pattern, and >2.5σ badge
-        report_out = os.path.join(self.tmp_dir.name, "report_out")
-        report_html_path = self.app._generate_html_report_sync(out_dir=report_out)
+        # Seed messy analysis/out/labels/*.json & ai_insights.json (string mood_score, null topics/activities, metadata keys)
+        labels_dir = os.path.join(self.tmp_dir.name, "analysis", "out", "labels")
+        os.makedirs(labels_dir, exist_ok=True)
+        label_day = (dt.date.today() - dt.timedelta(days=8)).isoformat()
+        with open(os.path.join(labels_dir, f"{label_day}.json"), "w", encoding="utf-8") as fh:
+            json.dump(
+                {"mood": "Calm", "mood_score": "68", "topics": None, "activities": "coding"},
+                fh,
+            )
+        ai_json_path = os.path.join(self.tmp_dir.name, "ai_insights.json")
+        sample_day = (dt.date.today() - dt.timedelta(days=5)).isoformat()
+        with open(ai_json_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "updated_at": "2026-11-14",
+                    sample_day: {"mood": "Focused", "mood_score": "74", "topics": None, "activities": None},
+                },
+                fh,
+            )
+
+        # Click the actual '📄 HTML Report' button (out_dir=None + background worker + browser launch)
+        opened_paths: list[str] = []
+        with mock.patch.object(self.wg, "NO_DIALOGS", False), mock.patch.object(
+            self.wg.WhisperApp,
+            "_open_local_file_in_browser",
+            side_effect=lambda p: (opened_paths.append(p), True)[1],
+        ):
+            self.app._explorer_report_btn.invoke()
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not opened_paths:
+                self.root.update()
+                time.sleep(0.02)
+
+        self.assertEqual(len(opened_paths), 1, f"Expected browser open on click; sub={self.app._explorer_sub_var.get()!r}")
+        report_html_path = opened_paths[0]
         self.assertTrue(os.path.isfile(report_html_path))
+        self.assertIn("✓ Saved & opened offline HTML report:", self.app._explorer_sub_var.get())
         with open(report_html_path, "r", encoding="utf-8") as fh:
             html = fh.read()
         self.assertIn("Longitudinal Lexical", html)
@@ -855,6 +888,33 @@ class TestSpeechInsights2GuiIntegration(unittest.TestCase):
         self.assertIn("Window pattern:", html)
         self.assertIn("2.5&sigma; excluded", html)
         self.assertIn("<svg", html)
+
+        # Verify Windows os.startfile path & webbrowser fallback in _open_local_file_in_browser
+        started: list[str] = []
+        with mock.patch.object(self.wg.os, "startfile", create=True, side_effect=lambda p: started.append(p)):
+            self.assertTrue(self.wg.WhisperApp._open_local_file_in_browser(report_html_path))
+            self.assertEqual(len(started), 1)
+        wb_uris: list[str] = []
+        with mock.patch.object(self.wg.os, "startfile", create=True, side_effect=OSError("no assoc")), mock.patch.object(
+            self.wg.webbrowser, "open", side_effect=lambda u, **kw: (wb_uris.append(u), True)[1]
+        ):
+            self.assertTrue(self.wg.WhisperApp._open_local_file_in_browser(report_html_path))
+            self.assertEqual(len(wb_uris), 1)
+            self.assertTrue(wb_uris[0].startswith("file://"))
+
+        # Also test main Speech Insights subbar '📄' HTML Report button
+        opened_main: list[str] = []
+        with mock.patch.object(self.wg, "NO_DIALOGS", False), mock.patch.object(
+            self.wg.WhisperApp,
+            "_open_local_file_in_browser",
+            side_effect=lambda p: (opened_main.append(p), True)[1],
+        ):
+            self.app.btn_html_report.invoke()
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not opened_main:
+                self.root.update()
+                time.sleep(0.02)
+        self.assertEqual(len(opened_main), 1)
 
         # Toggle outlier button OFF directly from Wide Explorer and verify original words restore
         self.app._explorer_trim_btn.invoke()

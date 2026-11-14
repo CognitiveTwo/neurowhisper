@@ -2656,9 +2656,59 @@ class WhisperApp:
         tk.Label(insights_top, text="Horizon", bg=COLOR_ACCENT_BG, fg=COLOR_TEXT_MUTED,
                  font=("Arial", 9)).pack(side="left")
 
-        # Row 2: Custom Period/Year + Bucket Granularity + Language Slice + Wide Explorer
+        # Row 2: Custom Period/Year + Bucket Granularity + Language Slice + Wide Explorer / Report
         insights_subbar = tk.Frame(self.insights_body, bg=COLOR_ACCENT_BG)
         insights_subbar.pack(fill="x", padx=self.CARD_PAD, pady=(0, 8))
+
+        self.insights_trim_outliers_var = tk.BooleanVar(
+            value=bool(self.config.get("insights_trim_outliers", False))
+        )
+
+        # Pack right-side action buttons first so Windows 125%/150% DPI scaling never clips them
+        self.btn_expand_insights = ctk.CTkButton(
+            insights_subbar, text="⤢ Expand", width=62, height=22,
+            corner_radius=7, font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color=COLOR_BG, hover_color=COLOR_TEAL_DIM,
+            border_width=1, border_color=COLOR_TEAL,
+            text_color=COLOR_TEAL,
+            command=self.open_trends_explorer,
+        )
+        self.btn_expand_insights.pack(side="right")
+        self._create_tooltip(
+            self.btn_expand_insights,
+            "Open wide resizable Longitudinal Trends Explorer & HTML Report export",
+        )
+
+        self.btn_html_report = ctk.CTkButton(
+            insights_subbar, text="📄", width=28, height=22,
+            corner_radius=7, font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color=COLOR_BG, hover_color=COLOR_TEAL_DIM,
+            border_width=1, border_color=COLOR_TEAL,
+            text_color=COLOR_TEAL,
+            command=self._export_and_open_html_report,
+        )
+        self.btn_html_report.pack(side="right", padx=(0, 3))
+        self._create_tooltip(
+            self.btn_html_report,
+            "Build & open standalone offline HTML report (analysis/out/report.html) in your browser",
+        )
+
+        self.btn_trim_outliers = ctk.CTkButton(
+            insights_subbar, text="✂ >2.5σ", width=64, height=22,
+            corner_radius=7, font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color=COLOR_BG, hover_color=COLOR_TEAL_DIM,
+            border_width=1, border_color=COLOR_BORDER,
+            text_color=COLOR_TEXT_MUTED,
+            command=self._toggle_trim_outliers,
+        )
+        self.btn_trim_outliers.pack(side="right", padx=(0, 3))
+        self._create_tooltip(
+            self.btn_trim_outliers,
+            "Kick out >2.5σ outliers (non-destructive):\n"
+            "Excludes accidental open-mic pushes, extreme stall spikes,\n"
+            "and runaway utterances from charts & averages without\n"
+            "modifying any transcript files on disk.",
+        )
 
         tk.Label(insights_subbar, text="Slice:", bg=COLOR_ACCENT_BG, fg=COLOR_TEXT_FAINT,
                  font=("Arial", 8)).pack(side="left", padx=(0, 3))
@@ -2667,9 +2717,9 @@ class WhisperApp:
             period_values.append(range_value)
         self.insights_period_combo = ttk.Combobox(
             insights_subbar, textvariable=self.insights_range_var,
-            values=period_values, state="readonly", width=10,
+            values=period_values, state="readonly", width=9,
         )
-        self.insights_period_combo.pack(side="left", padx=(0, 4))
+        self.insights_period_combo.pack(side="left", padx=(0, 3))
         self.insights_period_combo.bind("<<ComboboxSelected>>", self._on_insights_period_combo_select)
         self._enhance_combobox(
             self.insights_period_combo,
@@ -2684,7 +2734,7 @@ class WhisperApp:
             insights_subbar, textvariable=self.insights_bucket_var,
             values=list(INSIGHTS_BUCKET_OPTIONS), state="readonly", width=6,
         )
-        self.insights_bucket_combo.pack(side="left", padx=(0, 4))
+        self.insights_bucket_combo.pack(side="left", padx=(0, 3))
         self.insights_bucket_combo.bind("<<ComboboxSelected>>", self._on_insights_filter_change)
         self._enhance_combobox(
             self.insights_bucket_combo,
@@ -2699,46 +2749,11 @@ class WhisperApp:
             insights_subbar, textvariable=self.insights_lang_var,
             values=list(INSIGHTS_LANG_OPTIONS), state="readonly", width=4,
         )
-        self.insights_lang_combo.pack(side="left", padx=(0, 4))
+        self.insights_lang_combo.pack(side="left", padx=(0, 3))
         self.insights_lang_combo.bind("<<ComboboxSelected>>", self._on_insights_filter_change)
         self._enhance_combobox(
             self.insights_lang_combo,
             "Language filter: All (EN+DE normalized), EN only, or DE only",
-        )
-
-        self.insights_trim_outliers_var = tk.BooleanVar(
-            value=bool(self.config.get("insights_trim_outliers", False))
-        )
-
-        self.btn_expand_insights = ctk.CTkButton(
-            insights_subbar, text="⤢ Expand", width=66, height=22,
-            corner_radius=7, font=ctk.CTkFont(size=10, weight="bold"),
-            fg_color=COLOR_BG, hover_color=COLOR_TEAL_DIM,
-            border_width=1, border_color=COLOR_TEAL,
-            text_color=COLOR_TEAL,
-            command=self.open_trends_explorer,
-        )
-        self.btn_expand_insights.pack(side="right")
-        self._create_tooltip(
-            self.btn_expand_insights,
-            "Open wide resizable Longitudinal Trends Explorer & HTML Report export",
-        )
-
-        self.btn_trim_outliers = ctk.CTkButton(
-            insights_subbar, text="✂ >2.5σ", width=68, height=22,
-            corner_radius=7, font=ctk.CTkFont(size=10, weight="bold"),
-            fg_color=COLOR_BG, hover_color=COLOR_TEAL_DIM,
-            border_width=1, border_color=COLOR_BORDER,
-            text_color=COLOR_TEXT_MUTED,
-            command=self._toggle_trim_outliers,
-        )
-        self.btn_trim_outliers.pack(side="right", padx=(0, 4))
-        self._create_tooltip(
-            self.btn_trim_outliers,
-            "Kick out >2.5σ outliers (non-destructive):\n"
-            "Excludes accidental open-mic pushes, extreme stall spikes,\n"
-            "and runaway utterances from charts & averages without\n"
-            "modifying any transcript files on disk.",
         )
 
         # Coverage / baseline / freshness / profile notes
@@ -4062,12 +4077,15 @@ Troubleshooting:
             return label
         return INSIGHTS_RANGE_OPTIONS[INSIGHTS_RANGE_DEFAULT]
 
+    def _lexical_cache_file(self):
+        return os.path.join(app_dir, f"{LEXICAL_CACHE_PREFIX}.{self._hostname()}.json")
+
     def _get_lexical_index(self, force_rebuild=False):
         """Return the incremental per-machine LexicalDiskIndex (refreshing changed months)."""
         if lexical_insights is None:
             return None
         trans_dir = os.path.join(app_dir, TRANSCRIPTIONS_DIR)
-        cache_path = os.path.join(app_dir, f"{LEXICAL_CACHE_PREFIX}.{self._hostname()}.json")
+        cache_path = self._lexical_cache_file()
         idx = getattr(self, "_lexical_index", None)
         if idx is None or os.path.abspath(idx.transcriptions_dir) != os.path.abspath(trans_dir):
             idx = lexical_insights.LexicalDiskIndex(
@@ -6427,6 +6445,35 @@ Troubleshooting:
         top_bar = tk.Frame(win, bg=COLOR_ACCENT_BG, highlightthickness=1, highlightbackground=COLOR_BORDER)
         top_bar.pack(fill="x", padx=14, pady=(12, 8))
 
+        # Pack right-side buttons first so Windows high-DPI scaling never clips them
+        self._explorer_report_btn = ctk.CTkButton(
+            top_bar, text="📄 HTML Report", width=116, height=24, corner_radius=7,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color=COLOR_BG, hover_color=COLOR_TEAL_DIM,
+            border_width=1, border_color=COLOR_TEAL, text_color=COLOR_TEAL,
+            command=self._export_and_open_html_report,
+        )
+        self._explorer_report_btn.pack(side="right", padx=(4, 10), pady=8)
+        self._create_tooltip(
+            self._explorer_report_btn,
+            "Build & open standalone offline HTML report (analysis/out/report.html) in your default browser.\n"
+            "100% local — no data leaves this machine.",
+        )
+
+        self._explorer_trim_btn = ctk.CTkButton(
+            top_bar, text="✂ Kick >2.5σ", width=132, height=24, corner_radius=7,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color=COLOR_BG, hover_color=COLOR_TEAL_DIM,
+            border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT_MUTED,
+            command=self._toggle_trim_outliers,
+        )
+        self._explorer_trim_btn.pack(side="right", padx=(4, 2), pady=8)
+        self._create_tooltip(
+            self._explorer_trim_btn,
+            "Kick out >2.5σ outlier spikes (e.g. accidental hot-mic / stuck hotkey).\n"
+            "100% non-destructive — raw transcript files on disk are never modified.",
+        )
+
         chip_wrap = tk.Frame(top_bar, bg=COLOR_ACCENT_BG)
         chip_wrap.pack(side="left", padx=(10, 8), pady=8)
         tk.Label(chip_wrap, text="Horizon:", bg=COLOR_ACCENT_BG, fg=COLOR_TEXT_MUTED,
@@ -6476,29 +6523,6 @@ Troubleshooting:
         exp_lang.pack(side="left", padx=(0, 6))
         exp_lang.bind("<<ComboboxSelected>>", self._on_insights_filter_change)
         self._enhance_combobox(exp_lang, "Language filter (All = cross-language normalized)")
-
-        self._explorer_report_btn = ctk.CTkButton(
-            top_bar, text="📄 HTML Report", width=116, height=24, corner_radius=7,
-            font=ctk.CTkFont(size=10, weight="bold"),
-            fg_color=COLOR_BG, hover_color=COLOR_TEAL_DIM,
-            border_width=1, border_color=COLOR_TEAL, text_color=COLOR_TEAL,
-            command=self._export_and_open_html_report,
-        )
-        self._explorer_report_btn.pack(side="right", padx=(4, 10), pady=8)
-
-        self._explorer_trim_btn = ctk.CTkButton(
-            top_bar, text="✂ Kick >2.5σ", width=132, height=24, corner_radius=7,
-            font=ctk.CTkFont(size=10, weight="bold"),
-            fg_color=COLOR_BG, hover_color=COLOR_TEAL_DIM,
-            border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT_MUTED,
-            command=self._toggle_trim_outliers,
-        )
-        self._explorer_trim_btn.pack(side="right", padx=(4, 2), pady=8)
-        self._create_tooltip(
-            self._explorer_trim_btn,
-            "Kick out >2.5σ outlier spikes (e.g. accidental hot-mic / stuck hotkey).\n"
-            "100% non-destructive — raw transcript files on disk are never modified.",
-        )
 
         # 2. Callout & Coverage Strip
         callout_frame = tk.Frame(win, bg=COLOR_BG)
@@ -6805,9 +6829,12 @@ Troubleshooting:
                 nh = max(1.5, bh * min(1.0, ln_pct / 100.0))
                 canvas.create_rectangle(x0, y0, x1, y0 + nh, fill="#a855f7", outline="")
 
-    def _generate_html_report_sync(self, out_dir=None):
+    def _generate_html_report_sync(self, out_dir=None, trim_outliers=None):
         """Build standalone offline HTML report (series.json + report.html) and return report path."""
         script_root = os.path.dirname(os.path.abspath(__file__))
+        for root_cand in (app_dir, script_root):
+            if os.path.isdir(root_cand) and root_cand not in sys.path:
+                sys.path.insert(0, root_cand)
         for candidate_dir in (os.path.join(app_dir, "analysis"), os.path.join(script_root, "analysis")):
             if os.path.isdir(candidate_dir) and candidate_dir not in sys.path:
                 sys.path.insert(0, candidate_dir)
@@ -6818,9 +6845,16 @@ Troubleshooting:
         trans_dir = os.path.join(app_dir, TRANSCRIPTIONS_DIR)
         ai_path = os.path.join(app_dir, AI_INSIGHTS_FILE)
 
-        # Only touch Tk-scheduled flush directly when invoked on the main thread
-        if threading.current_thread() is threading.main_thread():
+        # Only touch Tk variables / scheduled flush when invoked on the Tk main thread
+        is_main = threading.current_thread() is threading.main_thread()
+        if is_main:
             self._flush_lexical_index()
+        if trim_outliers is None:
+            trim_outliers = (
+                self._is_trim_outliers_enabled()
+                if is_main
+                else bool(self.config.get("insights_trim_outliers", False))
+            )
 
         cache_p = (
             self._lexical_cache_file()
@@ -6832,7 +6866,7 @@ Troubleshooting:
             cache_path=cache_p,
             out_dir=target_out,
             ai_insights_path=ai_path,
-            trim_outliers=self._is_trim_outliers_enabled(),
+            trim_outliers=bool(trim_outliers),
         )
         series_path = os.path.join(target_out, "series.json")
         build_series.common.write_json(series_path, series)
@@ -6841,43 +6875,156 @@ Troubleshooting:
         calendar = build_series.common.read_json(cal_path) if os.path.isfile(cal_path) else None
         html_text = analysis_report.render(series, calendar=calendar)
         report_path = os.path.join(target_out, "report.html")
-        with open(report_path, "w", encoding="utf-8") as fh:
-            fh.write(html_text)
+        tmp_html = f"{report_path}.{os.getpid()}.{int(time.time() * 1000) % 1000000}.tmp"
+        try:
+            with open(tmp_html, "w", encoding="utf-8") as fh:
+                fh.write(html_text)
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+            for attempt in range(5):
+                try:
+                    os.replace(tmp_html, report_path)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.02 * (attempt + 1))
+        finally:
+            try:
+                if os.path.exists(tmp_html):
+                    os.remove(tmp_html)
+            except OSError:
+                pass
         return report_path
 
-    def _export_and_open_html_report(self):
-        btn = getattr(self, "_explorer_report_btn", None)
-        if btn is not None:
+    @staticmethod
+    def _open_local_file_in_browser(filepath):
+        """Open a local HTML file reliably across Windows (os.startfile / rundll32) and POSIX (webbrowser)."""
+        import pathlib
+
+        abs_p = os.path.normpath(os.path.abspath(filepath))
+        if hasattr(os, "startfile"):
             try:
-                btn.configure(state="disabled", text="Building...")
+                os.startfile(abs_p)  # type: ignore[attr-defined]
+                return True
+            except OSError:
+                pass
+        uri = pathlib.Path(abs_p).as_uri()
+        try:
+            if webbrowser.open(uri, new=2):
+                return True
+        except Exception:
+            pass
+        if sys.platform == "win32":
+            try:
+                subprocess.Popen(["rundll32", "url.dll,FileProtocolHandler", abs_p])
+                return True
+            except OSError:
+                pass
+        return False
+
+    def _export_and_open_html_report(self):
+        if getattr(self, "_html_report_building", False):
+            return
+        self._html_report_building = True
+
+        exp_btn = getattr(self, "_explorer_report_btn", None)
+        main_btn = getattr(self, "btn_html_report", None)
+        if exp_btn is not None:
+            try:
+                exp_btn.configure(state="disabled", text="Building...")
             except Exception:
                 pass
-        # Flush lexical index safely on the Tk main thread before starting worker
+        if main_btn is not None:
+            try:
+                main_btn.configure(state="disabled", text="…")
+            except Exception:
+                pass
+        if hasattr(self, "_explorer_sub_var") and self._explorer_is_open():
+            self._explorer_sub_var.set("Building offline HTML report...")
+
+        # Read Tk state & flush lexical index safely on the Tk main thread before starting worker
+        trim_flag = self._is_trim_outliers_enabled()
         try:
             self._flush_lexical_index()
         except Exception:
             pass
 
+        job = {"done": False, "path": None, "err": None}
+
         def _worker():
             try:
-                import pathlib
-
-                report_path = self._generate_html_report_sync()
-                self.log_internal(f"📄 Exported longitudinal HTML report: {report_path}")
-                if not NO_DIALOGS:
-                    webbrowser.open(pathlib.Path(os.path.abspath(report_path)).as_uri())
+                job["path"] = self._generate_html_report_sync(trim_outliers=trim_flag)
+                self.log_internal(f"📄 Exported longitudinal HTML report: {job['path']}")
             except (Exception, SystemExit) as exc:
-                self.log_internal(f"HTML report export failed: {exc}")
+                job["err"] = str(exc) or exc.__class__.__name__
+                self.log_internal(f"HTML report export failed: {job['err']}")
             finally:
-                def _restore():
-                    if btn is not None:
-                        try:
-                            btn.configure(state="normal", text="📄 HTML Report")
-                        except Exception:
-                            pass
-                self._ui_after(0, _restore)
+                job["done"] = True
+
+        def _poll_report_job():
+            if self._shutting_down:
+                self._html_report_building = False
+                return
+            if not job["done"]:
+                self._ui_after(25, _poll_report_job)
+                return
+
+            self._html_report_building = False
+            report_path = job["path"]
+            err_msg = job["err"]
+            cur_exp_btn = getattr(self, "_explorer_report_btn", None)
+            cur_main_btn = getattr(self, "btn_html_report", None)
+
+            if report_path and not err_msg:
+                if not NO_DIALOGS:
+                    try:
+                        self._open_local_file_in_browser(report_path)
+                    except Exception as open_exc:
+                        self.log_internal(f"Could not auto-launch browser for {report_path}: {open_exc}")
+                if hasattr(self, "_explorer_sub_var") and self._explorer_is_open():
+                    self._explorer_sub_var.set(f"✓ Saved & opened offline HTML report: {report_path}")
+                if cur_exp_btn is not None:
+                    try:
+                        cur_exp_btn.configure(state="normal", text="✓ Opened Report")
+                        self._ui_after(
+                            2400,
+                            lambda b=cur_exp_btn: b.configure(text="📄 HTML Report")
+                            if getattr(self, "_explorer_report_btn", None) is b
+                            else None,
+                        )
+                    except Exception:
+                        pass
+                if cur_main_btn is not None:
+                    try:
+                        cur_main_btn.configure(state="normal", text="✓")
+                        self._ui_after(
+                            2400,
+                            lambda b=cur_main_btn: b.configure(text="📄")
+                            if getattr(self, "btn_html_report", None) is b and not self._shutting_down
+                            else None,
+                        )
+                    except Exception:
+                        pass
+            else:
+                if hasattr(self, "_explorer_sub_var") and self._explorer_is_open():
+                    self._explorer_sub_var.set(f"⚠ HTML report export failed: {err_msg}")
+                if cur_exp_btn is not None:
+                    try:
+                        cur_exp_btn.configure(state="normal", text="📄 HTML Report")
+                    except Exception:
+                        pass
+                if cur_main_btn is not None:
+                    try:
+                        cur_main_btn.configure(state="normal", text="📄")
+                    except Exception:
+                        pass
 
         threading.Thread(target=_worker, daemon=True).start()
+        self._ui_after(25, _poll_report_job)
 
     def toggle_insights(self):
         """Toggle the collapsible Speech Insights accordion; compute lazily."""
