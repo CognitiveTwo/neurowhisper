@@ -67,19 +67,36 @@ def build(transcripts_dir=None, labels_dir=None):
                 counts[cat] += 1
         return counts
 
-    # ---- per-day aggregation -------------------------------------------
+    # ---- single-pass tokenization & per-day aggregation ----------------
+    entry_word_counts = []
+    by_day_stats = collections.defaultdict(lambda: {"words": 0, "de_words": 0, "entries": 0})
+    for e in entries:
+        toks = common.tokenize_words(e["text"])
+        n = len(toks)
+        entry_word_counts.append((e, n))
+        day_key = e["timestamp"].strftime("%Y-%m-%d")
+        st_day = by_day_stats[day_key]
+        st_day["words"] += n
+        st_day["entries"] += 1
+        if n and common.detect_language(e["text"], toks) == "de":
+            st_day["de_words"] += n
+
     daily = []
-    for day, day_entries in by_day.items():
+    for day in sorted(by_day):
         label = labels.get(day) or {}
-        words = sum(common.word_count(e["text"]) for e in day_entries)
+        st_day = by_day_stats[day]
+        words = st_day["words"]
+        de_words = st_day["de_words"]
+        de_share = round(de_words / words, 4) if words else 0.0
         daily.append({
             "date": day,
             "weekday": common.WEEKDAY_NAMES[dt.date.fromisoformat(day).weekday()],
             "words": words,
-            "entries": len(day_entries),
+            "de_words": de_words,
+            "entries": st_day["entries"],
             "mood": label.get("mood_score"),
             "mood_label": label.get("mood"),
-            "german_share": common.day_german_share(day_entries),
+            "german_share": de_share,
             "activities": label.get("activities", []),
             "categories": dict(category_counts(label)),
         })
@@ -100,15 +117,15 @@ def build(transcripts_dir=None, labels_dir=None):
         out = {}
         for row in rows:
             k = key(row)
-            b = out.setdefault(k, {"words": 0, "entries": 0, "days": 0,
-                                   "mood": [], "de": [], "cats": collections.Counter(),
+            b = out.setdefault(k, {"words": 0, "de_words": 0, "entries": 0, "days": 0,
+                                   "mood": [], "cats": collections.Counter(),
                                    "acts": collections.Counter()})
             b["words"] += row["words"]
+            b["de_words"] += row["de_words"]
             b["entries"] += row["entries"]
             b["days"] += 1
             if row["mood"] is not None:
                 b["mood"].append(row["mood"])
-            b["de"].append(row["german_share"])
             b["cats"].update(row["categories"])
             b["acts"].update(row["activities"])
         return out
@@ -128,7 +145,7 @@ def build(transcripts_dir=None, labels_dir=None):
                 "entries": b["entries"],
                 "mood_mean": mean(b["mood"]),
                 "mood_days": len(b["mood"]),
-                "german_share": round(st.mean(b["de"]), 3) if b["de"] else None,
+                "german_share": round(b["de_words"] / b["words"], 3) if b["words"] else 0.0,
                 "activities": dict(b["acts"]),
             }
             if have_categories:
@@ -146,15 +163,22 @@ def build(transcripts_dir=None, labels_dir=None):
     # ---- weekday and hour profiles --------------------------------------
     wd_words = collections.Counter()
     wd_entries = collections.Counter()
+    wd_days = collections.Counter()
     wd_mood = collections.defaultdict(list)
     for row in daily:
         wd_words[row["weekday"]] += row["words"]
         wd_entries[row["weekday"]] += row["entries"]
+        wd_days[row["weekday"]] += 1
         if row["mood"] is not None:
             wd_mood[row["weekday"]].append(row["mood"])
-    weekdays = [{"weekday": n, "words": wd_words[n], "entries": wd_entries[n],
-                 "days": len(wd_mood[n]), "mood_mean": mean(wd_mood[n])}
-                for n in common.WEEKDAY_NAMES]
+    weekdays = [{
+        "weekday": n,
+        "words": wd_words[n],
+        "entries": wd_entries[n],
+        "days": wd_days[n],
+        "mood_days": len(wd_mood[n]),
+        "mood_mean": mean(wd_mood[n]),
+    } for n in common.WEEKDAY_NAMES]
 
     hour_words = collections.Counter()
     hour_entries = collections.Counter()
@@ -162,9 +186,8 @@ def build(transcripts_dir=None, labels_dir=None):
     hour_mood_den = collections.Counter()
     grid = collections.Counter()  # (weekday index, hour) -> words
     mood_by_day = {r["date"]: r["mood"] for r in daily}
-    for e in entries:
+    for e, n in entry_word_counts:
         ts = e["timestamp"]
-        n = common.word_count(e["text"])
         hour_words[ts.hour] += n
         hour_entries[ts.hour] += 1
         grid[(ts.weekday(), ts.hour)] += n
@@ -179,6 +202,7 @@ def build(transcripts_dir=None, labels_dir=None):
     heat = [[grid[(w, h)] for h in range(24)] for w in range(7)]
 
     total_words = sum(r["words"] for r in daily)
+    total_de_words = sum(r.pop("de_words", 0) for r in daily)
     busiest = max(range(24), key=lambda h: hour_words[h]) if total_words else None
     moods = [r["mood"] for r in daily if r["mood"] is not None]
 
@@ -198,7 +222,7 @@ def build(transcripts_dir=None, labels_dir=None):
             "longest_streak": longest_streak([r["date"] for r in daily]),
             "busiest_hour": busiest,
             "mood_mean": mean(moods),
-            "german_share": round(st.mean(r["german_share"] for r in daily), 3),
+            "german_share": round(total_de_words / total_words, 3) if total_words else 0.0,
             "words_per_active_day": round(total_words / len(daily)) if daily else 0,
         },
         "daily": daily,

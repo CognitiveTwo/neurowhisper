@@ -28,17 +28,48 @@ TYPING_WPM = 40
 IDLE_UNLOAD_CHECK_INTERVAL_SECONDS = 15
 
 MODEL_MAP = {
+    "Large v3 Turbo (Fast & accurate, 99 langs, ~800MB)": "large-v3-turbo",
+    "Parakeet TDT 0.6B v3 (Ultra-fast ONNX, 25 langs, ~650MB)": "parakeet-tdt-0.6b-v3",
+    "Distil Large v3.5 (Ultra-fast English, ~750MB)": "distil-large-v3.5",
     "Large v3 (Best quality, 10GB+ VRAM GPU)": "large-v3",
     "Medium (GPU or fast CPU, 4GB+ RAM)": "medium",
     "Small (CPU-friendly, 2GB+ RAM)": "small",
     "Base (Minimal resources, quick)": "base",
-    "Parakeet TDT 0.6B v3 (Multi-lang, 2GB+ VRAM)": "nvidia/parakeet-tdt-0.6b-v3",
 }
+
+LEGACY_MODEL_ALIASES = {
+    "Parakeet TDT 0.6B v3 (Multi-lang, 2GB+ VRAM)": "parakeet-tdt-0.6b-v3",
+    "Parakeet TDT 0.6B v3 (Multi-lang, 2GB+ RAM)": "parakeet-tdt-0.6b-v3",
+    "Parakeet TDT 0.6B v2 (English, 2GB+ RAM)": "parakeet-tdt-0.6b-v2",
+}
+
+MODEL_DOWNLOAD_SIZES = {
+    "base": "150 MB",
+    "small": "460 MB",
+    "parakeet-tdt-0.6b-v3": "650 MB",
+    "parakeet-tdt-0.6b-v2": "650 MB",
+    "distil-large-v3.5": "750 MB",
+    "large-v3-turbo": "800 MB",
+    "canary-1b-v2": "1.0 GB",
+    "medium": "1.5 GB",
+    "large-v3": "3.0 GB",
+}
+
+# Model IDs natively served by OnnxAsrBackend when backend is "auto"
+ONNX_ASR_MODEL_IDS = frozenset({
+    "parakeet-tdt-0.6b-v3",
+    "nemo-parakeet-tdt-0.6b-v3",
+    "parakeet-tdt-0.6b-v2",
+    "nemo-parakeet-tdt-0.6b-v2",
+    "canary-1b-v2",
+    "nemo-canary-1b-v2",
+    "whisper-base",
+})
 
 DEFAULT_CONFIG = {
     "model_key": "Small (CPU-friendly, 2GB+ RAM)",
-    # "auto" for all three: a fresh install detects the hardware on first run
-    # and writes the resolved values into the per-machine config overlay.
+    # "auto" for all three: hardware is resolved lazily on the model-load thread
+    # so cold startup stays fast and hardware changes are respected.
     "backend": "auto",
     "device": "auto",
     "compute_type": "auto",
@@ -49,6 +80,7 @@ DEFAULT_CONFIG = {
     "input_device": None,
     "always_on_top": True,
     "transcription_mode": "local",
+    "local_language": "auto",
     "openai_api_key": "",
     "openai_transcription_model": "gpt-transcribe",
     "openai_edit_model": "gpt-4o-mini",
@@ -204,6 +236,7 @@ BACKEND_FACTORY_DEFAULTS = {
 
 BACKEND_DISPLAY_NAMES = {
     "faster-whisper": "Faster Whisper (CPU/CUDA)",
+    "onnx-asr": "ONNX ASR (CPU/GPU)",
     "openvino": "OpenVINO (Intel GPU)",
     "openai": "OpenAI Cloud (Online)",
     "parakeet": "Parakeet TDT (NVIDIA NeMo)",
@@ -213,29 +246,52 @@ ONLINE_BACKEND_NAME = "openai"
 
 BACKEND_OPTIONS = [
     "Auto",
-    "Parakeet (NVIDIA NeMo)",
-    "OpenVINO (Intel GPU)",
+    "ONNX ASR (CPU/GPU)",
     "CUDA (NVIDIA GPU)",
     "CPU only",
+    "OpenVINO (Intel GPU)",
+    "Parakeet (NVIDIA NeMo)",
 ]
 
 BACKEND_DISPLAY_TO_INTERNAL = {
     "Auto": "auto",
+    "ONNX ASR (CPU/GPU)": "onnx-asr",
     "Parakeet (NVIDIA NeMo)": "parakeet",
     "OpenVINO (Intel GPU)": "openvino",
     "CUDA (NVIDIA GPU)": "cuda",
     "CPU only": "faster-whisper",
 }
 
-# Keep behavior exactly as current GUI logic (Parakeet option does not map here yet).
 BACKEND_DISPLAY_TO_BACKEND_DEVICE = {
     # "auto" (not "faster-whisper") so the dropdown still reads "Auto" after a
     # restart and detect_best_backend() stays in charge of the choice.
     "Auto": ("auto", "auto"),
+    "ONNX ASR (CPU/GPU)": ("onnx-asr", "auto"),
+    "Parakeet (NVIDIA NeMo)": ("parakeet", "auto"),
     "OpenVINO (Intel GPU)": ("openvino", "auto"),
     "CUDA (NVIDIA GPU)": ("faster-whisper", "cuda"),
     "CPU only": ("faster-whisper", "cpu"),
 }
+
+
+def resolve_backend_display(backend: str, device: str = "auto") -> str:
+    """Map persisted ``(backend, device)`` config values back to a ``BACKEND_OPTIONS`` label."""
+    b = (backend or "auto").strip().lower()
+    d = (device or "auto").strip().lower()
+    if b == "auto":
+        return "Auto"
+    if b == "onnx-asr":
+        return "ONNX ASR (CPU/GPU)"
+    if b == "parakeet":
+        return "Parakeet (NVIDIA NeMo)"
+    if b == "openvino":
+        return "OpenVINO (Intel GPU)"
+    if b == "cuda" or (b == "faster-whisper" and d == "cuda"):
+        return "CUDA (NVIDIA GPU)"
+    if b == "faster-whisper" and d == "auto":
+        return "Auto"
+    return "CPU only"
+
 
 OPENAI_DEFAULT_EDIT_PROMPT = """You are a copy editor. Your job is to clean up transcribed speech.
 
@@ -264,6 +320,7 @@ OPENAI_DEFAULTS = {
 OPENAI_TRANSCRIPTION_MODELS = {
     "GPT Transcribe (Newest, recommended)": "gpt-transcribe",
     "GPT-4o Transcribe": "gpt-4o-transcribe",
+    "GPT-4o Mini Transcribe (Fast, low cost)": "gpt-4o-mini-transcribe",
     "Whisper-1 (Fast, reliable)": "whisper-1",
 }
 
@@ -286,6 +343,8 @@ TRANSCRIPTION_HISTORY_DAYS = 3650
 
 # OpenVINO model map and audio defaults
 OPENVINO_MODEL_MAP = {
+    "Large v3 Turbo (Fast & accurate, 99 langs, ~800MB)": "OpenVINO/whisper-large-v3-fp16-ov",
+    "Distil Large v3.5 (Ultra-fast English, ~750MB)": "OpenVINO/distil-whisper-large-v3-fp16-ov",
     "Large v3 (Best quality, 10GB+ VRAM GPU)": "OpenVINO/whisper-large-v3-fp16-ov",
     "Medium (GPU or fast CPU, 4GB+ RAM)": "OpenVINO/whisper-medium-fp16-ov",
     "Small (CPU-friendly, 2GB+ RAM)": "OpenVINO/whisper-small-fp16-ov",
@@ -294,6 +353,8 @@ OPENVINO_MODEL_MAP = {
 
 # Parakeet model map and defaults
 PARAKEET_MODEL_MAP = {
+    "Parakeet TDT 0.6B v3 (Ultra-fast ONNX, 25 langs, ~650MB)": "nvidia/parakeet-tdt-0.6b-v3",
+    "Parakeet TDT 0.6B v3 (Multi-lang, 2GB+ VRAM)": "nvidia/parakeet-tdt-0.6b-v3",
     "Parakeet TDT 0.6B v3 (Multi-lang, 2GB+ RAM)": "nvidia/parakeet-tdt-0.6b-v3",
     "Parakeet TDT 0.6B v2 (English, 2GB+ RAM)": "nvidia/parakeet-tdt-0.6b-v2",
 }
@@ -362,9 +423,9 @@ ENGLISH_FILLER_PATTERNS = {
 GERMAN_FILLER_PATTERNS = {
     "äh/ähm": r"\b(äh|ähm|öhm|öh)\b",
     "hm": r"\b(hm|hmm|mhm)\b",
-    "also/halt": r"\b(also|halt)\b",
+    "halt/irgendwie": r"\b(halt|irgendwie)\b",
     "quasi/sozusagen": r"\b(quasi|sozusagen)\b",
-    "genau/ne/ja": r"\b(genau|ne|ja)\b",
+    "sag ich mal": r"\b(sag ich mal|sage ich mal)\b",
 }
 
 ENGLISH_STOPWORDS = {

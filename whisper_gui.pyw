@@ -26,8 +26,11 @@ from app_config import (
     ICON_ICO,
     ICON_PNG,
     IDLE_UNLOAD_CHECK_INTERVAL_SECONDS,
+    LEGACY_MODEL_ALIASES,
     LIVE_PAUSE_RANGE,
+    MODEL_DOWNLOAD_SIZES,
     ONLINE_BACKEND_NAME,
+    ONNX_ASR_MODEL_IDS,
     MODEL_MAP,
     OPENAI_EDIT_MODEL_OPTIONS,
     OPENAI_KEY_URL,
@@ -53,6 +56,7 @@ from app_config import (
     TRANSCRIPTIONS_DIR,
     TYPING_WPM,
     UI_RUNTIME,
+    resolve_backend_display,
 )
 
 # Resolve app directory from script location (works from any CWD / Dropbox)
@@ -198,14 +202,37 @@ if sys.platform == 'win32':
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import customtkinter as ctk
-import sounddevice as sd
+import itertools
+import types as _types
+
+SOUNDDEVICE_ERROR = None
+try:
+    import sounddevice as sd
+except OSError as _sd_exc:
+    SOUNDDEVICE_ERROR = str(_sd_exc)
+    log.warning("Audio library unavailable (%s); microphone capture disabled.", _sd_exc)
+    sd = _types.ModuleType("sounddevice")
+    sd.default = _types.SimpleNamespace(device=None, samplerate=None, channels=None, dtype=None)
+    sd.PortAudioError = type("PortAudioError", (OSError,), {})
+    sd.query_devices = lambda *a, **kw: []
+    sd.query_hostapis = lambda *a, **kw: []
+    sd.InputStream = lambda *a, **kw: (_ for _ in ()).throw(
+        RuntimeError(f"PortAudio library not found ({SOUNDDEVICE_ERROR})")
+    )
+
 import numpy as np
-class _LazyWav:
-    """Defers `import scipy.io.wavfile` (~1.2s) until the first .write/.read."""
-    def __getattr__(self, name):
-        import scipy.io.wavfile as _wav
-        return getattr(_wav, name)
-wav = _LazyWav()
+from backends.base import write_pcm16_wav
+
+
+class _FastStdlibWav:
+    """Drop-in ``wav.write(path, rate, data)`` backed by stdlib ``wave`` (0ms import, clipped int16)."""
+
+    @staticmethod
+    def write(filename, rate, data):
+        write_pcm16_wav(filename, data, sample_rate=rate)
+
+
+wav = _FastStdlibWav()
 
 # Platform abstraction layer for keyboard/sound/clipboard
 try:
@@ -218,6 +245,7 @@ try:
         get_paste_shortcut,
         IS_MAC,
         IS_WINDOWS,
+        IS_LINUX,
         PLATFORM_NAME,
         KEYBOARD_ERROR,
     )
@@ -227,6 +255,7 @@ except ImportError:
     import keyboard
     IS_MAC = False
     IS_WINDOWS = True
+    IS_LINUX = sys.platform.startswith("linux")
     PLATFORM_NAME = 'windows'
     KEYBOARD_ERROR = None
     PLATFORM_UTILS_AVAILABLE = False
@@ -239,10 +268,11 @@ except ImportError:
 
 # Backend abstraction layer
 try:
-    from backends import create_backend, get_available_backends, detect_best_backend
+    from backends import create_backend, detect_best_backend, unload_all_backends
     BACKENDS_AVAILABLE = True
 except ImportError:
     BACKENDS_AVAILABLE = False
+    unload_all_backends = None
 
 import queue
 import threading
@@ -256,10 +286,17 @@ import webbrowser
 import re
 from collections import Counter, deque
 
-try:
-    from huggingface_hub import snapshot_download
-except ImportError:
-    snapshot_download = None
+_TEMP_FILE_COUNTER = itertools.count(1)
+
+
+def _get_snapshot_download():
+    """Lazy import of ``huggingface_hub.snapshot_download`` (used only by legacy fallback)."""
+    try:
+        from huggingface_hub import snapshot_download as _sd
+        return _sd
+    except ImportError:
+        return None
+
 
 # --- CONFIGURATION ---
 MODEL_MAP_REVERSE = {v: k for k, v in MODEL_MAP.items()}
@@ -364,8 +401,10 @@ class HotkeyManager:
 
         # The single hook that does everything: heartbeat + hotkey matching
         self._hook_ref = None
-        # Set of currently held key names (lowercase)
+        # Set of currently held key names (lowercase, normalized)
         self._pressed_keys = set()
+        self._fired_hotkeys = set()
+        self.paused = False
         self._install_hook()
 
         # Dead-hook detection
@@ -386,17 +425,38 @@ class HotkeyManager:
     def total_listener_restarts(self):
         return self._total_listener_restarts
 
+    _KEY_ALIASES = {
+        "left windows": "win",
+        "right windows": "win",
+        "windows": "win",
+        "super": "win",
+        "left super": "win",
+        "right super": "win",
+        "left ctrl": "ctrl",
+        "right ctrl": "ctrl",
+        "control": "ctrl",
+        "left alt": "alt",
+        "right alt": "alt",
+        "alt gr": "alt",
+        "left shift": "shift",
+        "right shift": "shift",
+        "left command": "command",
+        "right command": "command",
+        "cmd": "command",
+    }
+
+    @classmethod
+    def _normalize_key_name(cls, name):
+        n = (name or "").strip().lower()
+        return cls._KEY_ALIASES.get(n, n)
+
     # ------------------------------------------------------------------
     # Parse hotkey strings into sets of lowercase key names
     # ------------------------------------------------------------------
-    @staticmethod
-    def _parse_hotkey(hotkey_str):
-        """Parse 'ctrl+alt+s' or 'F9' into a frozenset of lowercase names.
-
-        Splits on '+' and strips each token individually so that multi-word
-        key names like 'right ctrl' are preserved.
-        """
-        parts = [p.strip().lower() for p in hotkey_str.split("+")]
+    @classmethod
+    def _parse_hotkey(cls, hotkey_str):
+        """Parse 'ctrl+alt+s' or 'F9' into a frozenset of normalized lowercase names."""
+        parts = [cls._normalize_key_name(p) for p in hotkey_str.split("+")]
         return frozenset(p for p in parts if p)
 
     # ------------------------------------------------------------------
@@ -404,48 +464,74 @@ class HotkeyManager:
     # ------------------------------------------------------------------
     def _install_hook(self):
         self._remove_hook()
+        if self._keyboard is None:
+            self._install_error = "Keyboard backend unavailable"
+            self._log("Hook install skipped: keyboard backend unavailable")
+            return
         try:
             def _on_key(event):
                 now = time.monotonic()
+                prev_event = self._last_hook_event
                 self._last_hook_event = now
 
                 name = getattr(event, "name", None)
                 if not name:
                     return
-                name_lower = name.lower()
+                name_lower = self._normalize_key_name(name)
                 event_type = getattr(event, "event_type", None)
 
-                to_fire = []
+                if self.paused:
+                    if event_type == "up":
+                        with self._lock:
+                            self._pressed_keys.discard(name_lower)
+                    return
+
+                cb_to_fire = None
+                hk_to_fire = None
                 if event_type == "down":
                     with self._lock:
+                        # Clear orphaned modifiers left behind by Win+L lock screen / UAC
+                        if now - prev_event > 8.0 and self._pressed_keys:
+                            self._pressed_keys.clear()
+                            self._fired_hotkeys.clear()
                         self._pressed_keys.add(name_lower)
+
+                        matched = []
                         for hk_name, binding in self._bindings.items():
-                            if binding["keys"].issubset(self._pressed_keys):
-                                last = self._last_trigger.get(hk_name, 0.0)
+                            req = binding["keys"]
+                            if req and req.issubset(self._pressed_keys):
+                                matched.append((len(req), hk_name, binding["callback"]))
+                            else:
+                                self._fired_hotkeys.discard(hk_name)
+
+                        if matched:
+                            matched.sort(key=lambda item: item[0], reverse=True)
+                            _sz, best_name, best_cb = matched[0]
+                            for _s, shadowed_name, _c in matched[1:]:
+                                self._fired_hotkeys.add(shadowed_name)
+                            if best_name not in self._fired_hotkeys:
+                                self._fired_hotkeys.add(best_name)
+                                last = self._last_trigger.get(best_name, 0.0)
                                 if now - last >= self.DEBOUNCE_S:
-                                    self._last_trigger[hk_name] = now
-                                    to_fire.append(
-                                        (hk_name, binding["callback"])
-                                    )
-                    # Fire callbacks outside the lock
-                    for hk_name, cb in to_fire:
+                                    self._last_trigger[best_name] = now
+                                    hk_to_fire = best_name
+                                    cb_to_fire = best_cb
+
+                    if cb_to_fire is not None:
                         try:
-                            cb()
+                            cb_to_fire()
                         except Exception as exc:
-                            self._flog(
-                                f"Hotkey callback error "
-                                f"({hk_name}): {exc}"
-                            )
+                            self._flog(f"Hotkey callback error ({hk_to_fire}): {exc}")
                 elif event_type == "up":
                     with self._lock:
                         self._pressed_keys.discard(name_lower)
+                        for hk_name, binding in self._bindings.items():
+                            if not binding["keys"].issubset(self._pressed_keys):
+                                self._fired_hotkeys.discard(hk_name)
 
             self._hook_ref = self._keyboard.hook(_on_key, suppress=False)
             self._flog("Hook-based hotkey handler installed")
         except Exception as e:
-            # Through _log, not _flog: a failed hook means no hotkeys at all,
-            # which the user has to see in the System Log, not only in
-            # logs/hotkey.log.
             self._install_error = str(e)
             self._log(f"Hook install failed: {e}")
             log.error("Keyboard hook install failed: %s", e)
@@ -627,13 +713,18 @@ def detect_cuda_available():
     Returns tuple: (is_available: bool, reason: str)
     """
     try:
+        from backends.faster_whisper_backend import FasterWhisperBackend
+        return FasterWhisperBackend().check_cuda()
+    except Exception:
+        pass
+    try:
         import ctranslate2
-        # Check if CUDA is supported by ctranslate2
+        if ctranslate2.get_cuda_device_count() <= 0:
+            return False, "No CUDA GPU detected (ctranslate2)"
         supported_devices = ctranslate2.get_supported_compute_types("cuda")
         if supported_devices:
             return True, "CUDA detected and available"
-        else:
-            return False, "CUDA not supported by ctranslate2"
+        return False, "CUDA not supported by ctranslate2"
     except Exception as e:
         error_str = str(e).lower()
         if any(kw in error_str for kw in CUDA_DETECT_KEYWORDS):
@@ -657,6 +748,7 @@ COLOR_TEAL = THEME_COLORS["teal"]         # Primary accent (bars, highlights)
 COLOR_TEAL_DIM = THEME_COLORS["teal_dim"]     # Subtle teal for backgrounds
 COLOR_BORDER = THEME_COLORS["border"]       # Subtle borders
 COLOR_LIVE = THEME_COLORS["live"]         # Red for live mode
+COLOR_FG_MUTED = THEME_COLORS["text_muted"]
 COLOR_BATCH = THEME_COLORS["batch"]        # Blue for batch mode
 COLOR_IDLE = THEME_COLORS["idle"]         # Gray
 COLOR_ONLINE = THEME_COLORS["online"]       # Purple for online mode
@@ -679,6 +771,11 @@ _WORD_RE = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)?")
 
 _GERMAN_UMLAUTS = set("äöüßÄÖÜ")
 
+_COMPILED_FILLERS = {
+    "en": {k: re.compile(p) for k, p in ENGLISH_FILLER_PATTERNS.items()},
+    "de": {k: re.compile(p) for k, p in GERMAN_FILLER_PATTERNS.items()},
+}
+
 
 def tokenize_words(text):
     """Unicode-aware word tokenizer (keeps umlauts, drops digits/punctuation)."""
@@ -686,20 +783,17 @@ def tokenize_words(text):
 
 
 def detect_entry_language(text, tokens=None):
-    """Cheap per-entry language heuristic -> 'de' or 'en'.
-
-    German if the text contains an umlaut/eszett, or if the share of German
-    function words among the tokens clears GERMAN_DETECT_THRESHOLD.
-    """
+    """Cheap per-entry language heuristic -> 'de' or 'en'."""
     if not text:
         return "en"
-    if any(ch in _GERMAN_UMLAUTS for ch in text):
-        return "de"
     if tokens is None:
         tokens = tokenize_words(text)
+    umlaut_count = sum(1 for ch in text if ch in _GERMAN_UMLAUTS)
     if not tokens:
-        return "en"
+        return "de" if umlaut_count > 0 else "en"
     hits = sum(1 for t in tokens if t in GERMAN_FUNCTION_WORDS)
+    if umlaut_count > 0 and (umlaut_count >= 2 or len(tokens) <= 5 or hits >= 1):
+        return "de"
     return "de" if (hits / len(tokens)) >= GERMAN_DETECT_THRESHOLD else "en"
 
 
@@ -712,9 +806,10 @@ def stopwords_for(lang):
 
 
 def count_fillers(text, lang):
-    """Return {pattern_label: count} for the given language's filler list."""
+    """Return {pattern_label: count} for the given language's precompiled filler list."""
     lowered = (text or "").lower()
-    return {k: len(re.findall(p, lowered)) for k, p in filler_patterns_for(lang).items()}
+    compiled = _COMPILED_FILLERS["de" if lang == "de" else "en"]
+    return {k: len(rx.findall(lowered)) for k, rx in compiled.items()}
 
 
 def filter_entries_by_days(entries, days, now=None):
@@ -842,11 +937,16 @@ class WhisperApp:
         self.live_buffer = [] # Class var to fix "last bit" bug
         self.live_backup_buffer = []
         self.live_buffer_lock = threading.Lock()  # Prevent race conditions on buffer
+        self._live_chunk_queue = queue.Queue()
+        self._live_session_texts = []
+        self._live_reset_event = threading.Event()
 
         # Transcription backend (set by load_model on its worker thread)
         self.backend = None
         self.current_backend_name = None
         self.current_device = None
+        self._model_loading = True
+        self._model_load_failed = False
 
         # Idle GPU unload: the model auto-unloads after idle_unload_minutes of
         # no dictation activity (freeing GPU memory held by faster-whisper's
@@ -865,6 +965,8 @@ class WhisperApp:
         self._analytics_tokens_cache = None
         self._analytics_langs_cache = None
         self._insights_refresh_job = None
+        self._ai_insights_mem_cache = None
+        self._ui_render_cache = {}
         # Personal trailing-baseline metrics (see _compute_metric_snapshot)
         self._personal_baseline = {}
         self._personal_baseline_days = 0
@@ -920,15 +1022,26 @@ class WhisperApp:
         self.total_latencies = self.stats.get('total_latencies', [])  # All-time latencies
 
         self.setup_ui()
-        self.load_recent_transcriptions()  # Load history from last 2 days
-        self.refresh_insights_tabs()  # Populate tabbed analytics from full transcript archive
+        self.load_recent_transcriptions()  # Load recent history (+ seed analytics cache)
+        # Defer full tabbed analytics build/paint slightly so the first window frame
+        # appears immediately even when Speech Insights was left expanded.
+        if not self.insights_collapsed.get():
+            self._schedule_insights_refresh(delay_ms=25)
+        else:
+            self._insights_dirty = True
         # Refresh stale AI insights once per app start, well after the UI settles
-        self.root.after(30000, self._maybe_auto_crunch_ai_insights)
+        self._hotkey_pump_job = None
+        self._gui_loop_job = None
+        self._hotkey_watchdog_job = None
+        self._init_histogram_job = None
+        self._welcome_job = None
+        self._auto_crunch_job = self.root.after(30000, self._maybe_auto_crunch_ai_insights)
         self.update_transcription_display()  # Show initial display
         self.root.attributes('-topmost', self.config['always_on_top'])
         
         # Threads
         threading.Thread(target=self.processing_loop, daemon=True).start()
+        threading.Thread(target=self._live_transcribe_loop, daemon=True).start()
         threading.Thread(target=self.load_model, daemon=True).start()
         threading.Thread(target=self._idle_unload_loop, daemon=True).start()
         
@@ -951,7 +1064,7 @@ class WhisperApp:
         # Fast hotkey pump: drains the action queue every 50ms independently of
         # the adaptive GUI loop (which idles at 1000ms - too slow for a hotkey
         # press, and recording only starts once the action is processed)
-        self.root.after(50, self._hotkey_pump)
+        self._hotkey_pump_job = self.root.after(50, self._hotkey_pump)
 
         # Window focus handler - refresh hotkeys when app regains focus
         self.root.bind("<FocusIn>", self._on_focus_in)
@@ -961,17 +1074,17 @@ class WhisperApp:
         self.root.bind("<Map>", self.on_restore)
         
         # UI Update Loop
-        self.root.after(UI_RUNTIME["initial_gui_loop_delay_ms"], self.update_gui_loop)
+        self._gui_loop_job = self.root.after(UI_RUNTIME["initial_gui_loop_delay_ms"], self.update_gui_loop)
         
         # Delayed histogram update (after canvas is fully sized)
-        self.root.after(UI_RUNTIME["initial_histogram_delay_ms"], self.update_histogram)
+        self._init_histogram_job = self.root.after(UI_RUNTIME["initial_histogram_delay_ms"], self.update_histogram)
 
         # Orderly shutdown when the window is closed
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         # First-run welcome. Scheduled on the Tk loop (never on the model
         # thread started above) and shown at most once per install.
-        self.root.after(700, self._maybe_show_welcome)
+        self._welcome_job = self.root.after(700, self._maybe_show_welcome)
 
     # --- Logging / Tk-safety helpers -------------------------------------
 
@@ -1126,33 +1239,377 @@ class WhisperApp:
         self.style.configure("TCheckbutton", background=COLOR_ACCENT_BG, foreground=COLOR_FG)
         self.style.configure("Horizontal.TProgressbar", troughcolor=COLOR_ACCENT_BG, background=COLOR_TEAL, bordercolor=COLOR_BG, lightcolor=COLOR_TEAL, darkcolor=COLOR_TEAL)
 
+    def _get_monitor_workarea(self, rx, ry):
+        """Return (left, top, right, bottom) of the monitor containing (rx, ry),
+        supporting multi-monitor negative/secondary coordinates on Windows."""
+        if IS_WINDOWS:
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                class _MONITORINFO(ctypes.Structure):
+                    _fields_ = [
+                        ("cbSize", wintypes.DWORD),
+                        ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT),
+                        ("dwFlags", wintypes.DWORD),
+                    ]
+
+                pt = wintypes.POINT(int(rx), int(ry))
+                hmon = ctypes.windll.user32.MonitorFromPoint(pt, 2)
+                if hmon:
+                    mi = _MONITORINFO()
+                    mi.cbSize = ctypes.sizeof(_MONITORINFO)
+                    if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                        r = mi.rcWork
+                        return int(r.left), int(r.top), int(r.right), int(r.bottom)
+            except Exception:
+                pass
+        try:
+            sw = int(self.root.winfo_screenwidth())
+            sh = int(self.root.winfo_screenheight())
+            if 0 <= rx < sw and 0 <= ry < sh:
+                return 0, 0, sw, sh
+        except Exception:
+            pass
+        return None
+
+    def _position_tooltip_window(self, tip, anchor_x, avoid_y_min, avoid_y_max, ref_x=None, ref_y=None):
+        """Place tooltip cleanly below avoid_y_max (or above avoid_y_min if near
+        screen bottom) without ever covering the cursor or spilling off-monitor."""
+        try:
+            tip.update_idletasks()
+            tip_w = max(1, tip.winfo_reqwidth())
+            tip_h = max(1, tip.winfo_reqheight())
+        except Exception:
+            tip_w, tip_h = 220, 28
+
+        x = int(anchor_x)
+        y = int(avoid_y_max) + 6
+        px = x if ref_x is None else int(ref_x)
+        py = int(avoid_y_max) if ref_y is None else int(ref_y)
+        bounds = self._get_monitor_workarea(px, py)
+        if bounds is not None:
+            ml, mt, mr, mb = bounds
+            if x + tip_w > mr - 6:
+                x = max(ml + 6, mr - tip_w - 6)
+            if x < ml + 6:
+                x = ml + 6
+            if y + tip_h > mb - 6:
+                y = max(mt + 6, int(avoid_y_min) - tip_h - 6)
+        tip.wm_geometry(f"+{int(x)}+{int(y)}")
+
     def _create_tooltip(self, widget, text):
-        """Create a hover tooltip for a widget"""
+        """Create a topmost dark-theme hover tooltip for ``widget``.
+
+        ``text`` may be either a string or a zero-arg callable returning a string.
+        """
+        if not hasattr(self, "_active_tooltips"):
+            self._active_tooltips = set()
         tooltip = None
-        
-        def show_tooltip(event):
+
+        def hide_tooltip(event=None):
             nonlocal tooltip
-            x = widget.winfo_rootx() + 10
-            y = widget.winfo_rooty() + widget.winfo_height() + 5
-            
-            tooltip = tk.Toplevel(widget)
-            tooltip.wm_overrideredirect(True)
-            tooltip.wm_geometry(f"+{x}+{y}")
-            tooltip.configure(bg="#333")
-            
-            label = tk.Label(tooltip, text=text, justify="left",
-                           bg="#333", fg="#fff", font=("Arial", 9),
-                           relief="solid", borderwidth=1, padx=8, pady=4)
-            label.pack()
-        
-        def hide_tooltip(event):
-            nonlocal tooltip
-            if tooltip:
-                tooltip.destroy()
+            if tooltip is not None:
+                self._active_tooltips.discard(tooltip)
+                try:
+                    tooltip.destroy()
+                except Exception:
+                    pass
                 tooltip = None
-        
-        widget.bind("<Enter>", show_tooltip)
-        widget.bind("<Leave>", hide_tooltip)
+
+        def show_tooltip(event=None):
+            nonlocal tooltip
+            if getattr(self, "_shutting_down", False):
+                return
+            hide_tooltip()
+            try:
+                resolved = text() if callable(text) else text
+            except Exception:
+                resolved = ""
+            if not resolved:
+                return
+            try:
+                wx = widget.winfo_rootx()
+                wy = widget.winfo_rooty()
+                wh = widget.winfo_height()
+            except Exception:
+                return
+
+            tooltip = tk.Toplevel(self.root)
+            self._active_tooltips.add(tooltip)
+            tooltip.wm_overrideredirect(True)
+            try:
+                tooltip.wm_attributes("-topmost", True)
+            except Exception:
+                pass
+            tooltip.configure(bg=COLOR_BORDER)
+
+            label = tk.Label(
+                tooltip,
+                text=str(resolved),
+                justify="left",
+                bg=COLOR_ACCENT_BG,
+                fg=COLOR_FG,
+                font=("Arial", 9),
+                padx=8,
+                pady=5,
+            )
+            label.pack(padx=1, pady=1)
+            self._position_tooltip_window(
+                tooltip,
+                anchor_x=wx + 8,
+                avoid_y_min=wy,
+                avoid_y_max=wy + wh,
+                ref_x=wx + 8,
+                ref_y=wy + wh // 2,
+            )
+
+        widget._nw_hide_tooltip = hide_tooltip
+        widget.bind("<Enter>", show_tooltip, add="+")
+        widget.bind("<Leave>", hide_tooltip, add="+")
+        widget.bind("<ButtonPress>", hide_tooltip, add="+")
+        widget.bind("<Unmap>", hide_tooltip, add="+")
+        widget.bind("<Destroy>", hide_tooltip, add="+")
+
+    def _enhance_combobox(self, combo, hint_text=None):
+        """Add three UX upgrades to a ``ttk.Combobox``:
+        1. Full-line hover tooltip on the closed combobox (selected value + hint).
+        2. Live per-item full-line hover tooltip inside the open dropdown list.
+        3. Auto-widened dropdown popup (via native ``postoffset``) plus a guard
+           preventing mouse-wheel page scrolling from mutating closed comboboxes.
+        """
+        import tkinter.font as tkfont
+
+        if not hasattr(self, "_active_tooltips"):
+            self._active_tooltips = set()
+        self._combo_style_seq = getattr(self, "_combo_style_seq", 0) + 1
+        style_name = f"NWCombo{self._combo_style_seq}.TCombobox"
+        try:
+            combo.configure(style=style_name)
+        except Exception:
+            style_name = None
+
+        def _closed_tooltip_text():
+            try:
+                current = (combo.get() or "").strip()
+            except Exception:
+                current = ""
+            if current and hint_text:
+                return f"{current}\n\n{hint_text}"
+            return current or (hint_text or "")
+
+        self._create_tooltip(combo, _closed_tooltip_text)
+
+        item_tip = None
+        item_label = None
+        last_idx = None
+        popdown_bound = False
+        last_postoffset = (0, 0, 0, 0)
+
+        def _hide_item_tip(*_args):
+            nonlocal item_tip, item_label, last_idx
+            last_idx = None
+            if item_tip is not None:
+                self._active_tooltips.discard(item_tip)
+                try:
+                    item_tip.destroy()
+                except Exception:
+                    pass
+                item_tip = None
+                item_label = None
+
+        def _show_item_tip(full_text, anchor_x, row_top_y, row_bot_y, ref_x, ref_y):
+            nonlocal item_tip, item_label
+            if getattr(self, "_shutting_down", False) or not full_text:
+                _hide_item_tip()
+                return
+            if item_tip is None or not item_tip.winfo_exists():
+                item_tip = tk.Toplevel(self.root)
+                self._active_tooltips.add(item_tip)
+                item_tip.wm_overrideredirect(True)
+                try:
+                    item_tip.wm_attributes("-topmost", True)
+                except Exception:
+                    pass
+                item_tip.configure(bg=COLOR_TEAL)
+                item_label = tk.Label(
+                    item_tip,
+                    text=full_text,
+                    justify="left",
+                    bg=COLOR_BG,
+                    fg=COLOR_FG,
+                    font=("Arial", 9),
+                    padx=9,
+                    pady=4,
+                )
+                item_label.pack(padx=1, pady=1)
+            else:
+                item_label.configure(text=full_text)
+            self._position_tooltip_window(
+                item_tip,
+                anchor_x=anchor_x,
+                avoid_y_min=row_top_y,
+                avoid_y_max=row_bot_y,
+                ref_x=ref_x,
+                ref_y=ref_y,
+            )
+
+        def _ensure_popdown_bound():
+            nonlocal popdown_bound
+            if popdown_bound:
+                return
+            try:
+                popdown = combo.tk.call("ttk::combobox::PopdownWindow", combo._w)
+                lb_path = f"{popdown}.f.l"
+            except Exception:
+                return
+
+            def _parse_bbox(raw_bbox):
+                if not raw_bbox:
+                    return None
+                if isinstance(raw_bbox, str):
+                    parts = raw_bbox.split()
+                    return [int(v) for v in parts] if len(parts) == 4 else None
+                if len(raw_bbox) == 4:
+                    return [int(v) for v in raw_bbox]
+                return None
+
+            def _on_lb_motion(x_s, y_s, rx_s, ry_s):
+                nonlocal last_idx
+                try:
+                    y = int(float(y_s))
+                    rx = int(float(rx_s))
+                    ry = int(float(ry_s))
+                    size = int(combo.tk.call(lb_path, "size"))
+                    if size <= 0:
+                        _hide_item_tip()
+                        return
+                    idx = int(combo.tk.call(lb_path, "nearest", y))
+                    bbox = _parse_bbox(combo.tk.call(lb_path, "bbox", idx))
+                    if not bbox:
+                        _hide_item_tip()
+                        return
+                    _bx, by, _bw, bh = bbox
+                    if y < by - 2 or y > by + bh + 2:
+                        _hide_item_tip()
+                        return
+                    full_line = str(combo.tk.call(lb_path, "get", idx))
+                    lb_rooty = int(combo.tk.call("winfo", "rooty", lb_path))
+                    row_top_y = lb_rooty + by
+                    row_bot_y = row_top_y + bh
+                    last_idx = idx
+                    _show_item_tip(full_line, rx + 14, row_top_y, row_bot_y, rx, ry)
+                except Exception:
+                    _hide_item_tip()
+
+            def _on_lb_key(*_a):
+                nonlocal last_idx
+                try:
+                    sel = combo.tk.call(lb_path, "curselection")
+                    if not sel:
+                        return
+                    idx = int(sel[0] if not isinstance(sel, str) else sel.split()[0])
+                    bbox = _parse_bbox(combo.tk.call(lb_path, "bbox", idx))
+                    if not bbox:
+                        return
+                    _bx, by, _bw, bh = bbox
+                    full_line = str(combo.tk.call(lb_path, "get", idx))
+                    lb_rootx = int(combo.tk.call("winfo", "rootx", lb_path))
+                    lb_rooty = int(combo.tk.call("winfo", "rooty", lb_path))
+                    last_idx = idx
+                    _show_item_tip(
+                        full_line,
+                        lb_rootx + 12,
+                        lb_rooty + by,
+                        lb_rooty + by + bh,
+                        lb_rootx + 12,
+                        lb_rooty + by + bh // 2,
+                    )
+                except Exception:
+                    pass
+
+            try:
+                motion_cmd = combo.register(_on_lb_motion)
+                key_cmd = combo.register(_on_lb_key)
+                hide_cmd = combo.register(_hide_item_tip)
+                combo._nw_popdown_callbacks = (
+                    _on_lb_motion,
+                    _on_lb_key,
+                    _hide_item_tip,
+                    motion_cmd,
+                    key_cmd,
+                    hide_cmd,
+                )
+                combo.tk.call("bind", lb_path, "<Motion>", f"+{motion_cmd} %x %y %X %Y")
+                combo.tk.call("bind", lb_path, "<KeyRelease-Up>", f"+{key_cmd}")
+                combo.tk.call("bind", lb_path, "<KeyRelease-Down>", f"+{key_cmd}")
+                combo.tk.call("bind", lb_path, "<Leave>", f"+{hide_cmd}")
+                combo.tk.call("bind", popdown, "<Unmap>", f"+{hide_cmd}")
+                popdown_bound = True
+            except Exception:
+                pass
+
+        def _on_post():
+            nonlocal last_postoffset
+            if hasattr(combo, "_nw_hide_tooltip"):
+                combo._nw_hide_tooltip()
+            _ensure_popdown_bound()
+            if not style_name:
+                return
+            try:
+                vals = list(combo["values"] or ())
+                if not vals:
+                    return
+                try:
+                    fnt = tkfont.nametofont(str(combo.cget("font") or "TkTextFont"))
+                except Exception:
+                    fnt = tkfont.nametofont("TkTextFont")
+                max_px = max(fnt.measure(str(v)) for v in vals) + 34
+                cb_w = max(1, combo.winfo_width())
+                cb_rx = combo.winfo_rootx()
+                cb_ry = combo.winfo_rooty()
+                bounds = self._get_monitor_workarea(cb_rx, cb_ry)
+                if bounds is not None:
+                    ml, _mt, mr, _mb = bounds
+                    max_px = min(max_px, max(cb_w, (mr - ml) - 20))
+                extra_w = max(0, int(max_px - cb_w))
+                dx = 0
+                if extra_w > 0 and bounds is not None:
+                    ml, _mt, mr, _mb = bounds
+                    overflow_r = (cb_rx + cb_w + extra_w) - (mr - 8)
+                    if overflow_r > 0:
+                        dx = -min(overflow_r, max(0, cb_rx - (ml + 8)))
+                new_offset = (int(dx), 0, int(extra_w), 0)
+                if new_offset != last_postoffset:
+                    last_postoffset = new_offset
+                    self.style.configure(style_name, postoffset=new_offset)
+                    combo.update_idletasks()
+            except Exception:
+                pass
+
+        try:
+            combo.configure(postcommand=_on_post)
+        except Exception:
+            pass
+
+        def _on_closed_combo_wheel(event):
+            try:
+                popdown = combo.tk.call("ttk::combobox::PopdownWindow", combo._w)
+                if int(combo.tk.call("winfo", "ismapped", popdown)):
+                    return None
+            except Exception:
+                pass
+            self._on_mousewheel(event, force_canvas=True)
+            return "break"
+
+        combo.bind("<MouseWheel>", _on_closed_combo_wheel)
+        if IS_LINUX:
+            combo.bind("<Button-4>", _on_closed_combo_wheel)
+            combo.bind("<Button-5>", _on_closed_combo_wheel)
+        combo.bind("<<ComboboxSelected>>", lambda _e: _hide_item_tip(), add="+")
+        combo.bind("<Destroy>", lambda _e: _hide_item_tip(), add="+")
+        combo._nw_hide_item_tip = _hide_item_tip
 
     def play_feedback_sound(self, start=True):
         # Use platform-aware sound function
@@ -1242,34 +1699,28 @@ class WhisperApp:
             needs_rewrite = True
             log.info("[Config] Existing config found - marking the first-run welcome as already shown")
 
+        # Normalize legacy/renamed model_key values so upgraded configs resolve cleanly.
+        raw_model_key = config.get("model_key", "")
+        if raw_model_key not in MODEL_MAP:
+            alias_id = LEGACY_MODEL_ALIASES.get(raw_model_key, raw_model_key)
+            if alias_id == "parakeet-tdt-0.6b-v2" and alias_id not in MODEL_MAP_REVERSE:
+                alias_id = "parakeet-tdt-0.6b-v3"
+            mapped_key = alias_id if alias_id in MODEL_MAP else MODEL_MAP_REVERSE.get(alias_id)
+            config["model_key"] = mapped_key if mapped_key in MODEL_MAP else DEFAULT_CONFIG["model_key"]
+
+        # Normalize legacy 'backend': 'cuda' configs to ('faster-whisper', 'cuda').
+        if config.get("backend") == "cuda":
+            config["backend"] = "faster-whisper"
+            if config.get("device") in ("auto", "", None):
+                config["device"] = "cuda"
+
         if needs_rewrite:
             self._persist_config(config)
 
-        # Auto-detect device/compute_type on a fresh install (both default to
-        # "auto"). The resolved values are written to the per-machine overlay,
-        # so this probe runs once per machine and not on every launch.
-        # 'backend' is deliberately NOT part of this: it stays "auto" and is
-        # resolved by _load_model_locked() on the model thread, against the
-        # live backend registry that also knows OpenVINO/Parakeet.
-        if config.get('device') == 'auto' or config.get('compute_type') == 'auto':
-            try:
-                device, compute_type, reason = get_optimal_device_config()
-            except Exception as e:
-                # Detection itself blew up: land on the universally safe combo.
-                device, compute_type = 'cpu', 'int8'
-                reason = f"hardware detection failed ({e}) - defaulting to CPU"
-                log.error("[Auto-detect] %s", reason)
-            if config.get('device') == 'auto':
-                config['device'] = device
-            if config.get('compute_type') == 'auto':
-                config['compute_type'] = compute_type
-            # 'backend' stays "auto" on purpose: the Backend dropdown shows
-            # "Auto" and _load_model_locked() resolves it against the live
-            # backend registry (which knows about OpenVINO/Parakeet too).
-            log.info("[Auto-detect] %s -> Using %s mode", reason, str(config['device']).upper())
-            # Save the detected config so it persists
-            self._save_local_config(config)
-
+        # Keep 'backend', 'device', and 'compute_type' as 'auto' during load_config():
+        # hardware probing (ctranslate2 / onnxruntime / openvino) runs off the Tk main
+        # thread inside _load_model_locked(), which makes cold window startup instant
+        # and avoids clobbering 'auto' to 'cpu' before OpenVINO/ONNX backends are checked.
         return config
 
     def load_stats(self):
@@ -1460,12 +1911,7 @@ class WhisperApp:
         return os.path.join(local_models_root, safe_name)
 
     # Approximate on-disk download sizes, shown in the first-run status text.
-    MODEL_DOWNLOAD_SIZES = {
-        "base": "150 MB",
-        "small": "460 MB",
-        "medium": "1.5 GB",
-        "large-v3": "3 GB",
-    }
+    MODEL_DOWNLOAD_SIZES = MODEL_DOWNLOAD_SIZES
 
     def is_model_downloaded(self, friendly_name):
         """True only when a real model weight file is present.
@@ -1474,25 +1920,60 @@ class WhisperApp:
         leaves config/tokenizer JSONs behind, and treating that as "downloaded"
         made the app skip the download and then fail to load, forever.
         """
-        target_dir = self.get_safe_model_path(friendly_name)
-        if not os.path.isdir(target_dir):
-            return False
-        for _root, _dirs, files in os.walk(target_dir):
-            if "model.bin" in files:
-                return True
-            # NeMo/Parakeet ships a single .nemo archive instead of model.bin,
-            # and OpenVINO ships an IR pair (openvino_*.xml + .bin). Without
-            # these an OpenVINO/Parakeet user sees "Downloading..." on every
-            # single start even though the model is already on disk.
-            if any(name.endswith(".nemo") or name.endswith(".xml") for name in files):
-                return True
+        candidate_dirs = [self.get_safe_model_path(friendly_name)]
+        if self.config.get("backend") == "onnx-asr":
+            model_id = MODEL_MAP.get(friendly_name, friendly_name)
+            fallback_map = {
+                "base": "whisper-base",
+                "distil-large-v3.5": "nemo-parakeet-tdt-0.6b-v2",
+                "small": "nemo-parakeet-tdt-0.6b-v3",
+                "medium": "nemo-parakeet-tdt-0.6b-v3",
+                "large-v3": "nemo-parakeet-tdt-0.6b-v3",
+                "large-v3-turbo": "nemo-parakeet-tdt-0.6b-v3",
+            }
+            if model_id in fallback_map:
+                candidate_dirs = [
+                    os.path.join(app_dir, "models", f"onnx_{fallback_map[model_id]}")
+                ]
+
+        for target_dir in candidate_dirs:
+            if not os.path.isdir(target_dir):
+                continue
+            for root, _dirs, files in os.walk(target_dir):
+                # Prune hidden metadata dirs (.cache, .locks) left by huggingface_hub
+                _dirs[:] = [d for d in _dirs if not d.startswith(".")]
+                if "model.bin" in files:
+                    return True
+                if any(name.endswith(".nemo") for name in files):
+                    return True
+                xml_stems = [os.path.splitext(name)[0] for name in files if name.endswith(".xml")]
+                if xml_stems:
+                    file_set = set(files)
+                    if all(
+                        f"{stem}.bin" in file_set
+                        and os.path.getsize(os.path.join(root, f"{stem}.bin")) > 0
+                        for stem in xml_stems
+                    ):
+                        return True
+                if any(name.endswith((".onnx", ".ort")) for name in files) and (
+                    "vocab.txt" in files or "config.json" in files
+                ):
+                    return True
         return False
+
+    def _local_language_arg(self):
+        """Return configured local transcription language code, or None for auto-detect."""
+        lang = str(self.config.get("local_language", "auto") or "auto").strip().lower()
+        return None if (not lang or lang == "auto") else lang
 
     @staticmethod
     def _temp_audio_path(tag):
-        """Scratch WAV path in the OS temp dir (keeps churn out of the Dropbox folder)."""
+        """Collision-free scratch WAV path in the OS temp dir (legacy fallback only)."""
         import tempfile
-        return os.path.join(tempfile.gettempdir(), f"neurowhisper_{tag}_{os.getpid()}.wav")
+        return os.path.join(
+            tempfile.gettempdir(),
+            f"neurowhisper_{tag}_{os.getpid()}_{next(_TEMP_FILE_COUNTER)}.wav",
+        )
 
     def _save_local_config(self, config=None):
         """Save machine-specific keys to per-machine config file."""
@@ -1526,29 +2007,140 @@ class WhisperApp:
             log.error("[Config] Warning: failed to save shared config: %s", e)
         self._save_local_config(config)
 
-    def _on_mousewheel(self, event):
-        """Handle mousewheel scrolling for the main content area."""
-        # Don't scroll canvas when mouse is over a text widget with its own scrollbar
-        widget = event.widget
-        if isinstance(widget, (tk.Text, scrolledtext.ScrolledText)):
+    def _on_canvas_configure(self, event):
+        """Sync content frame width and re-clamp scroll bounds when window resizes."""
+        try:
+            self._scroll_canvas.itemconfig(self._scroll_canvas_window, width=event.width)
+        except Exception:
+            pass
+        self._update_scroll_region()
+
+    def _on_scrollbar_yview(self, *args):
+        """Scrollbar command wrapper that keeps canvasy(0) strictly within [0, max_y]."""
+        try:
+            req_h = self.content_frame.winfo_reqheight()
+            avail_h = max(1, self._scroll_canvas.winfo_height())
+            if req_h <= avail_h:
+                self._scroll_canvas.yview_moveto(0.0)
+                return
+            self._scroll_canvas.yview(*args)
+            self._clamp_scroll_position(req_h, avail_h)
+        except Exception:
+            pass
+
+    def _clamp_scroll_position(self, req_h=None, avail_h=None):
+        """Ensure the content frame never scrolls into negative space (top gap)
+        or past its bottom edge."""
+        if req_h is None:
+            req_h = self.content_frame.winfo_reqheight()
+        if avail_h is None:
+            avail_h = max(1, self._scroll_canvas.winfo_height())
+        region_h = max(req_h, avail_h, 1)
+        cur_y = float(self._scroll_canvas.canvasy(0))
+        if req_h <= avail_h:
+            if abs(cur_y) > 0.5:
+                self._scroll_canvas.yview_moveto(0.0)
             return
-        self._scroll_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        max_y = float(req_h - avail_h)
+        clamped_y = max(0.0, min(max_y, cur_y))
+        if abs(clamped_y - cur_y) > 0.5:
+            self._scroll_canvas.yview_moveto(clamped_y / float(region_h))
+
+    def _schedule_scroll_region_sync(self):
+        """Refresh and clamp scroll bounds immediately and once layout settles."""
+        if getattr(self, "_shutting_down", False):
+            return
+        try:
+            self.content_frame.update_idletasks()
+            self._update_scroll_region()
+        except Exception:
+            pass
+        prev = getattr(self, "_scroll_sync_job", None)
+        if prev is not None:
+            try:
+                self.root.after_cancel(prev)
+            except Exception:
+                pass
+
+        def _settled():
+            self._scroll_sync_job = None
+            if not getattr(self, "_shutting_down", False):
+                self._update_scroll_region()
+
+        self._scroll_sync_job = self.root.after(50, _settled)
+
+    def _on_mousewheel(self, event, force_canvas=False):
+        """Handle mousewheel/touchpad scrolling with strict [0, max_y] clamping."""
+        if not force_canvas:
+            widget = getattr(event, "widget", None)
+            # Internal Tcl popup widgets (such as open ttk.Combobox popdown listboxes)
+            # arrive as raw str paths: let them scroll their own list without moving root.
+            if isinstance(widget, str):
+                return
+            if isinstance(widget, (tk.Text, scrolledtext.ScrolledText, tk.Listbox)):
+                return
+            if widget is not None:
+                try:
+                    if widget.winfo_toplevel() is not self.root:
+                        return
+                except Exception:
+                    return
+
+        try:
+            req_h = self.content_frame.winfo_reqheight()
+            avail_h = max(1, self._scroll_canvas.winfo_height())
+            if req_h <= avail_h:
+                if abs(float(self._scroll_canvas.canvasy(0))) > 0.5:
+                    self._scroll_canvas.yview_moveto(0.0)
+                return
+
+            num = getattr(event, "num", None)
+            delta = getattr(event, "delta", 0)
+            if num == 4:
+                step_px = -48.0
+            elif num == 5:
+                step_px = 48.0
+            elif delta:
+                # Windows/X11 wheel notch = ±120 -> 48 px; Precision Touchpad
+                # sends smaller smooth deltas (e.g. 15..60); macOS sends small ints.
+                if IS_MAC and abs(delta) < 20:
+                    step_px = float(-delta) * 14.0
+                else:
+                    step_px = -(float(delta) / 120.0) * 48.0
+                    if 0.0 < abs(step_px) < 4.0:
+                        step_px = -4.0 if step_px < 0 else 4.0
+            else:
+                return
+
+            region_h = float(max(req_h, avail_h))
+            cur_y = float(self._scroll_canvas.canvasy(0))
+            max_y = float(req_h - avail_h)
+            new_y = max(0.0, min(max_y, cur_y + step_px))
+            if abs(new_y - cur_y) >= 0.5:
+                self._scroll_canvas.yview_moveto(new_y / region_h)
+        except Exception:
+            pass
 
     def _update_scroll_region(self, event=None):
-        """Update the scroll region when content changes size, and show the
-        scrollbar only while the content actually overflows the viewport."""
-        self._scroll_canvas.configure(scrollregion=self._scroll_canvas.bbox("all"))
+        """Update the scroll region when content or viewport changes size,
+        clamp scrollregion height >= viewport height so content can never drift
+        into negative space, and show the scrollbar only when content overflows."""
         try:
-            req = self.content_frame.winfo_reqheight()
-            avail = self._scroll_canvas.winfo_height()
+            req_w = max(1, self._scroll_canvas.winfo_width())
+            req_h = self.content_frame.winfo_reqheight()
+            avail_h = max(1, self._scroll_canvas.winfo_height())
+            region_h = max(req_h, avail_h)
+            self._scroll_canvas.configure(scrollregion=(0, 0, req_w, region_h))
+            self._clamp_scroll_position(req_h, avail_h)
+
             mapped = bool(self._scroll_vsb.winfo_ismapped())
             # Hysteresis: hiding the bar widens the canvas, which can re-wrap
-            # content and change reqheight, so the hide threshold sits well
-            # below the show threshold to stop the two from oscillating.
-            if not mapped and req > avail:
+            # content and change reqheight, so the hide threshold sits below
+            # the show threshold to stop the two from oscillating.
+            if not mapped and req_h > avail_h + 2:
                 self._scroll_vsb.pack(side="right", fill="y",
                                       before=self._scroll_canvas)
-            elif mapped and req <= avail - 24:
+            elif mapped and req_h <= avail_h - 18:
                 self._scroll_vsb.pack_forget()
         except Exception:
             pass
@@ -1651,6 +2243,14 @@ class WhisperApp:
             dev_name = dev_name[:25].rstrip() + "…"
         self.device_info_var.set(f"Mic · {dev_name}" if dev_name else "Mic · default")
 
+        live_be = self.current_backend_name or self.config.get('backend', 'auto')
+        live_dev = self.current_device or self.config.get('device', 'auto')
+        if hasattr(self, "backend_status_label"):
+            try:
+                self.backend_status_label.config(text=f"[{live_be} / {live_dev}]")
+            except Exception:
+                pass
+
         if self.transcription_mode.get() == 'online':
             model = self.config.get('openai_transcription_model',
                                     DEFAULT_CONFIG['openai_transcription_model'])
@@ -1658,14 +2258,16 @@ class WhisperApp:
         else:
             model_key = self.config.get('model_key', '')
             short = model_key.split('(')[0].strip() or model_key
-            device = self.config.get('device', 'cpu')
-            compute = self.config.get('compute_type', 'int8')
-            self.model_info_var.set(f"{short} · {device} · {compute}")
+            compute = self.config.get('compute_type', 'auto')
+            if compute == 'auto' and live_dev != 'auto':
+                compute = 'float16' if str(live_dev).lower() == 'cuda' else 'int8'
+            self.model_info_var.set(f"{short} · {live_dev} · {compute}")
+        self._update_config_summary()
 
     def _config_summary_text(self):
         model_key = self.config.get('model_key', '')
         short = model_key.split('(')[0].strip() or model_key
-        device = self.config.get('device', 'cpu')
+        device = self.current_device or self.config.get('device', 'auto')
         try:
             pause = float(self.live_pause_var.get())
         except Exception:
@@ -1675,6 +2277,13 @@ class WhisperApp:
     def _update_config_summary(self):
         if hasattr(self, "config_summary_var"):
             self.config_summary_var.set(self._config_summary_text())
+
+    def _on_local_lang_change(self, event=None):
+        if not hasattr(self, "local_lang_var"):
+            return
+        self.config['local_language'] = (self.local_lang_var.get() or "auto").strip().lower()
+        self._persist_config()
+        self.log_internal(f"Local language set to: {self.config['local_language']}")
 
     def setup_ui(self):
         # --- STATUS STRIP (pack first at bottom so it stays fixed) ---
@@ -1693,9 +2302,12 @@ class WhisperApp:
             side="right", padx=(4, 14), pady=4)
 
         # --- SCROLLABLE CONTENT AREA (fallback for expanded accordions) ---
-        self._scroll_canvas = tk.Canvas(self.root, bg=COLOR_BG, highlightthickness=0)
-        self._scroll_vsb = ttk.Scrollbar(self.root, orient="vertical",
-                                          command=self._scroll_canvas.yview)
+        self._scroll_canvas = tk.Canvas(
+            self.root, bg=COLOR_BG, highlightthickness=0, yscrollincrement=1
+        )
+        self._scroll_vsb = ttk.Scrollbar(
+            self.root, orient="vertical", command=self._on_scrollbar_yview
+        )
         self.content_frame = tk.Frame(self._scroll_canvas, bg=COLOR_BG)
 
         self.content_frame.bind("<Configure>", self._update_scroll_region)
@@ -1704,15 +2316,16 @@ class WhisperApp:
         )
         self._scroll_canvas.configure(yscrollcommand=self._scroll_vsb.set)
 
-        self._scroll_vsb.pack(side="right", fill="y")
         self._scroll_canvas.pack(side="left", fill="both", expand=True)
 
-        # Keep content frame width in sync with canvas viewport
-        self._scroll_canvas.bind("<Configure>",
-            lambda e: self._scroll_canvas.itemconfig(self._scroll_canvas_window, width=e.width))
+        # Keep content frame width AND clamped scrollregion in sync with viewport
+        self._scroll_canvas.bind("<Configure>", self._on_canvas_configure)
 
-        # Mousewheel scrolling
+        # Mousewheel scrolling (Windows/macOS <MouseWheel>, Linux X11 <Button-4>/<Button-5>)
         self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+        if IS_LINUX:
+            self.root.bind_all("<Button-4>", self._on_mousewheel)
+            self.root.bind_all("<Button-5>", self._on_mousewheel)
 
         # --- HEADER: wordmark + three icon buttons ---
         header_frame = tk.Frame(self.content_frame, bg=COLOR_BG)
@@ -1884,10 +2497,26 @@ class WhisperApp:
         foot.pack(fill="x", pady=(6, 0))
         self.device_info_var = tk.StringVar(value="Mic · default")
         self.model_info_var = tk.StringVar(value="")
-        tk.Label(foot, textvariable=self.device_info_var, bg=COLOR_ACCENT_BG,
-                 fg=COLOR_TEXT_FAINT, font=("Arial", 8)).pack(side="left")
-        tk.Label(foot, textvariable=self.model_info_var, bg=COLOR_ACCENT_BG,
-                 fg=COLOR_TEXT_FAINT, font=("Arial", 8)).pack(side="right")
+        mic_footer_lbl = tk.Label(foot, textvariable=self.device_info_var, bg=COLOR_ACCENT_BG,
+                                  fg=COLOR_TEXT_FAINT, font=("Arial", 8))
+        mic_footer_lbl.pack(side="left")
+        model_footer_lbl = tk.Label(foot, textvariable=self.model_info_var, bg=COLOR_ACCENT_BG,
+                                    fg=COLOR_TEXT_FAINT, font=("Arial", 8))
+        model_footer_lbl.pack(side="right")
+        self._create_tooltip(
+            mic_footer_lbl,
+            lambda: f"Mic · {self.device_var.get()}"
+            if hasattr(self, "device_var") and self.device_var.get()
+            else self.device_info_var.get(),
+        )
+        self._create_tooltip(
+            model_footer_lbl,
+            lambda: (
+                f"{self.config.get('model_key', '')}\n({self.model_info_var.get()})"
+                if self.transcription_mode.get() == "local"
+                else f"Cloud · {self.model_info_var.get()}"
+            ),
+        )
 
         # ==============================================================
         # 2. LAST TRANSCRIPTION CARD
@@ -2159,6 +2788,10 @@ class WhisperApp:
         self.combo = ttk.Combobox(r1, textvariable=self.model_var, values=display_values, width=28, state="readonly")
         self.combo.pack(side="left", padx=5)
         self.combo.bind("<<ComboboxSelected>>", self.on_model_select)
+        self._enhance_combobox(
+            self.combo,
+            "Local speech-to-text model ('[get]' = downloads once on first selection, then runs 100% offline)",
+        )
 
         # Recovery affordance after a failed load (the error dialog names it).
         self.btn_reload_model = tk.Button(
@@ -2197,6 +2830,22 @@ class WhisperApp:
 
         cb = ttk.Checkbutton(r1b, text="On Top", variable=self.top_var, command=self.on_top_change)
         cb.pack(side="left", padx=10)
+
+        ttk.Label(r1b, text="Lang:").pack(side="left", padx=(6, 0))
+        self.local_lang_var = tk.StringVar(value=self.config.get('local_language', DEFAULT_CONFIG['local_language']))
+        local_lang_combo = ttk.Combobox(
+            r1b,
+            textvariable=self.local_lang_var,
+            values=["auto", "en", "de", "es", "fr", "it", "pt", "nl", "pl", "ru", "zh", "ja", "ko"],
+            width=6,
+            state="readonly",
+        )
+        local_lang_combo.pack(side="left", padx=4)
+        local_lang_combo.bind("<<ComboboxSelected>>", self._on_local_lang_change)
+        self._enhance_combobox(
+            local_lang_combo,
+            "Spoken language for local dictation ('auto' detects automatically;\npinning 'en' or 'de' avoids short-chunk language flips).",
+        )
 
         r2 = ttk.Frame(self.settings_content)
         r2.pack(fill="x", padx=5, pady=5)
@@ -2241,8 +2890,10 @@ class WhisperApp:
         else:
             self.device_var = tk.StringVar(value=default_dev)
             mic_combo = ttk.Combobox(r2, textvariable=self.device_var, values=input_devices, state="readonly")
+        self.mic_combo = mic_combo
         mic_combo.pack(side="left", fill="x", expand=True, padx=5)
         mic_combo.bind("<<ComboboxSelected>>", self.on_mic_change)
+        self._enhance_combobox(mic_combo, "Active audio input device")
 
         # --- BACKEND/ACCELERATION SELECTOR ---
         r_backend = ttk.Frame(self.settings_content)
@@ -2250,29 +2901,36 @@ class WhisperApp:
 
         ttk.Label(r_backend, text="Acceleration:").pack(side="left")
 
-        # Backend options: Auto detects best, or force specific
+        # Backend options: Auto detects best, or force specific (backend, device) pair
         backend_options = BACKEND_OPTIONS
         backend_map = BACKEND_DISPLAY_TO_INTERNAL
         self.backend_map_display = {v: k for k, v in backend_map.items()}
 
-        current_backend = self.config.get('backend', 'auto')
-        current_backend_display = self.backend_map_display.get(current_backend, "Auto")
+        current_be = self.config.get('backend', 'auto')
+        current_dev = self.config.get('device', 'auto')
+        current_backend_display = resolve_backend_display(current_be, current_dev)
 
         self.backend_var = tk.StringVar(value=current_backend_display)
         backend_combo = ttk.Combobox(r_backend, textvariable=self.backend_var,
-                                      values=backend_options, width=18, state="readonly")
+                                      values=backend_options, width=21, state="readonly")
+        self.backend_combo = backend_combo
         backend_combo.pack(side="left", padx=5)
         backend_combo.bind("<<ComboboxSelected>>", self.on_backend_change)
 
-        self._create_tooltip(backend_combo, "Acceleration Mode:\n• Auto: Detects best option\n• Parakeet: NVIDIA NeMo (multi-lang)\n• OpenVINO: Intel GPU/NPU\n• CUDA: NVIDIA GPUs\n• CPU only: Works everywhere")
+        self._enhance_combobox(
+            backend_combo,
+            "Acceleration Mode:\n"
+            "• Auto: Detects best local engine\n"
+            "• CUDA: NVIDIA GPUs (Faster-Whisper)\n"
+            "• ONNX ASR (CPU/GPU): Lightweight ONNX Runtime (Parakeet TDT v3)\n"
+            "• OpenVINO (Intel): Intel GPU/NPU\n"
+            "• Parakeet (NVIDIA NeMo): NVIDIA NeMo toolkit\n"
+            "• CPU only: Works everywhere",
+        )
 
         # Show current detected backend
         self.backend_status_label = ttk.Label(r_backend, text="", foreground=COLOR_TEAL)
-        self.backend_status_label.pack(side="left", padx=10)
-
-        # Update status to show current config backend
-        current_be = self.config.get('backend', 'faster-whisper')
-        current_dev = self.config.get('device', 'cpu')
+        self.backend_status_label.pack(side="left", padx=6)
         self.backend_status_label.config(text=f"[{current_be} / {current_dev}]")
 
         # --- HOTKEY CONFIGURATION ROW ---
@@ -2391,6 +3049,7 @@ class WhisperApp:
                                          values=OPENAI_TRANSCRIPTION_MODEL_OPTIONS, width=16, state="readonly")
         trans_model_combo.pack(side="left", padx=5)
         trans_model_combo.bind("<<ComboboxSelected>>", lambda e: self._auto_save_openai_settings())
+        self._enhance_combobox(trans_model_combo, "OpenAI speech-to-text model")
 
         ttk.Label(model_row, text="Lang:").pack(side="left", padx=(8, 0))
         self.openai_lang_var = tk.StringVar(value=self.config.get('openai_language', DEFAULT_CONFIG['openai_language']))
@@ -2399,6 +3058,7 @@ class WhisperApp:
                                   width=6, state="readonly")
         lang_combo.pack(side="left", padx=5)
         lang_combo.bind("<<ComboboxSelected>>", lambda e: self._auto_save_openai_settings())
+        self._enhance_combobox(lang_combo, "Spoken language hint for OpenAI transcription ('auto' detects automatically)")
 
         model_row2 = ttk.Frame(openai_frame)
         model_row2.pack(fill="x", padx=10, pady=5)
@@ -2410,6 +3070,7 @@ class WhisperApp:
                                         values=OPENAI_EDIT_MODEL_OPTIONS, width=15, state="readonly")
         edit_model_combo.pack(side="left", padx=5)
         edit_model_combo.bind("<<ComboboxSelected>>", lambda e: self._auto_save_openai_settings())
+        self._enhance_combobox(edit_model_combo, "OpenAI model used by +EDIT mode")
 
         # Edit prompt row
         prompt_row = ttk.Frame(openai_frame)
@@ -2424,6 +3085,8 @@ class WhisperApp:
         self.openai_prompt_var = tk.StringVar(value=self.config.get('openai_edit_prompt', ''))
         prompt_entry = ttk.Entry(prompt_row, textvariable=self.openai_prompt_var, width=30)
         prompt_entry.pack(side="left", fill="x", expand=True, padx=5)
+        prompt_entry.bind("<FocusOut>", lambda e: self._auto_save_openai_settings())
+        prompt_entry.bind("<Return>", lambda e: self._auto_save_openai_settings())
 
         # --- DOWNLOAD PROGRESS ---
         self.progress_frame = ttk.Frame(self.settings_content)
@@ -3107,9 +3770,49 @@ Troubleshooting:
                 m = 1
         return keys
 
+    _TRANSCRIPT_LINE_RX = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] (.*)$")
+
+    @classmethod
+    def _parse_transcript_file(cls, filepath, cutoff_dt=None):
+        """Parse a monthly transcript file into ``[{"timestamp": dt, "text": str}]``.
+
+        Supports multi-paragraph entries (e.g. from Online +EDIT): lines that do
+        not begin with a ``[YYYY-MM-DD HH:MM:SS] `` header are appended with a
+        newline to the preceding entry.
+        """
+        parsed = []
+        current = None
+        current_excluded = False
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            for raw_line in f:
+                stripped = raw_line.rstrip("\r\n")
+                m = cls._TRANSCRIPT_LINE_RX.match(stripped)
+                if m:
+                    if current is not None and current["text"].strip():
+                        current["text"] = current["text"].strip()
+                        parsed.append(current)
+                    current = None
+                    current_excluded = False
+                    try:
+                        ts = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+                    except ValueError:
+                        continue
+                    if cutoff_dt is not None and ts < cutoff_dt:
+                        current_excluded = True
+                        continue
+                    current = {"timestamp": ts, "text": m.group(2)}
+                elif current is not None and not current_excluded:
+                    if stripped or current["text"]:
+                        current["text"] += "\n" + stripped
+        if current is not None and current["text"].strip():
+            current["text"] = current["text"].strip()
+            parsed.append(current)
+        return parsed
+
     def _load_analytics_entries(self, days=None):
         now = datetime.datetime.now()
         cutoff = None if days is None else (now - datetime.timedelta(days=days))
+        cutoff_month = cutoff.strftime("%Y-%m") if cutoff is not None else None
         entries = []
         scanned_files = 0
 
@@ -3126,22 +3829,11 @@ Troubleshooting:
             if not os.path.isfile(path):
                 continue
             scanned_files += 1
+            if cutoff_month is not None and len(filename) >= 7 and filename[:4].isdigit() and filename[4] == "-":
+                if filename[:7] < cutoff_month:
+                    continue
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or not line.startswith("[") or "] " not in line:
-                            continue
-                        try:
-                            ts_end = line.index("] ")
-                            ts = datetime.datetime.strptime(line[1:ts_end], "%Y-%m-%d %H:%M:%S")
-                            if cutoff is not None and ts < cutoff:
-                                continue
-                            text = line[ts_end + 2:].strip()
-                            if text:
-                                entries.append({"timestamp": ts, "text": text})
-                        except Exception:
-                            continue
+                entries.extend(self._parse_transcript_file(path, cutoff_dt=cutoff))
             except Exception:
                 continue
 
@@ -3350,6 +4042,8 @@ Troubleshooting:
 
     def _run_scheduled_insights_refresh(self):
         self._insights_refresh_job = None
+        if self._shutting_down:
+            return
         if self.mode is not None:
             # Still recording/typing - don't burn the main thread now
             self._schedule_insights_refresh(5000)
@@ -3420,7 +4114,7 @@ Troubleshooting:
         self._refresh_intervention_tab(sentences)
         self._refresh_ai_timeline_tab(entries_all)
         self._refresh_ai_mood_tab(entries_all)
-        self._refresh_activity_matrix_tab(entries, all_text)
+        self._refresh_activity_matrix_tab(entries, all_text, tokens_per_entry)
         self._refresh_speaker_profile_tab(entries, all_tokens, sentences)
         self._refresh_daily_brief_tab(entries_all)
         self._update_insights_profile_summary()
@@ -3650,27 +4344,46 @@ Troubleshooting:
             colors=["#34d399", "#2dd4bf", "#14b8a6", "#0ea5e9", "#22d3ee"],
         )
 
-    @staticmethod
-    def _count_intervention_markers(sentences):
-        """Heuristic counts of (open questions, reflections, affirmations,
-        summaries) across sentences. Shared by the tab and the baseline."""
-        open_question_pattern = re.compile(
-            r"\b(what|how|when|where|who|could|would|can|tell me)\b", re.IGNORECASE
-        )
-        reflection_phrases = ("you feel", "it sounds like", "i hear", "you're feeling", "what i'm hearing")
-        affirmation_phrases = ("that makes sense", "good job", "great", "i appreciate", "thank you", "important work")
-        summary_phrases = ("to summarize", "so far", "in summary", "what we covered")
+    _OPEN_QUESTION_RX = re.compile(
+        r"\b(what|how|when|where|who|why|could|would|can|tell me|"
+        r"was|wie|wann|wo|wer|warum|wieso|weshalb|inwiefern|könnten|würden|erzähl)\b",
+        re.IGNORECASE,
+    )
+    _SELF_WORDS_RX = re.compile(
+        r"\b(i|me|my|mine|myself|ich|mir|mich|mein|meine|meinem|meinen|meiner|meines)\b",
+        re.IGNORECASE,
+    )
+    _COLLECTIVE_WORDS_RX = re.compile(
+        r"\b(we|us|our|ours|ourselves|wir|uns|unser|unsere|unserem|unseren|unserer|unseres)\b",
+        re.IGNORECASE,
+    )
+    _REFLECTION_PHRASES = (
+        "you feel", "it sounds like", "i hear", "you're feeling", "what i'm hearing",
+        "du fühlst", "sie fühlen", "es klingt", "ich höre", "wenn ich dich richtig verstehe",
+    )
+    _AFFIRMATION_PHRASES = (
+        "that makes sense", "good job", "great", "i appreciate", "thank you", "important work",
+        "das macht sinn", "das ergibt sinn", "super", "gut gemacht", "danke", "vielen dank", "ich schätze",
+    )
+    _SUMMARY_PHRASES = (
+        "to summarize", "so far", "in summary", "what we covered",
+        "zusammenfassend", "bisher", "kurz zusammengefasst", "insgesamt",
+    )
 
+    @classmethod
+    def _count_intervention_markers(cls, sentences):
+        """Heuristic counts of (open questions, reflections, affirmations,
+        summaries) across English and German sentences."""
         open_questions = reflections = affirmations = summaries = 0
         for sentence in sentences:
             s_lower = sentence.lower()
-            if "?" in sentence and open_question_pattern.search(sentence):
+            if "?" in sentence and cls._OPEN_QUESTION_RX.search(sentence):
                 open_questions += 1
-            if any(p in s_lower for p in reflection_phrases):
+            if any(p in s_lower for p in cls._REFLECTION_PHRASES):
                 reflections += 1
-            if any(p in s_lower for p in affirmation_phrases):
+            if any(p in s_lower for p in cls._AFFIRMATION_PHRASES):
                 affirmations += 1
-            if any(p in s_lower for p in summary_phrases):
+            if any(p in s_lower for p in cls._SUMMARY_PHRASES):
                 summaries += 1
         return open_questions, reflections, affirmations, summaries
 
@@ -3687,13 +4400,11 @@ Troubleshooting:
         open_questions, reflections, affirmations, summaries = \
             self._count_intervention_markers(sentences)
 
-        self_words = re.compile(r"\b(i|me|my|mine|myself)\b", re.IGNORECASE)
-        collective_words = re.compile(r"\b(we|us|our|ours|ourselves)\b", re.IGNORECASE)
         self_count = 0
         collective_count = 0
         for sentence in sentences:
-            self_count += len(self_words.findall(sentence))
-            collective_count += len(collective_words.findall(sentence))
+            self_count += len(self._SELF_WORDS_RX.findall(sentence))
+            collective_count += len(self._COLLECTIVE_WORDS_RX.findall(sentence))
 
         total = len(sentences)
         self.intervention_summary_var.set(
@@ -3731,17 +4442,24 @@ Troubleshooting:
         )
 
     def _get_daily_insights_cache(self):
+        if self._ai_insights_mem_cache is not None:
+            return self._ai_insights_mem_cache
+        data = {}
         try:
             if os.path.exists(AI_INSIGHTS_FILE):
                 with open(AI_INSIGHTS_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data = loaded
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             self._quarantine_corrupt_file(os.path.join(app_dir, AI_INSIGHTS_FILE), e)
         except Exception as e:
             self.log_internal(f"Failed to load AI Insights cache: {e}")
-        return {}
+        self._ai_insights_mem_cache = data
+        return data
 
     def _save_daily_insights_cache(self, cache):
+        self._ai_insights_mem_cache = dict(cache) if isinstance(cache, dict) else {}
         try:
             self._write_json_atomic(os.path.join(app_dir, AI_INSIGHTS_FILE), cache, indent=4)
         except Exception as e:
@@ -3775,7 +4493,8 @@ Troubleshooting:
         """Once per app start, refresh the AI insight cache in the background if
         the newest cached day is more than a day old. Never runs twice and never
         runs while a recording is in progress."""
-        if self._ai_auto_crunch_done:
+        self._auto_crunch_job = None
+        if self._shutting_down or self._ai_auto_crunch_done:
             return
         # Opt-in only: this uploads transcript text to OpenAI, so it must never
         # happen just because an API key happens to be configured.
@@ -3786,7 +4505,8 @@ Troubleshooting:
             return
         if self.mode is not None:
             # Recording/typing right now - retry in a few minutes
-            self.root.after(300000, self._maybe_auto_crunch_ai_insights)
+            if not self._shutting_down:
+                self._auto_crunch_job = self.root.after(300000, self._maybe_auto_crunch_ai_insights)
             return
         newest = self._newest_ai_insight_date(self._get_daily_insights_cache())
         if newest is not None and (datetime.date.today() - newest).days < 1:
@@ -3810,9 +4530,9 @@ Troubleshooting:
 
     def _batch_process_ai_insights_inner(self, api_key):
         import openai
-        client = openai.OpenAI(api_key=api_key)
+        client = openai.OpenAI(api_key=api_key, timeout=45.0)
 
-        entries = self._load_analytics_entries(days=None)
+        entries = self._get_analytics_entries()
         if not entries:
             self._ui_after(0, lambda: self._on_crunch_finished("No transcript entries found to process."))
             return
@@ -3824,7 +4544,7 @@ Troubleshooting:
             day_str = e["timestamp"].strftime("%Y-%m-%d")
             daily_text[day_str].append(e["text"])
 
-        cache = self._get_daily_insights_cache()
+        cache = dict(self._get_daily_insights_cache())
         processed_days = 0
 
         prompt = (
@@ -3840,6 +4560,8 @@ Troubleshooting:
         )
 
         for day_str, texts in sorted(daily_text.items()):
+            if self._shutting_down:
+                break
             if day_str in cache:
                 continue
 
@@ -3881,20 +4603,25 @@ Troubleshooting:
         self.refresh_insights_tabs()
 
     def _filter_ai_dates(self, dates, filter_str):
-        if not dates: return []
+        if not dates:
+            return []
         today = datetime.date.today()
+        prev_month_date = today.replace(day=1) - datetime.timedelta(days=1)
         filtered = []
         for d in dates:
             try:
                 dt = datetime.datetime.strptime(d, "%Y-%m-%d").date()
+                delta_days = (today - dt).days
                 if filter_str == "Last 7 Days":
-                    if (today - dt).days <= 7: filtered.append(d)
+                    if 0 <= delta_days <= 7:
+                        filtered.append(d)
                 elif filter_str == "Last 30 Days":
-                    if (today - dt).days <= 30: filtered.append(d)
+                    if 0 <= delta_days <= 30:
+                        filtered.append(d)
                 elif filter_str == "Previous Month":
-                    prev_month = (today.replace(day=1) - datetime.timedelta(days=1)).month
-                    if dt.month == prev_month: filtered.append(d)
-                else: # All Time
+                    if dt.year == prev_month_date.year and dt.month == prev_month_date.month:
+                        filtered.append(d)
+                else:  # All Time
                     filtered.append(d)
             except Exception:
                 pass
@@ -4078,7 +4805,7 @@ Troubleshooting:
                                     fill=COLOR_ACCENT_BG, outline=COLOR_BORDER, tags="tooltip_bg")
             canvas.tag_raise("tooltip")
 
-    def _refresh_activity_matrix_tab(self, entries, all_text):
+    def _refresh_activity_matrix_tab(self, entries, all_text, tokens_per_entry=None):
         if not hasattr(self, "activity_canvas"):
             return  # tab body not built yet
         self.activity_canvas.delete("all")
@@ -4088,7 +4815,6 @@ Troubleshooting:
             return
 
         from collections import defaultdict
-        import datetime
         
         # Group entries by day
         metric_type = self.activity_metric_var.get()
@@ -4099,7 +4825,11 @@ Troubleshooting:
             for d, data in cache.items():
                 if "mood_score" in data:
                     daily_vals[d] = float(data["mood_score"])
-        else: # Words (Volume)
+        elif tokens_per_entry is not None and len(tokens_per_entry) == len(entries):
+            for e, toks in zip(entries, tokens_per_entry):
+                d = e["timestamp"].strftime("%Y-%m-%d")
+                daily_vals[d] += len(toks)
+        else:  # Words (Volume) fallback
             for e in entries:
                 d = e["timestamp"].strftime("%Y-%m-%d")
                 daily_vals[d] += len(self._tokenize_words(e["text"]))
@@ -4355,7 +5085,7 @@ Troubleshooting:
             self.insights_collapsed.set(True)
         self.config['insights_collapsed'] = self.insights_collapsed.get()
         self._persist_config()
-        self.root.after(50, self._update_scroll_region)
+        self._schedule_scroll_region_sync()
 
     def toggle_settings(self):
         """Toggle the collapsible Configuration accordion."""
@@ -4373,7 +5103,7 @@ Troubleshooting:
         self.config['config_collapsed'] = self.config_collapsed.get()
         self._persist_config()
         # Refresh scroll region after content change
-        self.root.after(50, self._update_scroll_region)
+        self._schedule_scroll_region_sync()
 
     def toggle_log(self):
         """Toggle the collapsible System Log accordion (widget built lazily)."""
@@ -4386,7 +5116,7 @@ Troubleshooting:
             self.log_body.pack_forget()
             self.log_toggle_btn.config(text="\u25b6")
             self.log_collapsed.set(True)
-        self.root.after(50, self._update_scroll_region)
+        self._schedule_scroll_region_sync()
 
     def _build_log_widget(self):
         """Create the ScrolledText on first expand and flush the buffer."""
@@ -4432,25 +5162,33 @@ Troubleshooting:
         """Header CFG button: expand Configuration and scroll to it."""
         if self.config_collapsed.get():
             self.toggle_settings()
-        self.root.after(80, self._scroll_to_configuration)
-
-    def _scroll_to_configuration(self):
-        """Scroll the Configuration accordion header into view.
-
-        Not yview_moveto(1.0): the System Log accordion is packed after
-        Configuration, so scrolling to the bottom overshoots the panel the
-        CFG button just opened.
-        """
-        try:
-            self._scroll_canvas.update_idletasks()
-            y = self.settings_toggle_btn.winfo_rooty() - self.content_frame.winfo_rooty()
-            total = max(1, self.content_frame.winfo_height())
-            self._scroll_canvas.yview_moveto(max(0.0, min(1.0, y / total)))
-        except Exception:
+        prev = getattr(self, "_focus_cfg_job", None)
+        if prev is not None:
             try:
-                self._scroll_canvas.yview_moveto(1.0)
+                self.root.after_cancel(prev)
             except Exception:
                 pass
+        self._focus_cfg_job = self.root.after(60, self._scroll_to_configuration)
+
+    def _scroll_to_configuration(self):
+        """Scroll the Configuration accordion header into view without overshooting."""
+        self._focus_cfg_job = None
+        if getattr(self, "_shutting_down", False):
+            return
+        try:
+            self.content_frame.update_idletasks()
+            self._update_scroll_region()
+            req_h = self.content_frame.winfo_reqheight()
+            avail_h = max(1, self._scroll_canvas.winfo_height())
+            if req_h <= avail_h:
+                self._scroll_canvas.yview_moveto(0.0)
+                return
+            y = self.settings_toggle_btn.winfo_rooty() - self.content_frame.winfo_rooty()
+            max_y = float(req_h - avail_h)
+            target_y = max(0.0, min(max_y, float(y)))
+            self._scroll_canvas.yview_moveto(target_y / float(req_h))
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # OpenAI API key: first-run welcome and the inline AI-Insights notice
@@ -4507,7 +5245,8 @@ Troubleshooting:
 
     def _maybe_show_welcome(self):
         """First launch only: explain what works now and what a key unlocks."""
-        if self.config.get('welcome_shown'):
+        self._welcome_job = None
+        if self._shutting_down or self.config.get('welcome_shown'):
             return
         if NO_DIALOGS:
             self._mark_welcome_shown()
@@ -4612,27 +5351,53 @@ Troubleshooting:
         if self.mode != getattr(self, "_state_prev_mode", "?"):
             self._state_prev_mode = self.mode
             self._mode_started_at = time.time() if self.mode else None
-        if self.mode == "live":
+
+        is_cloud_mode = self.config.get('transcription_mode') == 'online'
+        if self.stopping:
+            word, color = "Transcribing...", COLOR_TRANSCRIBING
+        elif self.mode == "live":
             word, color = "Live typing", COLOR_LIVE
         elif self.mode == "batch":
             word, color = "Batch recording", COLOR_BATCH
         elif self._is_online_mode():
             word = "Recording + edit" if self.online_with_edit else "Recording"
             color = COLOR_ONLINE
+        elif not is_cloud_mode and getattr(self, "_model_loading", False):
+            status_low = (self.status_var.get() if hasattr(self, "status_var") else "").lower()
+            word = "Downloading..." if "download" in status_low else "Loading..."
+            color = COLOR_TRANSCRIBING
+        elif not is_cloud_mode and getattr(self, "_model_load_failed", False) and self.model is None:
+            word, color = "Model error", COLOR_LIVE
+        elif not is_cloud_mode and getattr(self, "_model_idle_unloaded", False):
+            word, color = "Idle (GPU freed)", COLOR_IDLE
         else:
             word, color = "Ready", COLOR_READY
-        self.state_word_var.set(word)
-        self._set_state_dot(color)
+
+        cache = self._ui_render_cache
+        if cache.get("state_word") != word:
+            cache["state_word"] = word
+            self.state_word_var.set(word)
+        if cache.get("state_dot") != color:
+            cache["state_dot"] = color
+            self._set_state_dot(color)
+
         started = getattr(self, "_mode_started_at", None)
         if self.mode and started:
             elapsed = int(max(0.0, time.time() - started))
-            self.state_elapsed_var.set(f"{elapsed // 60}:{elapsed % 60:02d}")
+            elapsed_str = f"{elapsed // 60}:{elapsed % 60:02d}"
         else:
-            self.state_elapsed_var.set("")
-        try:
-            self.vu_meter.configure(progress_color=self._vu_color())
-        except Exception:
-            pass
+            elapsed_str = ""
+        if cache.get("state_elapsed") != elapsed_str:
+            cache["state_elapsed"] = elapsed_str
+            self.state_elapsed_var.set(elapsed_str)
+
+        vu_col = self._vu_color()
+        if cache.get("vu_color") != vu_col:
+            cache["vu_color"] = vu_col
+            try:
+                self.vu_meter.configure(progress_color=vu_col)
+            except Exception:
+                pass
 
     def on_setting_change(self, *args):
         # Auto-save pause setting (debounced by trace)
@@ -4674,27 +5439,22 @@ Troubleshooting:
         self.restart_audio_stream()
 
     def on_backend_change(self, event=None):
-        """Handle backend/acceleration selection change."""
+        """Handle backend/acceleration selection change with live hot-reload."""
         display_val = self.backend_var.get()
-        
-        # Map display names to (backend, device) pairs
-        # Note: 'cuda' is NOT a backend, it's a device. Backend is the transcription engine.
         backend_device_map = BACKEND_DISPLAY_TO_BACKEND_DEVICE
-        
-        new_backend, new_device = backend_device_map.get(display_val, ("faster-whisper", "auto"))
-        
+        new_backend, new_device = backend_device_map.get(display_val, ("auto", "auto"))
+
         if new_backend != self.config.get('backend') or new_device != self.config.get('device'):
             self.config['backend'] = new_backend
             self.config['device'] = new_device
-            # Set appropriate compute type
             if new_device == 'auto':
                 self.config['compute_type'] = 'auto'
             else:
                 self.config['compute_type'] = 'float16' if new_device == 'cuda' else 'int8'
             self._persist_config()
-            
-            messagebox.showinfo("Acceleration Changed", 
-                f"Acceleration changed to: {display_val}\n\nRestart the app to apply the new mode.")
+            self._update_device_model_labels()
+            self.log_internal(f"Acceleration changed to {display_val} -> reloading model in background...")
+            self._manual_model_reload()
 
     def _update_mode_buttons(self):
         """Show/hide appropriate buttons based on transcription mode."""
@@ -4900,19 +5660,21 @@ Troubleshooting:
                 self._refresh_hotkeys(f"watchdog ({reason})")
 
             # Schedule next check using configured interval
-            if self.running:
-                self.root.after(self._hotkey_watchdog_interval, check_hotkeys)
+            if self.running and not self._shutting_down:
+                try:
+                    self._hotkey_watchdog_job = self.root.after(self._hotkey_watchdog_interval, check_hotkeys)
+                except (tk.TclError, RuntimeError):
+                    pass
 
         # Start first check after interval
-        self.root.after(self._hotkey_watchdog_interval, check_hotkeys)
+        self._hotkey_watchdog_job = self.root.after(self._hotkey_watchdog_interval, check_hotkeys)
 
     def cleanup_hotkeys(self):
         """Clean up hotkeys before app exit."""
         self.log_internal("Cleaning up hotkeys...")
         self._hotkey_manager.cleanup()
         self._clear_capture_hooks()
-        # Also unhook any capture hooks
-        if hasattr(self, '_capture_hook') and self._capture_hook:
+        if hasattr(self, '_capture_hook') and self._capture_hook and keyboard is not None:
             try:
                 keyboard.unhook(self._capture_hook)
             except Exception:
@@ -4920,15 +5682,20 @@ Troubleshooting:
             self._capture_hook = None
 
     def _clear_capture_hooks(self):
-        """Remove temporary hooks used during hotkey capture."""
+        """Remove temporary hooks used during hotkey capture and unpause hotkeys."""
+        mgr = getattr(self, "_hotkey_manager", None)
+        if mgr is not None:
+            mgr.paused = False
         hooks = getattr(self, '_capture_hooks', None)
-        if hooks:
+        if hooks and keyboard is not None:
             for hook in hooks:
+                if hook is None:
+                    continue
                 try:
                     keyboard.unhook(hook)
                 except Exception:
                     pass
-            self._capture_hooks = None
+        self._capture_hooks = None
 
     def _on_focus_in(self, event=None):
         """Check hotkey health when window gains focus.
@@ -4966,10 +5733,15 @@ Troubleshooting:
     def _hotkey_pump(self):
         """Cheap 50ms loop that only drains the hotkey queue, so hotkey presses
         respond instantly even while the main GUI loop idles at 1000ms."""
-        if not self.running:
+        self._hotkey_pump_job = None
+        if not self.running or self._shutting_down:
             return
         self._process_hotkey_actions()
-        self.root.after(50, self._hotkey_pump)
+        if self.running and not self._shutting_down:
+            try:
+                self._hotkey_pump_job = self.root.after(50, self._hotkey_pump)
+            except (tk.TclError, RuntimeError):
+                pass
 
     def _process_hotkey_actions(self):
         """Process queued hotkey actions on the Tk main thread."""
@@ -4995,6 +5767,8 @@ Troubleshooting:
 
     def toggle_online_transcribe(self):
         """Toggle online transcription (record and send to OpenAI)."""
+        if self.stopping:
+            return
         if self.mode == 'online_transcribe':
             # Stop recording and transcribe
             self._stop_online_recording(with_edit=False)
@@ -5007,6 +5781,8 @@ Troubleshooting:
 
     def toggle_online_transcribe_edit(self):
         """Toggle online transcription with GPT editing."""
+        if self.stopping:
+            return
         if self.mode == 'online_transcribe_edit':
             # Stop recording and transcribe+edit
             self._stop_online_recording(with_edit=True)
@@ -5020,13 +5796,13 @@ Troubleshooting:
     def _start_online_recording(self, with_edit=False):
         """Start recording for online transcription with streaming segments."""
         if not self.start_audio_stream():
+            self._report_recording_start_failure("online")
             return
 
-        mode_name = 'online_transcribe_edit' if with_edit else 'online_transcribe'
-        self.mode = mode_name
+        # Reset streaming state before exposing self.mode to processing_loop
         self.online_with_edit = with_edit
-
-        # Reset streaming state
+        with self.audio_queue.mutex:
+            self.audio_queue.queue.clear()
         self.online_segments = []
         self.online_segment_seq = 0
         self.online_pending_audio = []
@@ -5040,8 +5816,9 @@ Troubleshooting:
             self.log_internal(f"OpenAI client init failed: {e}")
 
         # Create thread pool for parallel API calls (2 workers for API rate limits)
-        from concurrent.futures import ThreadPoolExecutor
         self.online_executor = ThreadPoolExecutor(max_workers=AUDIO_RUNTIME["online_executor_workers"])
+        mode_name = 'online_transcribe_edit' if with_edit else 'online_transcribe'
+        self.mode = mode_name
         
         # Update UI
         btn = self.btn_transcribe_edit if with_edit else self.btn_transcribe
@@ -5049,25 +5826,38 @@ Troubleshooting:
         
         self.play_feedback_sound(start=True)
         self.status_var.set(f"Recording{' + GPT edit' if with_edit else ''}...")
-        self.msg_queue.put(f"Recording started (online streaming mode)")
+        self.msg_queue.put("Recording started (online streaming mode)")
 
     def _stop_online_recording(self, with_edit=False):
-        """Stop recording, process final segment, and combine all results."""
+        """Stop recording, drain remaining mic frames, process final segment, and combine results."""
+        self.stopping = True
         self.play_feedback_sound(start=False)
-        
-        # Queue any remaining audio
+
+        # Close stream first, then drain any trailing mic frames queued before close
+        self.stop_audio_stream()
+        while True:
+            try:
+                self.online_pending_audio.append(self.audio_queue.get_nowait())
+            except queue.Empty:
+                break
+
+        # Queue any remaining audio before detaching session state
         if self.online_pending_audio:
             self._queue_online_segment()
+
+        with self.online_segment_lock:
+            segments_snapshot = list(self.online_segments)
+        executor = self.online_executor
+        self.online_executor = None
+        self.mode = None
+        self.stopping = False
         
         # Check if we have any segments
-        if not self.online_segments:
-            self.mode = None
-            self.stop_audio_stream()
+        if not segments_snapshot:
+            if executor is not None:
+                executor.shutdown(wait=False)
             self._reset_online_buttons()
             return
-
-        self.mode = None
-        self.stop_audio_stream()
 
         # Show TRANSCRIBING state
         btn = self.btn_transcribe_edit if with_edit else self.btn_transcribe
@@ -5078,28 +5868,27 @@ Troubleshooting:
         # Wait for all segments to complete in background
         def wait_and_combine():
             try:
-                # Wait for executor to finish
-                if self.online_executor:
-                    self.online_executor.shutdown(wait=True)
-                    self.online_executor = None
+                if executor is not None:
+                    executor.shutdown(wait=True)
 
-                # Combine results in order
                 with self.online_segment_lock:
                     results = []
+                    errors = []
                     total_latency = 0
                     total_audio_duration = 0
-                    num_segments = len(self.online_segments)
-                    for seg in sorted(self.online_segments, key=lambda x: x['seq']):
-                        if seg['result'] and not seg['result'].startswith('[Error'):
-                            results.append(seg['result'])
+                    num_segments = len(segments_snapshot)
+                    for seg in sorted(segments_snapshot, key=lambda x: x['seq']):
+                        res = seg.get('result')
+                        if res and not res.startswith('[Error'):
+                            results.append(res)
+                        elif seg.get('status') == 'error' and res:
+                            errors.append(res)
                         total_latency += seg.get('latency', 0)
                         total_audio_duration += seg.get('duration_s', 0)
 
                 result_text = " ".join(results).strip()
 
                 if result_text:
-                    # Word counting, stats persistence, and archive saving all
-                    # happen once on the Tk main thread via result_queue.
                     self.total_audio_duration += total_audio_duration
                     self.today_audio_duration += total_audio_duration
                     self.last_transcription_latency = total_latency
@@ -5108,25 +5897,39 @@ Troubleshooting:
                     word_count = len(result_text.split())
                     self.msg_queue.put(f"☁️ Transcribed {word_count} words from {num_segments} segments ({total_latency:.0f}ms total)")
 
-                    # Copy to clipboard, paste, and show READY state
                     def deliver():
                         self.root.clipboard_clear()
                         self.root.clipboard_append(result_text)
                         self.root.update()
-                        # Platform-aware paste (Cmd+V on Mac, Ctrl+V on Windows)
-                        paste_key = get_paste_shortcut() if PLATFORM_UTILS_AVAILABLE else 'ctrl+v'
-                        keyboard.send(paste_key)
+                        pasted = False
+                        try:
+                            if PLATFORM_UTILS_AVAILABLE:
+                                pasted = bool(paste_from_clipboard())
+                            elif keyboard is not None:
+                                keyboard.send('ctrl+v')
+                                pasted = True
+                        except Exception as paste_err:
+                            self.log_internal(f"Auto-paste skipped (text is in clipboard): {paste_err}")
 
-                        if with_edit:
-                            self.btn_transcribe_edit.configure(fg_color=COLOR_READY, text_color="white", text="Done")
-                        else:
-                            self.btn_transcribe.configure(fg_color=COLOR_READY, text_color="white", text="Done")
-                        self.status_var.set("Copied & Pasted!")
-                        self.update_mini_window_color(COLOR_READY)
-                        self._ui_after(UI_RUNTIME["ready_state_delay_ms"], self._reset_online_buttons)
+                        if self.mode is None and not self.stopping:
+                            if with_edit:
+                                self.btn_transcribe_edit.configure(fg_color=COLOR_READY, text_color="white", text="Done")
+                            else:
+                                self.btn_transcribe.configure(fg_color=COLOR_READY, text_color="white", text="Done")
+                            self.status_var.set("Copied & Pasted!" if pasted else "Copied to clipboard!")
+                            self.update_mini_window_color(COLOR_READY)
+                            self._ui_after(UI_RUNTIME["ready_state_delay_ms"], self._reset_online_buttons)
                     self._ui_after(0, deliver)
+                elif errors:
+                    first_err = errors[0].strip("[]")
+                    self.msg_queue.put(f"Online transcription failed: {first_err}")
+                    def show_err(msg=first_err):
+                        if self.mode is None and not self.stopping:
+                            self._reset_online_buttons(keep_status=True)
+                            self.status_var.set(f"Online {msg[:68]}")
+                    self._ui_after(0, show_err)
                 else:
-                    self.msg_queue.put("No transcription result")
+                    self.msg_queue.put("No speech detected in online recording")
                     self._ui_after(0, self._reset_online_buttons)
 
             except Exception as e:
@@ -5135,12 +5938,30 @@ Troubleshooting:
 
         threading.Thread(target=wait_and_combine, daemon=True).start()
 
-    def _reset_online_buttons(self):
+    def _reset_online_buttons(self, keep_status=False):
         """Reset online mode button colors and text."""
+        if self.mode is not None or self.stopping or self._shutting_down:
+            return
         self.btn_transcribe.configure(fg_color=COLOR_BG, text_color=COLOR_TEXT_MUTED, text=self._mode_button_text("transcribe"))
         self.btn_transcribe_edit.configure(fg_color=COLOR_BG, text_color=COLOR_TEXT_MUTED, text=self._mode_button_text("transcribe_edit"))
         self.update_mini_window_color(COLOR_IDLE)
-        self.status_var.set("Ready")
+        if not keep_status:
+            self.status_var.set("Ready")
+
+    def _sync_openai_backend_config(self):
+        """Refresh any cached OpenAI backend client after settings change."""
+        self.online_backend = None
+        if self.backend is not None and self.current_backend_name == 'openai':
+            try:
+                self.backend.configure(
+                    api_key=self.config.get('openai_api_key', ''),
+                    transcription_model=self.config.get('openai_transcription_model', DEFAULT_CONFIG['openai_transcription_model']),
+                    edit_model=self.config.get('openai_edit_model', DEFAULT_CONFIG['openai_edit_model']),
+                    edit_prompt=self.config.get('openai_edit_prompt', '') or None,
+                    language=self.config.get('openai_language', DEFAULT_CONFIG['openai_language']),
+                )
+            except Exception:
+                pass
 
     def _save_openai_settings(self):
         """Save OpenAI settings to config."""
@@ -5151,20 +5972,32 @@ Troubleshooting:
         self.config['openai_edit_prompt'] = self.openai_prompt_var.get().strip()
 
         self._persist_config()
-        self._update_api_key_notice()
+        self._sync_openai_backend_config()
+        self._update_device_model_labels()
+        if hasattr(self, "_update_api_key_notice"):
+            try:
+                self._update_api_key_notice()
+            except Exception:
+                pass
 
         self.msg_queue.put("OpenAI settings saved")
-        messagebox.showinfo("Saved", "OpenAI settings saved successfully.")
+        if not NO_DIALOGS:
+            messagebox.showinfo("Saved", "OpenAI settings saved successfully.")
 
     def _auto_save_openai_settings(self):
-        """Silently save OpenAI settings when combo boxes change."""
+        """Silently save OpenAI settings when combo boxes or prompt entry change."""
         self.config['openai_transcription_model'] = self.openai_trans_model_var.get()
         self.config['openai_edit_model'] = self.openai_edit_model_var.get()
         self.config['openai_language'] = self.openai_lang_var.get()
+        if hasattr(self, "openai_prompt_var"):
+            self.config['openai_edit_prompt'] = self.openai_prompt_var.get().strip()
         
         try:
             self._persist_config()
-            self._update_api_key_notice()
+            self._sync_openai_backend_config()
+            self._update_device_model_labels()
+            if hasattr(self, "_update_api_key_notice"):
+                self._update_api_key_notice()
             self.log_internal(f"Settings saved: {self.openai_trans_model_var.get()}")
         except Exception:
             pass
@@ -5195,9 +6028,9 @@ Troubleshooting:
                 
                 self._ui_after(0, show_result)
                 
-            except ImportError as e:
+            except ImportError:
                 self._ui_after(0, lambda: messagebox.showerror("Error", 
-                    f"OpenAI library not installed.\n\nRun: pip install openai"))
+                    "OpenAI library not installed.\n\nRun: pip install openai"))
                 self._ui_after(0, lambda: self.status_var.set("Ready"))
             except Exception as e:
                 self._ui_after(0, lambda: messagebox.showerror("Error", f"Test failed: {e}"))
@@ -5208,9 +6041,19 @@ Troubleshooting:
     def start_hotkey_capture(self, hotkey_type):
         """Start capturing a new hotkey for batch or live mode - supports multi-key combos"""
         self._clear_capture_hooks()
+        if keyboard is None:
+            self.log_internal("Cannot capture hotkey: keyboard backend is unavailable on this system.")
+            if not NO_DIALOGS:
+                messagebox.showwarning("Hotkeys unavailable", "Keyboard hook backend is unavailable on this system.")
+            return
+
         self.capturing_hotkey = hotkey_type
         self._hotkey_parts = set()  # Track currently held keys
         self._hotkey_confirmed = False
+        if getattr(self, "_hotkey_manager", None) is not None:
+            self._hotkey_manager.paused = True
+
+        mod_order = ['ctrl', 'alt', 'shift', 'win', 'command', 'cmd']
         
         # Update button appearance to show capture mode
         if hotkey_type == 'batch':
@@ -5223,14 +6066,8 @@ Troubleshooting:
             if not self._hotkey_parts:
                 preview = "Press keys..."
             else:
-                # Order: ctrl, alt, shift, win, then other keys
-                ordered = []
-                for mod in ['ctrl', 'alt', 'shift', 'win']:
-                    if mod in self._hotkey_parts:
-                        ordered.append(mod)
-                for key in sorted(self._hotkey_parts):
-                    if key not in ['ctrl', 'alt', 'shift', 'win']:
-                        ordered.append(key)
+                ordered = [m for m in mod_order if m in self._hotkey_parts]
+                ordered.extend(k for k in sorted(self._hotkey_parts) if k not in mod_order)
                 preview = '+'.join(ordered)
             
             preview_text = f"{preview} (Enter=OK, Esc=Cancel)"
@@ -5240,23 +6077,21 @@ Troubleshooting:
                 self.live_hotkey_btn.config(text=preview_text)
         
         def on_key_down(event):
+            if getattr(event, "event_type", "down") != "down":
+                return
             if self.capturing_hotkey is None or self._hotkey_confirmed:
                 return
             
-            key_name = event.name.lower()
+            key_name = HotkeyManager._normalize_key_name(getattr(event, "name", None))
+            if not key_name:
+                return
             
             # Enter confirms the hotkey
             if key_name in ('enter', 'return'):
                 if self._hotkey_parts:
                     self._hotkey_confirmed = True
-                    # Build final hotkey string
-                    ordered = []
-                    for mod in ['ctrl', 'alt', 'shift', 'win']:
-                        if mod in self._hotkey_parts:
-                            ordered.append(mod)
-                    for key in sorted(self._hotkey_parts):
-                        if key not in ['ctrl', 'alt', 'shift', 'win']:
-                            ordered.append(key)
+                    ordered = [m for m in mod_order if m in self._hotkey_parts]
+                    ordered.extend(k for k in sorted(self._hotkey_parts) if k not in mod_order)
                     new_hotkey = '+'.join(ordered)
                     
                     current_type = self.capturing_hotkey
@@ -5266,51 +6101,24 @@ Troubleshooting:
                 return
             
             # Escape cancels
-            if key_name == 'escape':
+            if key_name in ('esc', 'escape'):
                 self._clear_capture_hooks()
                 self._ui_after(HOTKEY_RUNTIME["capture_finish_delay_ms"], self.cancel_hotkey_capture)
                 return
             
-            # Normalize modifier names
-            if key_name in ('left ctrl', 'right ctrl', 'control'):
-                key_name = 'ctrl'
-            elif key_name in ('left alt', 'right alt'):
-                key_name = 'alt'
-            elif key_name in ('left shift', 'right shift'):
-                key_name = 'shift'
-            elif key_name in ('left windows', 'right windows', 'windows'):
-                key_name = 'win'
-            
             self._hotkey_parts.add(key_name)
-            self.root.after(HOTKEY_RUNTIME["capture_preview_delay_ms"], update_preview)
+            self._ui_after(HOTKEY_RUNTIME["capture_preview_delay_ms"], update_preview)
         
         def on_key_up(event):
-            if self.capturing_hotkey is None or self._hotkey_confirmed:
-                return
-            
-            key_name = event.name.lower()
-            
-            # Normalize modifier names
-            if key_name in ('left ctrl', 'right ctrl', 'control'):
-                key_name = 'ctrl'
-            elif key_name in ('left alt', 'right alt'):
-                key_name = 'alt'
-            elif key_name in ('left shift', 'right shift'):
-                key_name = 'shift'
-            elif key_name in ('left windows', 'right windows', 'windows'):
-                key_name = 'win'
-            
-            # Don't remove keys - we want to capture all pressed keys
-            # Only update if the key was in our set
-            # self._hotkey_parts.discard(key_name)
-            # self.root.after(1, update_preview)
+            return
         
-        # Hook both key down and key up
-        on_key_down_hook = keyboard.hook(on_key_down, suppress=False)
-        on_key_up_hook = keyboard.on_release(on_key_up, suppress=False)
-        
-        # Store hook reference for cleanup
-        self._capture_hooks = (on_key_down_hook, on_key_up_hook)
+        try:
+            on_key_down_hook = keyboard.hook(on_key_down, suppress=False)
+            on_key_up_hook = keyboard.on_release(on_key_up, suppress=False)
+            self._capture_hooks = (on_key_down_hook, on_key_up_hook)
+        except Exception as exc:
+            self.log_internal(f"Failed to hook keyboard for capture: {exc}")
+            self.cancel_hotkey_capture()
 
     def finish_hotkey_capture(self, hotkey_type, new_hotkey):
         """Finish capturing hotkey and save"""
@@ -5336,6 +6144,7 @@ Troubleshooting:
             
             # Save config
             self._persist_config()
+            self._update_config_summary()
 
             # Keep tracked hotkey handlers in sync after hotkey changes.
             self._unregister_hotkeys()
@@ -5496,10 +6305,20 @@ Troubleshooting:
                 self._report_recording_start_failure("live")
                 return
             self.play_feedback_sound(start=True)
+            with self.audio_queue.mutex:
+                self.audio_queue.queue.clear()
+            while True:
+                try:
+                    self._live_chunk_queue.get_nowait()
+                    self._live_chunk_queue.task_done()
+                except queue.Empty:
+                    break
+            with self.live_buffer_lock:
+                self.live_buffer = []
+                self.live_backup_buffer = []
+            self._live_session_texts = []
+            self._live_reset_event.set()
             self.mode = "live"
-            with self.audio_queue.mutex: self.audio_queue.queue.clear()
-            self.live_buffer = [] 
-            self.live_backup_buffer = [] 
             # Highlight LIVE button, dim BATCH button
             self.btn_live.configure(fg_color=COLOR_LIVE, text_color="white", text=self._mode_button_text("live"))
             self.btn_batch.configure(fg_color=COLOR_BG, text_color=COLOR_TEXT_MUTED, text=self._mode_button_text("batch"))
@@ -5515,22 +6334,44 @@ Troubleshooting:
             self.stop_audio_stream()
             return
 
-        # --- FIX: Atomically capture and clear the remaining buffer ---
-        # This prevents the race condition where processing_loop could
-        # process the same chunk we're about to process here.
+        # Close the stream FIRST so no new audio frames arrive after our drain,
+        # and while self.stopping is still True so no hotkey press can adopt a
+        # dying stream.
+        self.stop_audio_stream()
+
+        # Drain any trailing mic frames queued before stream close
+        drained = []
+        while True:
+            try:
+                drained.append(self.audio_queue.get_nowait())
+            except queue.Empty:
+                break
+
         with self.live_buffer_lock:
+            if drained:
+                self.live_buffer.extend(drained)
+                self.live_backup_buffer.extend(drained)
+                if len(self.live_backup_buffer) > 3000:
+                    self.live_backup_buffer = self.live_backup_buffer[-3000:]
             remaining_buffer = self.live_buffer.copy()
             self.live_buffer = []
 
-        if remaining_buffer and self.model:
+        if remaining_buffer and (self.model is not None or self.backend is not None):
             self.log_internal("Flushing final buffer...")
-            self.process_live_chunk(remaining_buffer)
-        # -----------------------------------------
+            self._live_chunk_queue.put(remaining_buffer)
 
-        # Close the stream BEFORE releasing the guard: a hotkey press landing
-        # between the two would otherwise adopt this still-open stream and then
-        # have it closed out from under it.
-        self.stop_audio_stream()
+        # Wait (bounded + shutdown-aware) for _live_transcribe_loop to finish
+        # all queued live chunks in strict FIFO order before snapshotting.
+        wait_deadline = time.monotonic() + 30.0
+        while self._live_chunk_queue.unfinished_tasks > 0 and not self._shutting_down:
+            if time.monotonic() > wait_deadline:
+                break
+            time.sleep(0.02)
+
+        with self.live_buffer_lock:
+            backup_chunks = list(self.live_backup_buffer)
+        session_texts = list(self._live_session_texts)
+
         self.mode = None
         self.stopping = False
 
@@ -5538,10 +6379,11 @@ Troubleshooting:
             return
 
         def ui_idle():
-            self._reset_buttons_to_idle()
-            self.status_var.set("Ready. (Processing Live Backup...)")
+            if self.mode is None and not self.stopping:
+                self._reset_buttons_to_idle()
+                self.status_var.set("Ready. (Processing Live Backup...)")
         self._ui_after(0, ui_idle)
-        self.finalize_live_backup()
+        self.finalize_live_backup(backup_chunks, session_texts)
 
     def _reset_buttons_to_idle(self):
         """Reset both mode buttons to idle state"""
@@ -5584,24 +6426,26 @@ Troubleshooting:
                 self._report_recording_start_failure("batch")
                 return
             self.play_feedback_sound(start=True)
-            self.mode = "batch"
             self.batch_total_samples = 0
-            with self.audio_queue.mutex: self.audio_queue.queue.clear()
-            
-            # Initialize streaming batch state
+            with self.audio_queue.mutex:
+                self.audio_queue.queue.clear()
+
+            # Initialize streaming batch state before flipping self.mode
             self.batch_segments = []
             self.batch_segment_seq = 0
             self.batch_pending_audio = []
             self.batch_silence_count = 0
-            
+
             # Create thread pool - limit workers to avoid GPU memory issues
+            effective_dev = self.current_device or self.config.get('device', 'cpu')
             max_workers = (
                 AUDIO_RUNTIME["batch_executor_workers_cpu"]
-                if self.config.get('device') == 'cpu'
+                if effective_dev == 'cpu'
                 else AUDIO_RUNTIME["batch_executor_workers_gpu"]
             )
             self.batch_executor = ThreadPoolExecutor(max_workers=max_workers)
-            
+            self.mode = "batch"
+
             # Highlight BATCH button, dim LIVE button
             self.btn_batch.configure(fg_color=COLOR_BATCH, text_color="white", text=self._mode_button_text("batch"))
             self.btn_live.configure(fg_color=COLOR_BG, text_color=COLOR_TEXT_MUTED, text=self._mode_button_text("live"))
@@ -5611,64 +6455,84 @@ Troubleshooting:
     def _delayed_stop_batch(self):
         # Runs on a worker thread: marshal UI updates to the Tk main thread.
         time.sleep(AUDIO_RUNTIME["stop_delay_seconds"])
-        # Close the stream BEFORE releasing the guard (see _delayed_stop_live).
+        # Close the stream BEFORE draining & releasing the guard (see _delayed_stop_live).
         self.stop_audio_stream()
-        self.mode = None
-        self.stopping = False
+        while True:
+            try:
+                chunk = self.audio_queue.get_nowait()
+                self.batch_total_samples += len(chunk)
+                self.batch_pending_audio.append(chunk)
+            except queue.Empty:
+                break
 
         if self._shutting_down:
+            self.mode = None
+            self.stopping = False
             return
 
         def ui_transcribing():
-            # Show TRANSCRIBING state (amber)
-            self.btn_batch.configure(fg_color=COLOR_TRANSCRIBING, text_color="white", text="Transcribing...")
-            self.btn_live.configure(
-                fg_color=COLOR_BG,
-                text_color=COLOR_TEXT_MUTED,
-                text=self._mode_button_text("live"),
-            )
-            self.status_var.set("Processing Batch... Please Wait.")
-            self.update_mini_window_color(COLOR_TRANSCRIBING)
-        self._ui_after(0, ui_transcribing)
-        self.finalize_batch()
+            if self.mode is None and not self.stopping:
+                # Show TRANSCRIBING state (amber) only if a new session hasn't started
+                self.btn_batch.configure(fg_color=COLOR_TRANSCRIBING, text_color="white", text="Transcribing...")
+                self.btn_live.configure(
+                    fg_color=COLOR_BG,
+                    text_color=COLOR_TEXT_MUTED,
+                    text=self._mode_button_text("live"),
+                )
+                self.status_var.set("Processing Batch... Please Wait.")
+                self.update_mini_window_color(COLOR_TRANSCRIBING)
+        self.finalize_batch(on_transcribing_ui=ui_transcribing)
 
-    def finalize_batch(self):
+    def finalize_batch(self, on_transcribing_ui=None):
         # Runs on a worker thread (waits on the transcription pool); all UI
         # work is marshalled to the Tk main thread.
         def ui_reset():
-            self._reset_buttons_to_idle()
-            self.status_var.set("Ready.")
+            if self.mode is None and not self.stopping:
+                self._reset_buttons_to_idle()
+                self.status_var.set("Ready.")
 
-        if not self.batch_segments and not self.batch_pending_audio:
+        # 1. Queue any remaining pending audio while self.stopping is still True
+        if self.batch_pending_audio:
+            self._queue_batch_segment()
+
+        # 2. Snapshot session state and detach self.batch_executor BEFORE releasing
+        # self.mode / self.stopping so a subsequent hotkey press cannot clobber us.
+        with self.batch_segment_lock:
+            segments_snapshot = list(self.batch_segments)
+        total_samples = self.batch_total_samples
+        executor = self.batch_executor
+        self.batch_executor = None
+        self.mode = None
+        self.stopping = False
+
+        if not segments_snapshot:
+            if executor is not None:
+                executor.shutdown(wait=False)
             self.log_internal("No audio recorded.")
             self._ui_after(0, ui_reset)
             return
 
+        if on_transcribing_ui is not None:
+            self._ui_after(0, on_transcribing_ui)
+
         try:
-            # Track duration via the running sample counter (avoids keeping a
-            # second full copy of the recording in memory)
-            duration = self.batch_total_samples / AUDIO_RUNTIME["sample_rate"]
+            duration = total_samples / AUDIO_RUNTIME["sample_rate"]
             self.total_audio_duration += duration
             self.today_audio_duration += duration
 
-            # 1. Queue any remaining pending audio
-            if self.batch_pending_audio:
-                self._queue_batch_segment()
-
-            # 2. Wait for all segments to complete transcription
-            if self.batch_executor:
+            # 3. Wait for this session's segments to complete transcription
+            if executor is not None:
                 self.log_internal("Waiting for transcription threads...")
-                self.batch_executor.shutdown(wait=True)
-                self.batch_executor = None
+                executor.shutdown(wait=True)
 
-            # 3. Stitch results in correct order
+            # 4. Stitch results in correct order
             with self.batch_segment_lock:
-                ordered = sorted(self.batch_segments, key=lambda x: x['seq'])
+                ordered = sorted(segments_snapshot, key=lambda x: x['seq'])
                 results = [s['result'] for s in ordered if s['result'] and not s['result'].startswith('[Error')]
                 total_latency = sum(s.get('latency_ms', 0) for s in ordered)
                 full_text = " ".join(results).strip()
 
-            # 4. Output the combined text
+            # 5. Output the combined text
             if full_text:
                 self.log_internal(f"✅ Batch complete: {len(ordered)} segments stitched")
                 self.last_transcription_latency = total_latency
@@ -5684,10 +6548,13 @@ Troubleshooting:
                     self.status_var.set("Ready! Text copied to clipboard. Pasting...")
                     self.update_mini_window_color(COLOR_READY)
 
-                    # Auto-paste
-                    # Platform-aware paste (Cmd+V on Mac, Ctrl+V on Windows)
+                    # Auto-paste (guarded so UI always returns to idle even if keyboard hook is unavailable)
                     paste_key = get_paste_shortcut() if PLATFORM_UTILS_AVAILABLE else 'ctrl+v'
-                    keyboard.send(paste_key)
+                    if keyboard is not None:
+                        try:
+                            keyboard.send(paste_key)
+                        except Exception as paste_err:
+                            self.log_internal(f"Auto-paste skipped: {paste_err}")
 
                     # Return to idle after a delay
                     self._ui_after(UI_RUNTIME["ready_state_delay_ms"], ui_reset)
@@ -5733,6 +6600,7 @@ Troubleshooting:
                     self.backend.unload_model()
                     self._model_idle_unloaded = True
                     self._ui_after(0, lambda: self.status_var.set("Idle - model unloaded (GPU freed)"))
+                    self._ui_after(0, self._update_state_card)
             finally:
                 self._model_lock.release()
 
@@ -5755,50 +6623,90 @@ Troubleshooting:
                 self._ui_after(0, lambda: self.status_var.set("Load Error - retrying on next dictation"))
         self._last_activity_time = time.time()
 
-    def finalize_live_backup(self):
-        """Re-transcribe the full live session as a clipboard backup.
+    def finalize_live_backup(self, backup_chunks=None, session_texts=None):
+        """Produce a full-session clipboard backup at the end of Live mode.
 
         Clipboard-only by design: the live chunks were already typed, counted
-        into the stats, and saved to the archive. Pushing the backup through
-        result_queue as well would double-count every word and duplicate the
-        transcript archive.
+        into the stats, and saved to the archive. For short clips (<= ~60s)
+        when idle, we re-transcribe in-memory at beam_size=5 for higher
+        coherence; for long sessions (or if a new recording already started),
+        we join the session texts directly to avoid stalling the GPU/CPU.
         """
-        if not self.live_backup_buffer:
-            self._ui_after(0, lambda: self.status_var.set("Ready."))
+        if backup_chunks is None:
+            with self.live_buffer_lock:
+                backup_chunks = list(self.live_backup_buffer)
+        if session_texts is None:
+            session_texts = list(self._live_session_texts)
+
+        if not backup_chunks and not session_texts:
+            self._ui_after(
+                0,
+                lambda: self.status_var.set("Ready.")
+                if (self.mode is None and not self.stopping)
+                else None,
+            )
             return
-        temp_path = self._temp_audio_path("live_backup")
+
+        temp_path = None
+        text = ""
         try:
-            # We don't add duration here because live mode already adds it chunk by chunk
-            audio_np = np.concatenate(self.live_backup_buffer, axis=0).flatten()
-            wav.write(temp_path, AUDIO_RUNTIME["sample_rate"], audio_np)
-            with self._model_lock:
-                self._reload_model_if_needed_locked()
-                if not self.model: return
-                # Use backend abstraction if available
-                if self.backend and hasattr(self.backend, 'transcribe'):
-                    segments = self.backend.transcribe(temp_path)
-                    text = " ".join([s.text for s in segments]).strip()
-                else:
-                    segments, _ = self.model.transcribe(
-                        temp_path, beam_size=5, vad_filter=True, condition_on_previous_text=True
-                    )
-                    text = " ".join([s.text for s in segments]).strip()
+            if backup_chunks and len(backup_chunks) <= 600 and self.mode is None and not self._shutting_down:
+                audio_np = np.concatenate(backup_chunks, axis=0).flatten()
+                lang = self._local_language_arg()
+                with self._model_lock:
+                    self._reload_model_if_needed_locked()
+                    if self.backend and hasattr(self.backend, "transcribe_audio"):
+                        segments = self.backend.transcribe_audio(
+                            audio_np,
+                            sample_rate=AUDIO_RUNTIME["sample_rate"],
+                            beam_size=5,
+                            vad_filter=True,
+                            language=lang,
+                        )
+                        text = " ".join([s.text for s in segments]).strip()
+                    elif self.backend and hasattr(self.backend, "transcribe"):
+                        temp_path = self._temp_audio_path("live_backup")
+                        wav.write(temp_path, AUDIO_RUNTIME["sample_rate"], audio_np)
+                        segments = self.backend.transcribe(temp_path)
+                        text = " ".join([s.text for s in segments]).strip()
+                    elif self.model is not None:
+                        temp_path = self._temp_audio_path("live_backup")
+                        wav.write(temp_path, AUDIO_RUNTIME["sample_rate"], audio_np)
+                        segments, _ = self.model.transcribe(
+                            temp_path,
+                            beam_size=5,
+                            vad_filter=True,
+                            condition_on_previous_text=True,
+                            language=lang,
+                        )
+                        text = " ".join([s.text for s in segments]).strip()
+
+            if not text and session_texts:
+                text = " ".join(session_texts).strip()
 
             def deliver(backup_text=text):
                 if backup_text:
                     self.root.clipboard_clear()
                     self.root.clipboard_append(backup_text)
-                    self.status_var.set("Ready. (Backup in Clipboard)")
-                else:
+                    if self.mode is None and not self.stopping:
+                        self.status_var.set("Ready. (Backup in Clipboard)")
+                elif self.mode is None and not self.stopping:
                     self.status_var.set("Ready.")
             self._ui_after(0, deliver)
         except Exception as e:
             self.log_internal(f"Backup Error: {e}")
+            self._ui_after(
+                0,
+                lambda: self.status_var.set("Ready.")
+                if (self.mode is None and not self.stopping)
+                else None,
+            )
         finally:
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
+            if temp_path:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
 
     # --- MINIMIZATION LOGIC ---
     def on_minimize(self, event):
@@ -5910,77 +6818,78 @@ Troubleshooting:
 
     def processing_loop(self):
         silent_chunks = 0
-        current_live_duration = 0
-        
+        current_live_duration = 0.0
+
         while self.running:
             try:
-                data = self.audio_queue.get(timeout=AUDIO_RUNTIME["queue_timeout_seconds"])
-                
+                if self._live_reset_event.is_set():
+                    self._live_reset_event.clear()
+                    silent_chunks = 0
+                    current_live_duration = 0.0
+
+                timeout = (
+                    0.25
+                    if (self.mode is None and self.current_display_volume == 0.0)
+                    else AUDIO_RUNTIME["queue_timeout_seconds"]
+                )
+                data = self.audio_queue.get(timeout=timeout)
+
                 # SMOOTHING
-                raw_amp = np.sqrt(np.mean(data**2))
+                raw_amp = float(np.sqrt(np.mean(data ** 2)))
                 if raw_amp > self.current_display_volume:
-                    self.current_display_volume = raw_amp 
+                    self.current_display_volume = raw_amp
                 else:
-                    self.current_display_volume *= 0.85 
-                
+                    self.current_display_volume *= 0.85
+                    if self.current_display_volume < 1e-4:
+                        self.current_display_volume = 0.0
+
                 if self.mode == "batch":
                     self.batch_total_samples += len(data)
                     self.batch_pending_audio.append(data)
-                    
+
                     # VAD: detect pause for streaming segmentation
                     if raw_amp < self.config['silence_threshold']:
                         self.batch_silence_count += 1
                     else:
                         self.batch_silence_count = 0
-                    
+
                     # Calculate pending audio duration (~100ms per chunk at 16kHz, 1600 samples)
                     pending_duration = len(self.batch_pending_audio) * AUDIO_RUNTIME["chunk_duration_seconds"]
                     silence_duration = self.batch_silence_count * AUDIO_RUNTIME["chunk_duration_seconds"]
-                    
-                    # Progressive pause threshold: encourages ~20s segments
-                    # - Under 10s: require 2.0s pause (don't cut too early)
-                    # - 10s-20s: linearly decrease from 2.0s to 1.5s (progressively easier to cut)
-                    # - Over 20s: use 1.5s pause (eager to segment)
-                    # This creates more evenly spaced ~20s segments
+
                     if pending_duration < AUDIO_RUNTIME["batch_min_segment_seconds"]:
                         pause_threshold_batch = AUDIO_RUNTIME["pause_threshold_short_seconds"]
                     elif pending_duration < AUDIO_RUNTIME["batch_long_segment_seconds"]:
-                        # Linear interpolation: 2.0 at 10s → 1.5 at 20s
                         progress = (
                             pending_duration - AUDIO_RUNTIME["batch_min_segment_seconds"]
                         ) / (
                             AUDIO_RUNTIME["batch_long_segment_seconds"] - AUDIO_RUNTIME["batch_min_segment_seconds"]
-                        )  # 0 to 1
+                        )
                         pause_threshold_batch = AUDIO_RUNTIME["pause_threshold_short_seconds"] - (
                             (AUDIO_RUNTIME["pause_threshold_short_seconds"] - AUDIO_RUNTIME["pause_threshold_long_seconds"]) * progress
-                        )  # 2.0 → 1.5
+                        )
                     else:
                         pause_threshold_batch = AUDIO_RUNTIME["pause_threshold_long_seconds"]
-                    
-                    # Segment when: (pause detected AND 10s+ audio) OR 60s max reached
+
                     is_natural_break = (
                         silence_duration > pause_threshold_batch
                         and pending_duration > AUDIO_RUNTIME["batch_min_segment_seconds"]
                     )
                     is_max_duration = pending_duration > AUDIO_RUNTIME["batch_max_segment_seconds"]
-                    
-                    # Queue segment when pause detected or max duration reached
+
                     if (is_natural_break or is_max_duration) and not self.stopping:
                         self._queue_batch_segment()
                 elif self.mode in ("online_transcribe", "online_transcribe_edit"):
-                    # Online mode: streaming transcription with pause detection
                     self.online_pending_audio.append(data)
-                    online_pending_duration = len(self.online_pending_audio) * AUDIO_RUNTIME["chunk_duration_seconds"]  # ~100ms per chunk
-                    
-                    # Check for silence
+                    online_pending_duration = len(self.online_pending_audio) * AUDIO_RUNTIME["chunk_duration_seconds"]
+
                     if raw_amp < self.config['silence_threshold']:
                         self.online_silence_count += 1
                     else:
                         self.online_silence_count = 0
-                    
+
                     online_silence_duration = self.online_silence_count * AUDIO_RUNTIME["chunk_duration_seconds"]
-                    
-                    # Same progressive threshold as batch: ~20s target segments
+
                     if online_pending_duration < AUDIO_RUNTIME["batch_min_segment_seconds"]:
                         online_pause_threshold = AUDIO_RUNTIME["pause_threshold_short_seconds"]
                     elif online_pending_duration < AUDIO_RUNTIME["batch_long_segment_seconds"]:
@@ -5994,99 +6903,155 @@ Troubleshooting:
                         )
                     else:
                         online_pause_threshold = AUDIO_RUNTIME["pause_threshold_long_seconds"]
-                    
+
                     is_natural_break = (
                         online_silence_duration > online_pause_threshold
                         and online_pending_duration > AUDIO_RUNTIME["batch_min_segment_seconds"]
                     )
                     is_max_duration = online_pending_duration > AUDIO_RUNTIME["batch_max_segment_seconds"]
-                    
-                    # Queue segment when pause or max duration
+
                     if (is_natural_break or is_max_duration) and not self.stopping:
                         self._queue_online_segment()
                 elif self.mode == "live":
                     with self.live_buffer_lock:
                         self.live_buffer.append(data)
-                    self.live_backup_buffer.append(data) 
+                        self.live_backup_buffer.append(data)
+                        if len(self.live_backup_buffer) > 3000:
+                            self.live_backup_buffer = self.live_backup_buffer[-3000:]
                     chunk_dur = len(data) / AUDIO_RUNTIME["sample_rate"]
                     current_live_duration += chunk_dur
-            
-                if raw_amp < self.config['silence_threshold']:
-                    silent_chunks += 1
-                else:
-                    silent_chunks = 0
-                
-                # Audio thread: read the mirrored attribute, never the Tk var.
-                pause_threshold = self._live_pause
-                is_silence = (silent_chunks * AUDIO_RUNTIME["chunk_duration_seconds"]) > pause_threshold
-                is_too_long = current_live_duration > AUDIO_RUNTIME["live_max_chunk_seconds"]
 
-                if (is_silence or is_too_long) and current_live_duration > AUDIO_RUNTIME["live_min_chunk_seconds"] and not self.stopping:
-                    # Atomically capture and clear buffer to prevent race conditions
-                    with self.live_buffer_lock:
-                        buffer_to_process = self.live_buffer.copy()
-                        self.live_buffer = []
-                    if self.model and buffer_to_process:
-                        self.process_live_chunk(buffer_to_process)
-                    current_live_duration = 0
-                    silent_chunks = 0
-            
+                    if raw_amp < self.config['silence_threshold']:
+                        silent_chunks += 1
+                    else:
+                        silent_chunks = 0
+
+                    # Audio thread: read the mirrored attribute, never the Tk var.
+                    pause_threshold = self._live_pause
+                    is_silence = (silent_chunks * AUDIO_RUNTIME["chunk_duration_seconds"]) > pause_threshold
+                    is_too_long = current_live_duration > AUDIO_RUNTIME["live_max_chunk_seconds"]
+
+                    if (
+                        (is_silence or is_too_long)
+                        and current_live_duration > AUDIO_RUNTIME["live_min_chunk_seconds"]
+                        and not self.stopping
+                    ):
+                        with self.live_buffer_lock:
+                            buffer_to_process = self.live_buffer.copy()
+                            self.live_buffer = []
+                        if (self.model is not None or self.backend is not None) and buffer_to_process:
+                            self._live_chunk_queue.put(buffer_to_process)
+                        current_live_duration = 0.0
+                        silent_chunks = 0
+
             except queue.Empty:
                 self.current_display_volume *= 0.85
+                if self.current_display_volume < 1e-4:
+                    self.current_display_volume = 0.0
             except Exception as e:
                 # Never die silently - this loop is the audio engine
                 self.log_internal(f"Audio processing error: {e}")
 
+    def _live_transcribe_loop(self):
+        """Dedicated FIFO worker thread for live-mode chunks so processing_loop
+        never blocks mic draining or VU smoothing during inference."""
+        while self.running and not self._shutting_down:
+            try:
+                chunk = self._live_chunk_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            try:
+                if chunk is None:
+                    return
+                self.process_live_chunk(chunk)
+            except Exception as e:
+                self.log_internal(f"Live worker error: {e}")
+            finally:
+                self._live_chunk_queue.task_done()
+
+    _LIVE_HALLUCINATIONS = frozenset({
+        "thank you.",
+        "thank you",
+        "thanks for watching.",
+        "thanks for watching!",
+        "you",
+        ".",
+        "...",
+        "vielen dank.",
+        "vielen dank",
+        "danke.",
+        "tschüss.",
+        "untertitel der amara.org-community",
+    })
+
     def process_live_chunk(self, audio_data):
-        if not audio_data: return
+        if not audio_data:
+            return
         audio_np = np.concatenate(audio_data, axis=0).flatten()
-        
+
         # --- TRACK DURATION ---
         duration = len(audio_np) / AUDIO_RUNTIME["sample_rate"]
         self.total_audio_duration += duration
         self.today_audio_duration += duration
         # ----------------------
-        
-        temp_path = self._temp_audio_path("live")
-        wav.write(temp_path, AUDIO_RUNTIME["sample_rate"], audio_np)
+
+        temp_path = None
         try:
+            lang = self._local_language_arg()
             with self._model_lock:
                 self._reload_model_if_needed_locked()
+                if not self.model and not self.backend:
+                    return
 
-                # Track transcription latency
                 start_time = time.perf_counter()
 
-                # Use backend abstraction if available
-                # beam_size=1 for live chunks: latency matters more than the small
-                # accuracy gain of beam 5 (the full-session backup uses beam 5)
-                if self.backend and hasattr(self.backend, 'transcribe'):
+                # Zero-disk in-memory inference whenever supported by the backend
+                if self.backend and hasattr(self.backend, 'transcribe_audio'):
+                    segments = self.backend.transcribe_audio(
+                        audio_np,
+                        sample_rate=AUDIO_RUNTIME["sample_rate"],
+                        beam_size=1,
+                        vad_filter=True,
+                        language=lang,
+                    )
+                    text = "".join([s.text for s in segments]).strip()
+                elif self.backend and hasattr(self.backend, 'transcribe'):
+                    temp_path = self._temp_audio_path("live")
+                    wav.write(temp_path, AUDIO_RUNTIME["sample_rate"], audio_np)
                     segments = self.backend.transcribe(temp_path, beam_size=1)
                     text = "".join([s.text for s in segments]).strip()
                 else:
-                    segments, _ = self.model.transcribe(temp_path, beam_size=1, vad_filter=True)
+                    temp_path = self._temp_audio_path("live")
+                    wav.write(temp_path, AUDIO_RUNTIME["sample_rate"], audio_np)
+                    segments, _ = self.model.transcribe(
+                        temp_path, beam_size=1, vad_filter=True, language=lang
+                    )
                     text = "".join([s.text for s in segments]).strip()
 
-            # Calculate and record latency
             latency_ms = (time.perf_counter() - start_time) * 1000
             self.session_latencies.append(latency_ms)
             self.total_latencies.append(latency_ms)
 
-            hallucinations = ["thank you.", "you", ".", "Thank you."]
-            if text.lower().strip() in [h.lower() for h in hallucinations] or not text: return
+            if not text or text.lower().strip() in self._LIVE_HALLUCINATIONS:
+                return
 
-            # Log with latency for performance tracking
+            self._live_session_texts.append(text)
             self.log_internal(f"🎤 LIVE ⚡{latency_ms:.0f}ms")
-            self.last_transcription_latency = latency_ms  # Store for display
+            self.last_transcription_latency = latency_ms
             self.result_queue.put(f"[LIVE] {text}")
-            # Type the text directly (uses platform-aware keyboard module)
-            keyboard.write(text + " ")
+            if keyboard is not None:
+                try:
+                    keyboard.write(text + " ")
+                except Exception as type_err:
+                    self.log_internal(f"Auto-type skipped: {type_err}")
         except Exception as e:
             self.log_internal(f"Transcription error: {e}")
         finally:
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
+            if temp_path:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
 
     def _queue_batch_segment(self):
         """Queue current pending audio for background transcription"""
@@ -6097,7 +7062,6 @@ Troubleshooting:
             seq = self.batch_segment_seq
             self.batch_segment_seq += 1
             audio_data = self.batch_pending_audio.copy()
-            
             segment = {
                 'seq': seq,
                 'audio': audio_data,
@@ -6109,47 +7073,63 @@ Troubleshooting:
             self.batch_silence_count = 0
         
         # Submit to thread pool (created on batch start)
-        if self.batch_executor:
-            self.batch_executor.submit(self._transcribe_segment, seq)
+        executor = self.batch_executor
+        if executor is not None:
+            try:
+                executor.submit(self._transcribe_segment, seq, segment)
+            except RuntimeError:
+                pass
         
         self._update_batch_progress()
         self.log_internal(f"📦 Queued segment {seq + 1} for transcription")
 
-    def _transcribe_segment(self, seq):
+    def _transcribe_segment(self, seq, segment_ref=None):
         """Transcribe a single segment (runs in thread pool)"""
-        segment = None
+        segment = segment_ref
         with self.batch_segment_lock:
-            for s in self.batch_segments:
-                if s['seq'] == seq:
-                    segment = s
-                    s['status'] = 'transcribing'
-                    break
-        
-        if not segment or not self.model:
+            if segment is None:
+                for s in self.batch_segments:
+                    if s['seq'] == seq:
+                        segment = s
+                        break
+            if segment is not None:
+                segment['status'] = 'transcribing'
+
+        if not segment or (not self.model and not self.backend):
             return
 
-        temp_file = self._temp_audio_path(f"batch_seg_{seq}")
+        temp_file = None
         try:
             audio_np = np.concatenate(segment['audio'], axis=0).flatten()
-            wav.write(temp_file, AUDIO_RUNTIME["sample_rate"], audio_np)
+            lang = self._local_language_arg()
 
             with self._model_lock:
                 self._reload_model_if_needed_locked()
 
-                # Track transcription latency
                 start_time = time.perf_counter()
 
-                # Use backend abstraction if available
-                if self.backend and hasattr(self.backend, 'transcribe'):
+                if self.backend and hasattr(self.backend, 'transcribe_audio'):
+                    segments = self.backend.transcribe_audio(
+                        audio_np,
+                        sample_rate=AUDIO_RUNTIME["sample_rate"],
+                        beam_size=5,
+                        vad_filter=True,
+                        language=lang,
+                    )
+                    text = " ".join([s.text for s in segments]).strip()
+                elif self.backend and hasattr(self.backend, 'transcribe'):
+                    temp_file = self._temp_audio_path(f"batch_seg_{seq}")
+                    wav.write(temp_file, AUDIO_RUNTIME["sample_rate"], audio_np)
                     segments = self.backend.transcribe(temp_file)
                     text = " ".join([s.text for s in segments]).strip()
                 else:
+                    temp_file = self._temp_audio_path(f"batch_seg_{seq}")
+                    wav.write(temp_file, AUDIO_RUNTIME["sample_rate"], audio_np)
                     segments, _ = self.model.transcribe(
-                        temp_file, beam_size=5, vad_filter=True
+                        temp_file, beam_size=5, vad_filter=True, language=lang
                     )
                     text = " ".join([s.text for s in segments]).strip()
 
-            # Calculate latency
             latency_ms = (time.perf_counter() - start_time) * 1000
 
             with self.batch_segment_lock:
@@ -6158,7 +7138,6 @@ Troubleshooting:
                 segment['latency_ms'] = latency_ms
                 segment['audio'] = None  # Free the raw audio - no longer needed
 
-            # Log with latency info for performance comparison
             self.log_internal(f"✅ Segment {seq + 1} ⚡{latency_ms:.0f}ms")
 
         except Exception as e:
@@ -6167,15 +7146,18 @@ Troubleshooting:
                 segment['result'] = f"[Error: {e}]"
             self.log_internal(f"❌ Segment {seq + 1} error: {e}")
         finally:
-            try:
-                os.remove(temp_file)
-            except OSError:
-                pass
+            if temp_file:
+                try:
+                    os.remove(temp_file)
+                except OSError:
+                    pass
 
         self._update_batch_progress()
 
     def _update_batch_progress(self):
         """Update UI with batch transcription progress (called from pool threads)"""
+        if self.mode != "batch" and not self.stopping:
+            return
         with self.batch_segment_lock:
             total = len(self.batch_segments)
             done = sum(1 for s in self.batch_segments if s['status'] == 'done')
@@ -6209,8 +7191,20 @@ Troubleshooting:
             self.online_silence_count = 0
         
         # Submit to thread pool (created on online start)
-        if self.online_executor:
-            self.online_executor.submit(self._transcribe_online_segment, seq)
+        executor = self.online_executor
+        session_backend = self.online_backend
+        session_with_edit = self.online_with_edit
+        if executor is not None:
+            try:
+                executor.submit(
+                    self._transcribe_online_segment,
+                    seq,
+                    segment,
+                    session_backend,
+                    session_with_edit,
+                )
+            except RuntimeError:
+                pass
         
         self._update_online_progress()
         self.log_internal(f"📦 Queued online segment {seq + 1}")
@@ -6237,42 +7231,61 @@ Troubleshooting:
         )
         return backend
 
-    def _transcribe_online_segment(self, seq):
+    def _transcribe_online_segment(
+        self,
+        seq,
+        segment_ref=None,
+        session_backend=None,
+        session_with_edit=None,
+    ):
         """Transcribe a single segment via OpenAI API (runs in thread pool)"""
-        segment = None
+        segment = segment_ref
         with self.online_segment_lock:
-            for s in self.online_segments:
-                if s['seq'] == seq:
-                    segment = s
-                    s['status'] = 'transcribing'
-                    break
-        
+            if segment is None:
+                for s in self.online_segments:
+                    if s['seq'] == seq:
+                        segment = s
+                        break
+            if segment is not None:
+                segment['status'] = 'transcribing'
+
         if not segment:
             return
 
-        temp_file = self._temp_audio_path(f"online_seg_{seq}")
+        temp_file = None
         try:
-            # Concatenate audio and save to temp file
             audio_np = np.concatenate(segment['audio'], axis=0).flatten()
-            wav.write(temp_file, AUDIO_RUNTIME["sample_rate"], (audio_np * 32767).astype(np.int16))
-
-            # Track transcription latency
             start_time = time.perf_counter()
-            
-            # One configured backend (one OpenAI client) per recording
-            # session; only build a fresh one if the session backend is gone.
-            backend = self.online_backend or self._get_online_backend()
 
-            if self.online_with_edit:
-                raw_text, edited_text = backend.transcribe_and_edit(temp_file)
-                text = edited_text
+            # One configured backend (one OpenAI client) per recording session
+            backend = session_backend or self.online_backend or self._get_online_backend()
+            with_edit = self.online_with_edit if session_with_edit is None else session_with_edit
+
+            if with_edit:
+                if hasattr(backend, 'transcribe_and_edit_audio'):
+                    _raw_text, edited_text = backend.transcribe_and_edit_audio(
+                        audio_np, sample_rate=AUDIO_RUNTIME["sample_rate"]
+                    )
+                    text = edited_text
+                else:
+                    temp_file = self._temp_audio_path(f"online_seg_{seq}")
+                    wav.write(temp_file, AUDIO_RUNTIME["sample_rate"], audio_np)
+                    _raw_text, edited_text = backend.transcribe_and_edit(temp_file)
+                    text = edited_text
             else:
-                segments_result = backend.transcribe(temp_file)
-                text = " ".join(seg.text for seg in segments_result).strip()
-            
-            # Calculate latency
+                if hasattr(backend, 'transcribe_audio'):
+                    segments_result = backend.transcribe_audio(
+                        audio_np, sample_rate=AUDIO_RUNTIME["sample_rate"]
+                    )
+                    text = " ".join(seg.text for seg in segments_result).strip()
+                else:
+                    temp_file = self._temp_audio_path(f"online_seg_{seq}")
+                    wav.write(temp_file, AUDIO_RUNTIME["sample_rate"], audio_np)
+                    segments_result = backend.transcribe(temp_file)
+                    text = " ".join(seg.text for seg in segments_result).strip()
+
             latency_ms = (time.perf_counter() - start_time) * 1000
-            
+
             with self.online_segment_lock:
                 segment['result'] = text
                 segment['status'] = 'done'
@@ -6287,10 +7300,11 @@ Troubleshooting:
                 segment['result'] = f"[Error: {e}]"
             self.log_internal(f"❌ Online segment {seq + 1} error: {e}")
         finally:
-            try:
-                os.remove(temp_file)
-            except OSError:
-                pass
+            if temp_file:
+                try:
+                    os.remove(temp_file)
+                except OSError:
+                    pass
 
         self._update_online_progress()
 
@@ -6368,20 +7382,20 @@ Troubleshooting:
         self._schedule_insights_refresh()
 
     def load_recent_transcriptions(self):
-        """Load transcriptions from last 2 calendar days + today"""
+        """Load recent transcription history and seed analytics cache in one pass."""
         self.history = []
         today = datetime.date.today()
         cutoff_date = today - datetime.timedelta(days=TRANSCRIPTION_HISTORY_DAYS)
-        
+        cutoff_month = cutoff_date.strftime("%Y-%m")
+        cutoff_dt = datetime.datetime.combine(cutoff_date, datetime.time.min)
+
         try:
             if not os.path.exists(TRANSCRIPTIONS_DIR):
                 return
-            
-            # Get relevant month files (current and possibly previous month)
-            months_to_check = set()
-            for i in range(TRANSCRIPTION_HISTORY_DAYS + 1):  # Today and recent days might span 2 months
-                check_date = today - datetime.timedelta(days=i)
-                months_to_check.add(check_date.strftime("%Y-%m"))
+
+            all_entries = []
+            scanned_files = 0
+            parsed_all_files = True
 
             # Merge all month files: legacy shared ("YYYY-MM.txt") and
             # per-machine ("YYYY-MM.HOSTNAME.txt"); skip Dropbox conflict debris
@@ -6389,49 +7403,52 @@ Troubleshooting:
                 if not filename.lower().endswith('.txt'):
                     continue
                 if 'conflicted copy' in filename.lower():
-                    continue  # avoid double-counting duplicated entries
-                if filename[:7] not in months_to_check:
                     continue
                 filepath = os.path.join(TRANSCRIPTIONS_DIR, filename)
+                if not os.path.isfile(filepath):
+                    continue
+                scanned_files += 1
+                if len(filename) >= 7 and filename[:4].isdigit() and filename[4] == '-':
+                    if filename[:7] < cutoff_month:
+                        parsed_all_files = False
+                        continue
 
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        
-                        # Parse timestamp and text
-                        # Format: [YYYY-MM-DD HH:MM:SS] text
-                        if line.startswith('[') and '] ' in line:
-                            try:
-                                ts_end = line.index('] ')
-                                ts_str = line[1:ts_end]
-                                text = line[ts_end + 2:]
-                                
-                                timestamp = datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-                                
-                                # Check if within date range
-                                if timestamp.date() >= cutoff_date:
-                                    # Archived lines carry no latency: pad to
-                                    # the (timestamp, text, latency_ms) shape
-                                    self.history.append((timestamp, text, 0))
-                            except (ValueError, IndexError):
-                                continue
-            
-            # Sort by timestamp
+                try:
+                    file_entries = self._parse_transcript_file(filepath)
+                except Exception:
+                    continue
+
+                if parsed_all_files:
+                    all_entries.extend(file_entries)
+
+                for entry in file_entries:
+                    if entry["timestamp"] >= cutoff_dt:
+                        self.history.append((entry["timestamp"], entry["text"], 0))
+
             self.history.sort(key=lambda x: x[0])
-            
-            # Recalculate robust Today stats ignoring volatile session data.
+
+            # Seed the analytics cache when every archive file fell within cutoff_month
+            # so refresh_insights_tabs() performs zero duplicate disk reads on startup.
+            if parsed_all_files:
+                all_entries.sort(key=lambda x: x["timestamp"])
+                self._analytics_entries_cache = all_entries
+                self._analytics_scanned_files = scanned_files
+                self._analytics_tokens_cache = None
+                self._analytics_langs_cache = None
+
+            # Reconcile Today's word count while preserving genuine recorded audio duration
             if self.history:
-                today_date = datetime.date.today()
-                today_text = " ".join([text for dt, text, _lat in self.history if dt.date() == today_date])
-                self.today_words = len(self._tokenize_words(today_text))
-                self.today_audio_duration = (self.today_words / 130.0) * 60.0 # Estimate duration linearly
-            
+                today_text = " ".join([text for dt, text, _lat in self.history if dt.date() == today])
+                archive_today_words = len(self._tokenize_words(today_text))
+                if archive_today_words > 0:
+                    self.today_words = max(self.today_words, archive_today_words)
+                    if self.today_audio_duration <= 0.0:
+                        self.today_audio_duration = (self.today_words / 130.0) * 60.0
+
             if self.history:
                 self.history_index = len(self.history) - 1
                 self.current_transcription = self.history[-1][1]
-                
+
         except Exception as e:
             self.log_internal(f"Error loading transcription history: {e}")
 
@@ -6563,10 +7580,14 @@ Troubleshooting:
 
     def _run_scheduled_histogram_refresh(self):
         self._histogram_job = None
+        if self._shutting_down:
+            return
         self.update_histogram()
 
     def update_histogram(self):
         """Redraw both histograms"""
+        if self._shutting_down:
+            return
         # Draw today's histogram (dynamic hour range)
         today_data = self.get_histogram_data(for_today=True)
         self.draw_histogram_on_canvas(self.histogram_canvas_today, today_data, 
@@ -6834,6 +7855,9 @@ Troubleshooting:
         # The whole body is guarded: one unexpected exception here used to kill
         # the loop permanently (no reschedule), freezing every live readout
         # while the app looked fine. The reschedule now lives in `finally`.
+        self._gui_loop_job = None
+        if self._shutting_down:
+            return
         loop_interval = 1000
         try:
             loop_interval = self._update_gui_loop_body()
@@ -6842,13 +7866,27 @@ Troubleshooting:
         finally:
             if not self._shutting_down:
                 try:
-                    self.root.after(loop_interval, self.update_gui_loop)
+                    self._gui_loop_job = self.root.after(loop_interval, self.update_gui_loop)
                 except (tk.TclError, RuntimeError):
                     pass
 
     def _update_gui_loop_body(self):
         """One tick of the GUI refresh loop. Returns the next delay in ms."""
         # (Hotkey actions are drained by the dedicated 50ms _hotkey_pump loop)
+
+        # 0. Midnight rollover check (if the app stays running overnight)
+        today_iso = datetime.date.today().isoformat()
+        if today_iso != self.session_date:
+            try:
+                self.flush_stats()
+            except Exception:
+                pass
+            self.session_date = today_iso
+            self.today_words = 0
+            self.today_audio_duration = 0.0
+            self.session_latencies = []
+            self._hourly_merge_cache = None
+            self._schedule_histogram_refresh(delay_ms=200)
 
         # 1. Logs (buffered until the System Log accordion is first expanded)
         while not self.msg_queue.empty():
@@ -6883,8 +7921,7 @@ Troubleshooting:
             self._append_log_line(
                 f"[{timestamp}] {mode_tag}: {len(clean_text.split())} words transcribed\n")
 
-        # --- STATISTICS (cheap arithmetic; also runs while idle so the status
-        # strip and the Insights summary line stay current) ---
+        # --- STATISTICS (cached so idle ticks perform zero redundant Tk redraws) ---
         alltime_words = self.total_words + self._peer_stats.get('total_words', 0)
         alltime_audio_duration = self.total_audio_duration + self._peer_stats.get('total_audio_duration', 0.0)
         alltime_mins_saved = alltime_words / TYPING_WPM
@@ -6900,29 +7937,49 @@ Troubleshooting:
         alltime_avg_latency = sum(self.total_latencies[-100:]) / len(self.total_latencies[-100:]) if self.total_latencies else 0
         avg_latency = session_avg_latency or alltime_avg_latency
 
-        # All-time block now lives inside the expanded Speech Insights body
-        self.lbl_alltime_words.config(text=f"{alltime_words:,}")
-        self.lbl_alltime_time.config(text=f"{self.format_time_saved(alltime_mins_saved)}")
-        self.lbl_alltime_duration.config(text=f"{self.format_speaking_time(alltime_audio_duration)}")
-        self.lbl_alltime_speed.config(text=f"{alltime_speed} WPM")
+        cache = self._ui_render_cache
 
-        self.status_stats_var.set(
+        alltime_tuple = (
+            f"{alltime_words:,}",
+            f"{self.format_time_saved(alltime_mins_saved)}",
+            f"{self.format_speaking_time(alltime_audio_duration)}",
+            f"{alltime_speed} WPM",
+        )
+        if cache.get("alltime_tuple") != alltime_tuple:
+            cache["alltime_tuple"] = alltime_tuple
+            self.lbl_alltime_words.config(text=alltime_tuple[0])
+            self.lbl_alltime_time.config(text=alltime_tuple[1])
+            self.lbl_alltime_duration.config(text=alltime_tuple[2])
+            self.lbl_alltime_speed.config(text=alltime_tuple[3])
+
+        status_stats_txt = (
             f"{avg_latency / 1000.0:.1f} s · {today_spoken_mins:.0f} min today"
             f" · saved {self.format_time_saved(today_mins_saved)}"
         )
-        self._update_insights_summary(self.today_words, session_speed)
+        if cache.get("status_stats") != status_stats_txt:
+            cache["status_stats"] = status_stats_txt
+            self.status_stats_var.set(status_stats_txt)
+
+        summary_key = (self.today_words, session_speed)
+        if cache.get("insights_summary") != summary_key:
+            cache["insights_summary"] = summary_key
+            self._update_insights_summary(self.today_words, session_speed)
+
         self._update_state_card()
 
-        # 3. VU meter (progress colour follows the active mode)
+        # 3. VU meter (quantized to 0.001 so idle ticks never trigger CTk canvas redraws)
         display_val = min(1.0, self.current_display_volume * AUDIO_RUNTIME["live_buffer_gain"])
-        self.vu_meter.set(display_val)
+        vu_val = round(display_val, 3)
+        if cache.get("vu_val") != vu_val:
+            cache["vu_val"] = vu_val
+            self.vu_meter.set(display_val)
 
         # 4. Mini window
         if self.mini_window and self.mini_canvas:
             x0 = getattr(self, "_mini_vu_x0", 27)
             x1 = getattr(self, "_mini_vu_x1", UI_RUNTIME["mini_window_width"] - 68)
             frac = min(1.0, display_val * AUDIO_RUNTIME["mini_vu_multiplier"])
-            self.mini_canvas.coords(self.mini_vu, x0, 31, x0 + (x1 - x0) * frac, 35)
+            frac_q = round(frac, 3)
 
             elapsed = self.state_elapsed_var.get() or "0:00"
             if self.mode == "live":
@@ -6944,10 +8001,15 @@ Troubleshooting:
             else:
                 status_txt = f"Idle · {self.config['hotkey_live'].upper()}"
 
-            self.mini_canvas.itemconfigure("status_text", text=status_txt)
-            self.mini_canvas.itemconfigure("stats_text", text=f"{self.today_words:,} w")
-            self.mini_canvas.itemconfigure(
-                "stats_text2", text=f"{self.format_speaking_time(self.today_audio_duration)}")
+            stats1_txt = f"{self.today_words:,} w"
+            stats2_txt = f"{self.format_speaking_time(self.today_audio_duration)}"
+            mini_key = (id(self.mini_canvas), frac_q, status_txt, stats1_txt, stats2_txt)
+            if cache.get("mini_state") != mini_key:
+                cache["mini_state"] = mini_key
+                self.mini_canvas.coords(self.mini_vu, x0, 31, x0 + (x1 - x0) * frac, 35)
+                self.mini_canvas.itemconfigure("status_text", text=status_txt)
+                self.mini_canvas.itemconfigure("stats_text", text=stats1_txt)
+                self.mini_canvas.itemconfigure("stats_text2", text=stats2_txt)
 
         # Adaptive loop speed: fast (30ms) when transcribing, slow (1000ms) when idle
         return UI_RUNTIME["main_loop_interval_ms"] if self.mode else 1000
@@ -6964,7 +8026,10 @@ Troubleshooting:
         """'Reload Model' button: retry a load that previously failed."""
         self._model_error_dialog_shown = False
         self._model_idle_unloaded = False
+        self._model_load_failed = False
+        self._model_loading = True
         self.status_var.set("Reloading model...")
+        self._update_state_card()
         self.log_internal("Manual model reload requested.")
         threading.Thread(target=self.load_model, daemon=True).start()
 
@@ -6978,20 +8043,22 @@ Troubleshooting:
         return f"Downloading model {short}… first run only"
 
     def _report_model_load_failure(self, error):
-        """Make a failed model load impossible to miss.
-
-        Before this, a load failure left the status bar reading "Loading..."
-        forever with the traceback going to a stdout that does not exist
-        under pythonw.exe.
-        """
+        """Make a failed model load impossible to miss."""
+        self._model_load_failed = True
         message = str(error)
         log.error("Model load failed: %s", message, exc_info=True)
         try:
             self.log_internal(f"❌ Model load failed: {message}")
         except Exception:
             pass
-        self._ui_after(0, lambda: self.status_var.set("Model load failed – see System Log"))
-        self._ui_after(0, lambda: self._set_state_dot(COLOR_LIVE))
+
+        def _show_err_state():
+            self.status_var.set("Model load failed – see System Log")
+            self._ui_render_cache["state_dot"] = COLOR_LIVE
+            self._set_state_dot(COLOR_LIVE)
+            self._update_state_card()
+
+        self._ui_after(0, _show_err_state)
         if getattr(self, "_model_error_dialog_shown", False) or NO_DIALOGS:
             return
         self._model_error_dialog_shown = True
@@ -7002,57 +8069,157 @@ Troubleshooting:
         )
         self._ui_after(0, lambda: messagebox.showerror("Model load failed", detail))
 
+    @staticmethod
+    def _sanitize_no_proxy():
+        """Strip brackets around bare IPv6 host entries (e.g. ``[::1]`` -> ``::1``)
+        so ``httpx`` does not raise ``InvalidURL``."""
+        for key in ("NO_PROXY", "no_proxy"):
+            raw = os.environ.get(key)
+            if not raw or "[" not in raw:
+                continue
+            parts = []
+            seen = set()
+            for item in raw.split(","):
+                tok = item.strip()
+                if not tok:
+                    continue
+                if "://" not in tok and tok.startswith("[") and tok.endswith("]"):
+                    tok = tok[1:-1]
+                if tok not in seen:
+                    seen.add(tok)
+                    parts.append(tok)
+            updated = ",".join(parts)
+            if updated != raw:
+                os.environ[key] = updated
+
+    @staticmethod
+    def _resolve_faster_whisper_repo_id(model_id):
+        if "/" in model_id:
+            return model_id
+        try:
+            from faster_whisper.utils import _MODELS as fw_models
+            if model_id in fw_models:
+                return fw_models[model_id]
+        except Exception:
+            pass
+        return f"systran/faster-whisper-{model_id}"
+
+    @staticmethod
+    def _resolve_local_ct2_dir(target_dir):
+        """Locate ``model.bin`` either directly in ``target_dir`` or inside a HuggingFace snapshot."""
+        if not os.path.isdir(target_dir):
+            return None
+        direct = os.path.join(target_dir, "model.bin")
+        if os.path.isfile(direct):
+            return target_dir
+        best = None
+        best_mtime = -1.0
+        for root, dirs, files in os.walk(target_dir):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            if "model.bin" in files:
+                cand = os.path.join(root, "model.bin")
+                try:
+                    mt = os.path.getmtime(cand)
+                except OSError:
+                    mt = 0.0
+                if mt >= best_mtime:
+                    best_mtime = mt
+                    best = root
+        return best
+
     def _load_model_locked(self):
-        # Set by the backend-failure path below so the legacy block loads on
-        # CPU instead of retrying the device that just failed.
         legacy_device = None
         legacy_compute_type = None
+        self._model_loading = True
+        self._model_load_failed = False
+        self._ui_after(0, self._update_state_card)
         try:
             friendly_name = self.config['model_key']
             model_id = MODEL_MAP.get(friendly_name, "medium")
-            
+
             # --- 1. REFRESH DROPDOWN INDICATORS ---
-            # This ensures we see the arrow/checkmark correctly on startup/reload
             self._ui_after(0, self.refresh_model_list)
-            
+
             self.log_internal(f"Init {friendly_name}...")
-            
+
             safe_name = friendly_name.replace(" ", "_").replace("(", "").replace(")", "").replace("/", "_")
             local_models_root = os.path.join(app_dir, "models")
             target_dir = os.path.join(local_models_root, safe_name)
-            
+
             # --- 2. DETERMINE BACKEND ---
             backend_name = self.config.get('backend', 'auto')
             device = self.config.get('device', 'auto')
             compute_type = self.config.get('compute_type', 'auto')
-            
-            # Check if this is a Parakeet model - requires Parakeet backend
-            is_parakeet_model = 'parakeet' in model_id.lower() or 'nvidia/parakeet' in model_id.lower()
-            
-            # Use backend abstraction if available
+            if backend_name == 'cuda':
+                backend_name = 'faster-whisper'
+                if device in ('auto', '', None):
+                    device = 'cuda'
+
+            model_id_low = model_id.lower()
+            model_id_tail = model_id_low.split("/")[-1]
+            is_onnx_asr_model = (model_id_low in ONNX_ASR_MODEL_IDS) or (model_id_tail in ONNX_ASR_MODEL_IDS)
+            is_parakeet_only_model = (
+                ('parakeet' in model_id_low or 'nvidia/parakeet' in model_id_low)
+                and not is_onnx_asr_model
+            )
+
             if BACKENDS_AVAILABLE and backend_name != 'legacy':
-                # Force Parakeet backend for Parakeet models
-                if is_parakeet_model:
+                if is_onnx_asr_model:
+                    if backend_name == 'parakeet':
+                        parakeet_ok = False
+                        try:
+                            parakeet_ok, _ = create_backend('parakeet').is_available
+                        except Exception:
+                            parakeet_ok = False
+                        if not parakeet_ok:
+                            self.log_internal("[Parakeet] NeMo not installed — using lightweight ONNX ASR backend")
+                            backend_name = 'onnx-asr'
+                    elif backend_name != 'openai':
+                        backend_name = 'onnx-asr'
+                        self.log_internal("[ONNX ASR model detected] Using ONNX ASR backend")
+
+                    if device == 'auto':
+                        if backend_name == 'parakeet':
+                            try:
+                                import torch
+                                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                            except ImportError:
+                                device = 'cpu'
+                        else:
+                            _, detected_device, _ = detect_best_backend()
+                            device = (
+                                detected_device
+                                if detected_device in ('cuda', 'dml', 'coreml', 'cpu')
+                                else 'cpu'
+                            )
+                elif is_parakeet_only_model:
                     backend_name = 'parakeet'
-                    self.log_internal(f"[Parakeet model detected] Using Parakeet backend")
-                    # Parakeet works best with CUDA
+                    self.log_internal("[Parakeet model detected] Using Parakeet backend")
                     if device == 'auto':
                         try:
                             import torch
                             device = 'cuda' if torch.cuda.is_available() else 'cpu'
                         except ImportError:
                             device = 'cpu'
-                # Auto-detect best backend if needed (for non-Parakeet models)
+                elif backend_name == 'parakeet':
+                    parakeet_ok = False
+                    try:
+                        parakeet_ok, _ = create_backend('parakeet').is_available
+                    except Exception:
+                        parakeet_ok = False
+                    if not parakeet_ok:
+                        self.log_internal("[Parakeet] NeMo not installed — falling back to ONNX ASR backend")
+                        backend_name = 'onnx-asr'
+                        if device == 'auto':
+                            _, detected_device, _ = detect_best_backend()
+                            device = (
+                                detected_device
+                                if detected_device in ('cuda', 'dml', 'coreml', 'cpu')
+                                else 'cpu'
+                            )
                 elif backend_name == 'auto' or device == 'auto':
                     detected_backend, detected_device, reason = detect_best_backend()
                     if backend_name == 'auto':
-                        # The detected backend brings its own device, and it
-                        # overrides the persisted one. load_config() resolves
-                        # device with a CUDA-or-CPU probe that knows nothing
-                        # about OpenVINO, so a persisted 'cpu' would otherwise
-                        # be handed to the OpenVINO backend, which expects
-                        # 'GPU'/'NPU'. A device the user pinned explicitly is
-                        # untouched, because then backend is not 'auto'.
                         backend_name = detected_backend
                         if detected_device and detected_device != device:
                             self.log_internal(
@@ -7060,39 +8227,42 @@ Troubleshooting:
                                 f"(follows the auto-selected {detected_backend} backend)"
                             )
                         device = detected_device
-                        # The old compute_type belongs to the old device.
                         compute_type = 'auto'
                     elif device == 'auto':
-                        device = detected_device
+                        if backend_name == 'onnx-asr' and detected_device not in ('cuda', 'dml', 'coreml', 'cpu'):
+                            device = 'cpu'
+                        else:
+                            device = detected_device
                     self.log_internal(f"[Auto-detect] {reason}")
-                
+
+                # Release any previously active backend (and worker subprocess / GPU memory)
+                if unload_all_backends is not None:
+                    try:
+                        unload_all_backends(exclude=backend_name)
+                    except Exception as unload_err:
+                        log.warning("Could not unload previous backends: %s", unload_err)
+
                 # Create backend instance
                 self.backend = create_backend(backend_name)
                 self.current_backend_name = backend_name
                 self.current_device = device
-                
+
                 # Resolve compute type
                 if compute_type == 'auto':
                     if hasattr(self.backend, 'get_optimal_compute_type'):
                         compute_type = self.backend.get_optimal_compute_type(device)
                     else:
                         compute_type = 'int8' if device == 'cpu' else 'float16'
-                
+
                 self.log_internal(f"Loading {backend_name} backend ({device}, {compute_type})...")
-                
-                # Progress bar for download. Never for the cloud backend:
-                # it has no local model, so "Downloading model ..." would be a
-                # lie and the indeterminate bar would spin forever.
+
                 if backend_name != ONLINE_BACKEND_NAME and not self.is_model_downloaded(friendly_name):
                     download_text = self._download_status_text(model_id)
                     self.log_internal(download_text)
                     self._ui_after(0, lambda: self._show_progress("Downloading..."))
                     self._ui_after(0, lambda t=download_text: self.status_var.set(t))
-                
-                # Load model via backend - with fallback on failure.
-                # configure() is inside the try: without an API key it raises,
-                # and that belongs to the "set your OpenAI key" branch below,
-                # not to the generic model-load-failure dialog.
+                    self._ui_after(0, self._update_state_card)
+
                 try:
                     if backend_name == 'openai':
                         self.backend.configure(
@@ -7107,12 +8277,13 @@ Troubleshooting:
                         model_key=friendly_name,
                         device=device,
                         compute_type=compute_type,
-                        model_path=target_dir
+                        model_path=target_dir,
                     )
-                    
+
                     # For compatibility with existing transcription code
                     self.model = self.backend.model if hasattr(self.backend, 'model') else self.backend
-                    
+                    self._model_load_failed = False
+
                     self._ui_after(0, self._hide_progress)
                     self._ui_after(0, self.refresh_model_list)
                     self.log_internal(f"Model Ready. [{backend_name.upper()} / {device.upper()}]")
@@ -7120,11 +8291,12 @@ Troubleshooting:
                     self._ui_after(0, self._update_device_model_labels)
                     return
                 except Exception as backend_error:
-                    # Backend failed
                     self.log_internal(f"⚠️ {backend_name} failed: {backend_error}")
-                    
-                    # Don't fall back to faster-whisper for Parakeet models - they're incompatible
-                    if is_parakeet_model:
+                    err_low = str(backend_error).lower()
+
+                    if is_parakeet_only_model:
+                        self._model_load_failed = True
+                        self.model = None
                         error_msg = (
                             f"Parakeet model requires NeMo to be installed.\n\n"
                             f"Error: {backend_error}\n\n"
@@ -7138,25 +8310,41 @@ Troubleshooting:
                             self._ui_after(0, lambda: messagebox.showerror("NeMo Required", error_msg))
                         self._ui_after(0, lambda: self.status_var.set("Error: NeMo not installed"))
                         return
-                    
+
                     if backend_name == 'openai' or device == 'cloud':
-                        # Cloud backend has no local fallback (usually a missing API key)
                         self.backend = None
+                        self.model = None
+                        self._model_load_failed = False
                         self._ui_after(0, self._hide_progress)
                         self._ui_after(0, lambda: self.status_var.set("Online mode - set OpenAI API key in Configuration"))
                         return
 
-                    # For other backends, fall back to faster-whisper on CPU.
-                    # The legacy block below must actually USE cpu/int8 - reading
-                    # self.config here would retry the very device that just
-                    # failed (e.g. cuda/float16) and fail again.
+                    # Do not fall through to legacy faster-whisper when loading an ONNX-only model
+                    # or when CPU/offline failure already occurred cleanly on the primary backend.
+                    is_offline_or_missing = any(
+                        phrase in err_low
+                        for phrase in (
+                            "is not downloaded yet",
+                            "no internet connection",
+                            "offline mode",
+                            "local_files_only",
+                        )
+                    )
+                    if is_onnx_asr_model or backend_name == 'onnx-asr' or is_offline_or_missing or device == 'cpu':
+                        self.model = None
+                        self._ui_after(0, self._hide_progress)
+                        self._report_model_load_failure(backend_error)
+                        return
+
                     self.log_internal("Falling back to CPU (int8)")
-                    log.warning("Backend %s failed (%s); falling back to CPU (int8)",
-                                backend_name, backend_error)
+                    log.warning(
+                        "Backend %s failed (%s); falling back to CPU (int8)",
+                        backend_name,
+                        backend_error,
+                    )
                     legacy_device = 'cpu'
                     legacy_compute_type = 'int8'
                     self._ui_after(0, self._hide_progress)
-                    # Fall through to legacy code below
 
             # --- FALLBACK: Original WhisperModel code (legacy mode) ---
             if legacy_device is None:
@@ -7169,18 +8357,30 @@ Troubleshooting:
             self.backend = None
             self.current_backend_name = 'faster-whisper'
             self.current_device = legacy_device
-            
-            # --- 2. PROGRESS BAR SETUP ---
-            # Check if likely already downloaded first to avoid flashing progress bar
+
+            self._sanitize_no_proxy()
+            offline_env = any(
+                os.environ.get(var, "").strip().lower() in ("1", "true", "yes")
+                for var in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+            )
+
+            if not self.is_model_downloaded(friendly_name):
+                self.migrate_from_cache(model_id, target_dir)
+
+            if not self.is_model_downloaded(friendly_name) and offline_env:
+                raise RuntimeError(
+                    f"Model '{friendly_name}' is not downloaded yet and offline mode is enabled."
+                )
+
+            snapshot_download = _get_snapshot_download()
             if not self.is_model_downloaded(friendly_name) and snapshot_download:
                 download_text = self._download_status_text(model_id)
                 self.log_internal(download_text)
 
-                # Show progress bar in indeterminate mode (animated)
                 def show_progress():
                     self.progress_bar.configure(mode="indeterminate")
                     self.progress_frame.pack(fill="x", padx=5, pady=0)
-                    self.progress_bar.start(15)  # Animation speed
+                    self.progress_bar.start(15)
                     self.progress_label.configure(text="Downloading...")
 
                 def hide_progress():
@@ -7190,75 +8390,64 @@ Troubleshooting:
 
                 self._ui_after(0, show_progress)
                 self._ui_after(0, lambda t=download_text: self.status_var.set(t))
+                self._ui_after(0, self._update_state_card)
 
                 try:
-                   repo_id = model_id
-                   if "/" not in model_id: repo_id = f"systran/faster-whisper-{model_id}"
-
-                   # No local_dir_use_symlinks: huggingface_hub 1.x removed the
-                   # kwarg and raises TypeError if it is passed.
-                   snapshot_download(repo_id=repo_id, local_dir=target_dir)
+                    repo_id = self._resolve_faster_whisper_repo_id(model_id)
+                    snapshot_download(repo_id=repo_id, local_dir=target_dir)
                 finally:
-                   # Hide progress bar
-                   self._ui_after(0, hide_progress)
-
-            # ----------------------------------
-            
-            if not os.path.exists(target_dir) or not os.listdir(target_dir):
-                self.migrate_from_cache(model_id, target_dir)
+                    self._ui_after(0, hide_progress)
 
             os.makedirs(target_dir, exist_ok=True)
-            
-            # Check if model files exist directly in target_dir (from snapshot_download)
-            # Look for model.bin which is the main model file
-            model_bin_path = os.path.join(target_dir, "model.bin")
-            if os.path.exists(model_bin_path):
-                # Model was downloaded via snapshot_download directly into target_dir
-                # Load from the local path directly
-                self.log_internal(f"Loading model from local path...")
-                from faster_whisper import WhisperModel
+            resolved_local_dir = self._resolve_local_ct2_dir(target_dir)
+            from faster_whisper import WhisperModel
+
+            if resolved_local_dir is not None:
+                self.log_internal("Loading model from local path...")
                 self.model = WhisperModel(
-                    target_dir,  # Use the directory path directly
+                    resolved_local_dir,
                     device=legacy_device,
-                    compute_type=legacy_compute_type
+                    compute_type=legacy_compute_type,
+                    local_files_only=True,
                 )
             else:
-                # Fallback: model needs to be downloaded or is in cache format
-                from faster_whisper import WhisperModel
                 self.model = WhisperModel(
                     model_id,
                     device=legacy_device,
                     compute_type=legacy_compute_type,
-                    download_root=target_dir
+                    download_root=target_dir,
+                    local_files_only=offline_env,
                 )
-            
-            # Refresh again to show checkmark now that it's downloaded
+
+            self._model_load_failed = False
             self._ui_after(0, self.refresh_model_list)
+            self._ui_after(0, self._update_device_model_labels)
 
             self.log_internal("Model Ready.")
             self._ui_after(0, lambda: self.status_var.set("Ready."))
         except Exception as e:
+            self._model_load_failed = True
+            self.model = None
             error_str = str(e).lower()
             self.log_internal(f"Load Error: {e}")
             self._ui_after(0, lambda: self.progress_frame.pack_forget())
 
-            # Check for CUDA/cuDNN specific errors
             is_cuda_error = any(kw in error_str for kw in CUDA_ERROR_KEYWORDS)
 
             if is_cuda_error and self.config.get('device') == 'cuda':
-                # Keep the existing, more specific CUDA dialog for this case,
-                # but still make the failure visible in the status bar.
                 log.error("Model load failed (CUDA): %s", e, exc_info=True)
                 self._ui_after(0, lambda: self.status_var.set("Model load failed – see System Log"))
                 self._ui_after(0, lambda: self._set_state_dot(COLOR_LIVE))
                 self._ui_after(0, lambda err=e: self._show_cuda_error_dialog(str(err)))
             else:
                 self._report_model_load_failure(e)
+        finally:
+            self._model_loading = False
+            self._ui_after(0, self._update_state_card)
 
     def migrate_from_cache(self, model_id, target_dir):
         try:
-            repo_id = model_id
-            if "/" not in model_id: repo_id = f"systran/faster-whisper-{model_id}"
+            repo_id = self._resolve_faster_whisper_repo_id(model_id)
             cache_name = f"models--{repo_id.replace('/', '--')}"
             default_cache_path = os.path.expanduser(os.path.join("~", ".cache", "huggingface", "hub", cache_name))
             
@@ -7419,6 +8608,35 @@ Troubleshooting:
 
         self.running = False
 
+        # Cancel all pending Tk after() callbacks so root.destroy() never logs TclErrors
+        for job_attr in (
+            "_hotkey_pump_job",
+            "_gui_loop_job",
+            "_hotkey_watchdog_job",
+            "_insights_refresh_job",
+            "_histogram_job",
+            "_init_histogram_job",
+            "_welcome_job",
+            "_auto_crunch_job",
+            "_scroll_sync_job",
+            "_focus_cfg_job",
+        ):
+            job_id = getattr(self, job_attr, None)
+            if job_id is not None:
+                setattr(self, job_attr, None)
+                try:
+                    self.root.after_cancel(job_id)
+                except Exception:
+                    pass
+
+        for tip in list(getattr(self, "_active_tooltips", ())):
+            try:
+                tip.destroy()
+            except Exception:
+                pass
+        if hasattr(self, "_active_tooltips"):
+            self._active_tooltips.clear()
+
         # Stop whatever is recording. Done inline rather than via
         # _stop_any_recording(): that spawns the async finalisation threads,
         # which would sleep, transcribe and then touch widgets that this
@@ -7428,6 +8646,10 @@ Troubleshooting:
         try:
             with self.audio_queue.mutex:
                 self.audio_queue.queue.clear()
+        except Exception:
+            pass
+        try:
+            self._live_chunk_queue.put_nowait(None)
         except Exception:
             pass
 
@@ -7443,10 +8665,6 @@ Troubleshooting:
         except Exception:
             pass
 
-        # Executor shutdown and model unload both go on a helper thread with a
-        # bounded join. Verified bug: closing the window while the very first
-        # model download was still running blocked here forever, because
-        # unload_model() waits on the worker that is busy downloading.
         def _release_heavy_resources():
             for attr in ('online_executor', 'batch_executor'):
                 executor = getattr(self, attr, None)
@@ -7461,12 +8679,12 @@ Troubleshooting:
                     self.backend.unload_model()
             except Exception as e:
                 log.warning("unload_model() during shutdown failed: %s", e)
+            if unload_all_backends is not None:
+                try:
+                    unload_all_backends()
+                except Exception as e:
+                    log.warning("unload_all_backends() during shutdown failed: %s", e)
 
-        # Captured before the thread starts: _teardown_worker() waits up to 3 s
-        # for a clean shutdown, so when our own 3 s join expires the child may
-        # still be alive - and the releaser is a daemon thread, so nobody would
-        # ever kill it. An orphaned worker keeps its CUDA context, which is the
-        # exact thing worker mode exists to release.
         worker_proc = getattr(self.backend, "_proc", None) if self.backend is not None else None
 
         releaser = threading.Thread(target=_release_heavy_resources, daemon=True)

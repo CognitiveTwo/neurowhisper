@@ -5,14 +5,16 @@
 A local voice-dictation app for the desktop. Hold a hotkey, speak, and the text is
 typed into whatever window you were already in — your editor, your browser, your
 chat client. Transcription runs on your own machine with
-[faster-whisper](https://github.com/SYSTRAN/faster-whisper), so nothing leaves the
+[faster-whisper](https://github.com/SYSTRAN/faster-whisper) or
+[onnx-asr](https://github.com/istupakov/onnx-asr), so nothing leaves the
 computer unless you explicitly turn on cloud mode.
 
 ## What you get
 
 - **Live mode** — streams your speech and types it as you talk.
 - **Batch mode** — record a longer stretch, then transcribe it in one go.
-- **Automatic GPU/CPU selection** — uses CUDA when it can, falls back to CPU otherwise.
+- **Modern local models** — Whisper Large v3 Turbo, NVIDIA Parakeet TDT 0.6B v3 (ONNX, no PyTorch needed), Distil-Whisper Large v3.5, plus classic Small/Base/Medium/Large-v3.
+- **Automatic GPU/CPU selection** — uses CUDA or ONNX Runtime hardware providers when available, falls back to INT8 CPU otherwise.
 - **Customizable hotkeys** — any key combination, changed from the UI.
 - **Statistics** — words dictated, speaking time, and usage over time.
 - **Optional cloud mode** — send audio to the OpenAI API instead, if you prefer.
@@ -107,12 +109,15 @@ click the **Rebind** button next to the hotkey fields.
 
 | Model | Download | RAM | Best for |
 |-------|----------|-----|----------|
-| Base | ~150 MB | 2 GB | Quick notes, low-spec machines |
-| Small (default) | ~460 MB | 2 GB | General use, comfortable on CPU |
-| Medium | ~1.5 GB | 4 GB | Better accuracy |
-| Large-v3 | ~3 GB | 8 GB | Best accuracy, GPU recommended |
+| Large v3 Turbo | ~800 MB | 3 GB | Fast & accurate across 99 languages |
+| Parakeet TDT 0.6B v3 (ONNX) | ~650 MB | 2 GB | Ultra-fast CPU/GPU across 25 European languages (EN, DE, FR, ES, …) |
+| Distil Large v3.5 | ~750 MB | 3 GB | Ultra-fast English dictation |
+| Small (default) | ~460 MB | 2 GB | General multilingual use, comfortable on CPU |
+| Base | ~150 MB | 1.5 GB | Quick notes, low-spec machines |
+| Medium | ~1.5 GB | 4 GB | Higher multilingual accuracy |
+| Large-v3 | ~3 GB | 8 GB | Maximum accuracy, GPU recommended |
 
-Pick a model in the app; it downloads on first use.
+Pick a model (and optional language lock such as `en` or `de`) in the app; it downloads on first use and runs offline afterwards.
 
 ## GPU acceleration
 
@@ -121,18 +126,21 @@ Transcription on an NVIDIA GPU is several times faster than on CPU.
 1. Download the CUDA/cuDNN DLLs from
    [whisper-standalone-win](https://github.com/Purfview/whisper-standalone-win/releases/tag/libs).
 2. Extract them into the application folder (next to `whisper_gui.pyw`).
-3. Restart the app and set the backend to **Auto** — it detects CUDA and switches
-   to the GPU, and silently falls back to CPU if the DLLs are missing or the
+3. Set **Acceleration** to **Auto** — it detects CUDA and switches to the GPU
+   immediately, and falls back to CPU cleanly if the DLLs are missing or the
    driver is too old.
 
 The DLLs are large (~1.8 GB) and are deliberately not part of this repository.
 
-**Other backends.** Intel GPUs can run the model through OpenVINO, and NVIDIA
-GPUs can alternatively use the Parakeet TDT model via NVIDIA NeMo. Both are
-optional and need extra packages installed into the app's virtual environment:
+**Lightweight ONNX ASR (included).** Selecting **Parakeet TDT 0.6B v3** or the
+**ONNX ASR (CPU/GPU)** acceleration option runs inference through `onnx-asr` and
+ONNX Runtime — no PyTorch or NVIDIA NeMo installation required.
+
+**Optional backends.** Intel GPUs/NPUs can run Whisper models through OpenVINO,
+and NVIDIA GPUs can alternatively run Parakeet via NVIDIA NeMo:
 
 ```bash
-pip install -r requirements-openvino.txt   # Intel GPU (OpenVINO)
+pip install -r requirements-openvino.txt   # Intel GPU / NPU (OpenVINO)
 pip install -r requirements-nemo.txt       # Parakeet TDT (NeMo, NVIDIA GPU)
 ```
 
@@ -158,8 +166,10 @@ OpenAI API key for the labelling steps.
 
 Everything stays on your machine by default:
 
-- Audio is transcribed locally and the recordings are temporary files that are
-  deleted after use.
+- Audio is transcribed directly in memory for all in-process backends — recordings
+  are never written to disk unless an out-of-process CUDA worker, NeMo, or custom
+  backend requires a short-lived temporary buffer, which is deleted immediately
+  after use.
 - Transcripts are written to `transcriptions/` on your disk. Delete them at any
   time; nothing is uploaded.
 - Anything leaves the machine **only** if you turn on the optional OpenAI cloud
@@ -200,14 +210,14 @@ rebuilds the virtual environment if a dependency is broken.
 
 **Hotkey robustness.** Windows drops keyboard hooks under a variety of
 conditions (UAC dialogs, lock screen, elevated windows). The app re-registers
-hotkeys every 3 minutes, runs a 10-second watchdog on the handlers, refreshes on
+hotkeys every 3 minutes, runs a 5-second watchdog on the handlers, refreshes on
 window focus and on restore-from-minimize, and offers a manual refresh button.
 
 **Adaptive GUI loop.** The UI refresh runs at 30 ms while transcribing and drops
-to 1000 ms when idle, skipping all canvas redraws. The original fixed 30 ms loop
-burned about a third of a CPU core continuously and caused system-wide typing
-lag; the adaptive loop makes idle CPU usage effectively zero. See
-`update_gui_loop()` in `whisper_gui.pyw`.
+to 1000 ms when idle, skipping all canvas and widget redraws when state has not
+changed. The original fixed 30 ms loop burned about a third of a CPU core
+continuously and caused system-wide typing lag; the adaptive loop makes idle CPU
+usage effectively zero. See `update_gui_loop()` in `whisper_gui.pyw`.
 
 ## License
 
@@ -216,5 +226,6 @@ lag; the adaptive loop makes idle CPU usage effectively zero. See
 ## Credits
 
 Built on [faster-whisper](https://github.com/SYSTRAN/faster-whisper),
+[onnx-asr](https://github.com/istupakov/onnx-asr),
 [CTranslate2](https://github.com/OpenNMT/CTranslate2) and
 [customtkinter](https://github.com/TomSchimansky/CustomTkinter).

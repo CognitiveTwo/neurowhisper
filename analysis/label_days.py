@@ -146,15 +146,28 @@ def from_app_insights(args, day_entries):
         if not isinstance(value, dict):
             unusable += 1
             continue
-        topics = [str(t).strip() for t in
-                  (list(value.get("projects") or []) + list(value.get("topics") or [])
-                   + list(value.get("themes") or []))
-                  if str(t).strip()]
+        concrete_topics = [
+            str(t).strip()
+            for t in (list(value.get("projects") or []) + list(value.get("topics") or []))
+            if str(t).strip()
+        ]
+        theme_topics = [
+            str(t).strip()
+            for t in (list(value.get("themes") or []))
+            if str(t).strip()
+        ]
         seen, uniq = set(), []
-        for t in topics:
+        for t in concrete_topics:
             if t.lower() not in seen:
                 seen.add(t.lower())
                 uniq.append(t)
+        if len(uniq) < 3:
+            for t in theme_topics:
+                if t.lower() not in seen:
+                    seen.add(t.lower())
+                    uniq.append(t)
+                    if len(uniq) >= 3:
+                        break
         label = {
             "mood": str(value.get("mood", "")).strip() or "unlabelled",
             "mood_score": value.get("mood_score", 50),
@@ -265,19 +278,25 @@ def main(argv=None):
         from openai import OpenAI
     except ImportError:
         raise SystemExit("The openai package is missing: pip install -r analysis/requirements.txt")
-    client = OpenAI(api_key=key)
+    client = OpenAI(api_key=key, timeout=90.0)
 
     done = failed = 0
     tok_in = tok_out = 0
     for i, (day, text) in enumerate(todo, 1):
-        obj, reason, usage = label_one(client, args.model, day, text)
+        try:
+            obj, reason, usage = label_one(client, args.model, day, text)
+        except Exception as exc:
+            obj, reason, usage = None, f"API error ({exc})", None
         if usage is not None:
             tok_in += getattr(usage, "prompt_tokens", 0) or 0
             tok_out += getattr(usage, "completion_tokens", 0) or 0
         if obj is None:
             if args.verbose:
                 print(f"  [{i}/{len(todo)}] {day}: {reason} - retrying once")
-            obj, reason, usage = label_one(client, args.model, day, text, temperature=0.0)
+            try:
+                obj, reason, usage = label_one(client, args.model, day, text, temperature=0.0)
+            except Exception as exc:
+                obj, reason, usage = None, f"API error ({exc})", None
             if usage is not None:
                 tok_in += getattr(usage, "prompt_tokens", 0) or 0
                 tok_out += getattr(usage, "completion_tokens", 0) or 0

@@ -6,14 +6,15 @@ faster-whisper==1.2.1
 ctranslate2==4.6.2
 sounddevice==0.5.3
 keyboard==0.13.5
-pynput>=1.7.6,<2  # macOS-compatible keyboard alternative (used automatically on Mac)
+pynput>=1.7.6,<2  # macOS and non-root Linux X11 keyboard backend
 customtkinter==5.2.2
 Pillow>=10       # window icon rendering
 
 numpy==2.3.5
 
-# Hard transitive dependency of faster-whisper (VAD runs on onnxruntime).
-onnxruntime>=1.14,<2
+# Hard transitive dependency of faster-whisper (VAD) and onnx-asr (Parakeet/Canary ONNX).
+onnxruntime>=1.18.1,<2,!=1.24.1,!=1.25.*,!=1.26.0
+onnx-asr>=0.12.0,<1
 
 # Audio processing
 av==16.0.1
