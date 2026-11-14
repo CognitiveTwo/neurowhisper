@@ -986,6 +986,106 @@ class TestWhisperAppIntegration(unittest.TestCase):
         self.assertEqual(migrated["backend"], "faster-whisper")
         self.assertEqual(migrated["device"], "cuda")
 
+    def test_scroll_clamping_and_combobox_hover_tooltips(self):
+        """Regression test for scroll top-gap bug and truncated dropdown item tooltips."""
+        self.root.deiconify()
+        self.root.geometry("480x850+40+40")
+        self.root.update()
+        if not self.app.insights_collapsed.get():
+            self.app.toggle_insights()
+        if not self.app.config_collapsed.get():
+            self.app.toggle_settings()
+        if not self.app.log_collapsed.get():
+            self.app.toggle_log()
+        self.root.update()
+        self.app._update_scroll_region()
+        self.root.update()
+
+        # 1. With all accordions collapsed (content fits inside 850px viewport),
+        # scrolling up OR down must keep canvasy(0) strictly at 0.0 (zero top gap!).
+        for delta in (120, 480, -120, -480, 30, -30):
+            ev = types.SimpleNamespace(widget=self.app.content_frame, delta=delta, num=None)
+            self.app._on_mousewheel(ev)
+        self.root.update()
+        self.assertAlmostEqual(float(self.app._scroll_canvas.canvasy(0)), 0.0, places=1)
+
+        # 2. Expand Configuration + Speech Insights + System Log so content overflows,
+        # scroll down, verify bounds [0, req_h - avail_h], then collapse back and verify
+        # canvasy(0) snaps cleanly back to 0.0!
+        if self.app.insights_collapsed.get():
+            self.app.toggle_insights()
+        if self.app.config_collapsed.get():
+            self.app.toggle_settings()
+        if self.app.log_collapsed.get():
+            self.app.toggle_log()
+        self.root.update()
+        self.app._update_scroll_region()
+        self.root.update()
+
+        req_h = self.app.content_frame.winfo_reqheight()
+        avail_h = self.app._scroll_canvas.winfo_height()
+        self.assertGreater(req_h, avail_h)
+
+        # Scroll down well past bottom -> clamps at req_h - avail_h
+        for _ in range(40):
+            self.app._on_mousewheel(
+                types.SimpleNamespace(widget=self.app.content_frame, delta=-120, num=None)
+            )
+        self.root.update()
+        cur_y = float(self.app._scroll_canvas.canvasy(0))
+        self.assertGreater(cur_y, 0.0)
+        self.assertLessEqual(cur_y, float(req_h - avail_h) + 1.0)
+
+        # Scrolling over a CLOSED combobox scrolls the page and does NOT mutate selection
+        selected_before = self.app.model_var.get()
+        res = self.app.combo.event_generate("<MouseWheel>", delta=120)
+        self.root.update()
+        self.assertEqual(self.app.model_var.get(), selected_before)
+
+        # Collapse all three accordions while scrolled down -> must snap back to y=0.0!
+        self.app.toggle_log()
+        self.app.toggle_settings()
+        self.app.toggle_insights()
+        self.root.update()
+        self.app._update_scroll_region()
+        self.root.update()
+        self.assertAlmostEqual(float(self.app._scroll_canvas.canvasy(0)), 0.0, places=1)
+
+        # 3. Expand Configuration, post Model combobox dropdown, verify auto-widening
+        # and full-line per-item hover tooltip!
+        self.app.toggle_settings()
+        self.root.update()
+        combo = self.app.combo
+        cb_w = combo.winfo_width()
+        combo.tk.call("ttk::combobox::Post", combo._w)
+        self.root.update()
+        popdown = combo.tk.call("ttk::combobox::PopdownWindow", combo._w)
+        pop_geom = str(combo.tk.call("wm", "geometry", popdown))
+        pop_w = int(pop_geom.split("x", 1)[0])
+        self.assertGreater(pop_w, cb_w)
+
+        # Trigger listbox hover callback on item 1 (Parakeet TDT 0.6B v3 full label)
+        lb_path = f"{popdown}.f.l"
+        bbox = combo.tk.call(lb_path, "bbox", 1)
+        if isinstance(bbox, str):
+            bbox = [int(v) for v in bbox.split()]
+        on_lb_motion = combo._nw_popdown_callbacks[0]
+        on_lb_motion("10", str(bbox[1] + 2), "200", "220")
+        self.root.update()
+        expected_line = str(combo.tk.call(lb_path, "get", 1))
+        active_texts = []
+        for tip in list(getattr(self.app, "_active_tooltips", ())):
+            for child in tip.winfo_children():
+                if hasattr(child, "cget"):
+                    active_texts.append(str(child.cget("text")))
+        self.assertIn(expected_line, active_texts)
+
+        # Unposting the dropdown must immediately destroy the item tooltip!
+        combo.tk.call("ttk::combobox::Unpost", combo._w)
+        self.root.update()
+        self.assertEqual(len(getattr(self.app, "_active_tooltips", set())), 0)
+        self.assertEqual(self.tk_errors, [])
+
 
 # --------------------------------------------------------------------------- #
 # 7. End-to-End Analysis Toolkit Tests

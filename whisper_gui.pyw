@@ -245,6 +245,7 @@ try:
         get_paste_shortcut,
         IS_MAC,
         IS_WINDOWS,
+        IS_LINUX,
         PLATFORM_NAME,
         KEYBOARD_ERROR,
     )
@@ -254,6 +255,7 @@ except ImportError:
     import keyboard
     IS_MAC = False
     IS_WINDOWS = True
+    IS_LINUX = sys.platform.startswith("linux")
     PLATFORM_NAME = 'windows'
     KEYBOARD_ERROR = None
     PLATFORM_UTILS_AVAILABLE = False
@@ -1237,33 +1239,377 @@ class WhisperApp:
         self.style.configure("TCheckbutton", background=COLOR_ACCENT_BG, foreground=COLOR_FG)
         self.style.configure("Horizontal.TProgressbar", troughcolor=COLOR_ACCENT_BG, background=COLOR_TEAL, bordercolor=COLOR_BG, lightcolor=COLOR_TEAL, darkcolor=COLOR_TEAL)
 
+    def _get_monitor_workarea(self, rx, ry):
+        """Return (left, top, right, bottom) of the monitor containing (rx, ry),
+        supporting multi-monitor negative/secondary coordinates on Windows."""
+        if IS_WINDOWS:
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                class _MONITORINFO(ctypes.Structure):
+                    _fields_ = [
+                        ("cbSize", wintypes.DWORD),
+                        ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT),
+                        ("dwFlags", wintypes.DWORD),
+                    ]
+
+                pt = wintypes.POINT(int(rx), int(ry))
+                hmon = ctypes.windll.user32.MonitorFromPoint(pt, 2)
+                if hmon:
+                    mi = _MONITORINFO()
+                    mi.cbSize = ctypes.sizeof(_MONITORINFO)
+                    if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                        r = mi.rcWork
+                        return int(r.left), int(r.top), int(r.right), int(r.bottom)
+            except Exception:
+                pass
+        try:
+            sw = int(self.root.winfo_screenwidth())
+            sh = int(self.root.winfo_screenheight())
+            if 0 <= rx < sw and 0 <= ry < sh:
+                return 0, 0, sw, sh
+        except Exception:
+            pass
+        return None
+
+    def _position_tooltip_window(self, tip, anchor_x, avoid_y_min, avoid_y_max, ref_x=None, ref_y=None):
+        """Place tooltip cleanly below avoid_y_max (or above avoid_y_min if near
+        screen bottom) without ever covering the cursor or spilling off-monitor."""
+        try:
+            tip.update_idletasks()
+            tip_w = max(1, tip.winfo_reqwidth())
+            tip_h = max(1, tip.winfo_reqheight())
+        except Exception:
+            tip_w, tip_h = 220, 28
+
+        x = int(anchor_x)
+        y = int(avoid_y_max) + 6
+        px = x if ref_x is None else int(ref_x)
+        py = int(avoid_y_max) if ref_y is None else int(ref_y)
+        bounds = self._get_monitor_workarea(px, py)
+        if bounds is not None:
+            ml, mt, mr, mb = bounds
+            if x + tip_w > mr - 6:
+                x = max(ml + 6, mr - tip_w - 6)
+            if x < ml + 6:
+                x = ml + 6
+            if y + tip_h > mb - 6:
+                y = max(mt + 6, int(avoid_y_min) - tip_h - 6)
+        tip.wm_geometry(f"+{int(x)}+{int(y)}")
+
     def _create_tooltip(self, widget, text):
-        """Create a hover tooltip for a widget"""
+        """Create a topmost dark-theme hover tooltip for ``widget``.
+
+        ``text`` may be either a string or a zero-arg callable returning a string.
+        """
+        if not hasattr(self, "_active_tooltips"):
+            self._active_tooltips = set()
         tooltip = None
-        
-        def show_tooltip(event):
+
+        def hide_tooltip(event=None):
             nonlocal tooltip
-            x = widget.winfo_rootx() + 10
-            y = widget.winfo_rooty() + widget.winfo_height() + 5
-            
-            tooltip = tk.Toplevel(widget)
-            tooltip.wm_overrideredirect(True)
-            tooltip.wm_geometry(f"+{x}+{y}")
-            tooltip.configure(bg="#333")
-            
-            label = tk.Label(tooltip, text=text, justify="left",
-                           bg="#333", fg="#fff", font=("Arial", 9),
-                           relief="solid", borderwidth=1, padx=8, pady=4)
-            label.pack()
-        
-        def hide_tooltip(event):
-            nonlocal tooltip
-            if tooltip:
-                tooltip.destroy()
+            if tooltip is not None:
+                self._active_tooltips.discard(tooltip)
+                try:
+                    tooltip.destroy()
+                except Exception:
+                    pass
                 tooltip = None
-        
-        widget.bind("<Enter>", show_tooltip)
-        widget.bind("<Leave>", hide_tooltip)
+
+        def show_tooltip(event=None):
+            nonlocal tooltip
+            if getattr(self, "_shutting_down", False):
+                return
+            hide_tooltip()
+            try:
+                resolved = text() if callable(text) else text
+            except Exception:
+                resolved = ""
+            if not resolved:
+                return
+            try:
+                wx = widget.winfo_rootx()
+                wy = widget.winfo_rooty()
+                wh = widget.winfo_height()
+            except Exception:
+                return
+
+            tooltip = tk.Toplevel(self.root)
+            self._active_tooltips.add(tooltip)
+            tooltip.wm_overrideredirect(True)
+            try:
+                tooltip.wm_attributes("-topmost", True)
+            except Exception:
+                pass
+            tooltip.configure(bg=COLOR_BORDER)
+
+            label = tk.Label(
+                tooltip,
+                text=str(resolved),
+                justify="left",
+                bg=COLOR_ACCENT_BG,
+                fg=COLOR_FG,
+                font=("Arial", 9),
+                padx=8,
+                pady=5,
+            )
+            label.pack(padx=1, pady=1)
+            self._position_tooltip_window(
+                tooltip,
+                anchor_x=wx + 8,
+                avoid_y_min=wy,
+                avoid_y_max=wy + wh,
+                ref_x=wx + 8,
+                ref_y=wy + wh // 2,
+            )
+
+        widget._nw_hide_tooltip = hide_tooltip
+        widget.bind("<Enter>", show_tooltip, add="+")
+        widget.bind("<Leave>", hide_tooltip, add="+")
+        widget.bind("<ButtonPress>", hide_tooltip, add="+")
+        widget.bind("<Unmap>", hide_tooltip, add="+")
+        widget.bind("<Destroy>", hide_tooltip, add="+")
+
+    def _enhance_combobox(self, combo, hint_text=None):
+        """Add three UX upgrades to a ``ttk.Combobox``:
+        1. Full-line hover tooltip on the closed combobox (selected value + hint).
+        2. Live per-item full-line hover tooltip inside the open dropdown list.
+        3. Auto-widened dropdown popup (via native ``postoffset``) plus a guard
+           preventing mouse-wheel page scrolling from mutating closed comboboxes.
+        """
+        import tkinter.font as tkfont
+
+        if not hasattr(self, "_active_tooltips"):
+            self._active_tooltips = set()
+        self._combo_style_seq = getattr(self, "_combo_style_seq", 0) + 1
+        style_name = f"NWCombo{self._combo_style_seq}.TCombobox"
+        try:
+            combo.configure(style=style_name)
+        except Exception:
+            style_name = None
+
+        def _closed_tooltip_text():
+            try:
+                current = (combo.get() or "").strip()
+            except Exception:
+                current = ""
+            if current and hint_text:
+                return f"{current}\n\n{hint_text}"
+            return current or (hint_text or "")
+
+        self._create_tooltip(combo, _closed_tooltip_text)
+
+        item_tip = None
+        item_label = None
+        last_idx = None
+        popdown_bound = False
+        last_postoffset = (0, 0, 0, 0)
+
+        def _hide_item_tip(*_args):
+            nonlocal item_tip, item_label, last_idx
+            last_idx = None
+            if item_tip is not None:
+                self._active_tooltips.discard(item_tip)
+                try:
+                    item_tip.destroy()
+                except Exception:
+                    pass
+                item_tip = None
+                item_label = None
+
+        def _show_item_tip(full_text, anchor_x, row_top_y, row_bot_y, ref_x, ref_y):
+            nonlocal item_tip, item_label
+            if getattr(self, "_shutting_down", False) or not full_text:
+                _hide_item_tip()
+                return
+            if item_tip is None or not item_tip.winfo_exists():
+                item_tip = tk.Toplevel(self.root)
+                self._active_tooltips.add(item_tip)
+                item_tip.wm_overrideredirect(True)
+                try:
+                    item_tip.wm_attributes("-topmost", True)
+                except Exception:
+                    pass
+                item_tip.configure(bg=COLOR_TEAL)
+                item_label = tk.Label(
+                    item_tip,
+                    text=full_text,
+                    justify="left",
+                    bg=COLOR_BG,
+                    fg=COLOR_FG,
+                    font=("Arial", 9),
+                    padx=9,
+                    pady=4,
+                )
+                item_label.pack(padx=1, pady=1)
+            else:
+                item_label.configure(text=full_text)
+            self._position_tooltip_window(
+                item_tip,
+                anchor_x=anchor_x,
+                avoid_y_min=row_top_y,
+                avoid_y_max=row_bot_y,
+                ref_x=ref_x,
+                ref_y=ref_y,
+            )
+
+        def _ensure_popdown_bound():
+            nonlocal popdown_bound
+            if popdown_bound:
+                return
+            try:
+                popdown = combo.tk.call("ttk::combobox::PopdownWindow", combo._w)
+                lb_path = f"{popdown}.f.l"
+            except Exception:
+                return
+
+            def _parse_bbox(raw_bbox):
+                if not raw_bbox:
+                    return None
+                if isinstance(raw_bbox, str):
+                    parts = raw_bbox.split()
+                    return [int(v) for v in parts] if len(parts) == 4 else None
+                if len(raw_bbox) == 4:
+                    return [int(v) for v in raw_bbox]
+                return None
+
+            def _on_lb_motion(x_s, y_s, rx_s, ry_s):
+                nonlocal last_idx
+                try:
+                    y = int(float(y_s))
+                    rx = int(float(rx_s))
+                    ry = int(float(ry_s))
+                    size = int(combo.tk.call(lb_path, "size"))
+                    if size <= 0:
+                        _hide_item_tip()
+                        return
+                    idx = int(combo.tk.call(lb_path, "nearest", y))
+                    bbox = _parse_bbox(combo.tk.call(lb_path, "bbox", idx))
+                    if not bbox:
+                        _hide_item_tip()
+                        return
+                    _bx, by, _bw, bh = bbox
+                    if y < by - 2 or y > by + bh + 2:
+                        _hide_item_tip()
+                        return
+                    full_line = str(combo.tk.call(lb_path, "get", idx))
+                    lb_rooty = int(combo.tk.call("winfo", "rooty", lb_path))
+                    row_top_y = lb_rooty + by
+                    row_bot_y = row_top_y + bh
+                    last_idx = idx
+                    _show_item_tip(full_line, rx + 14, row_top_y, row_bot_y, rx, ry)
+                except Exception:
+                    _hide_item_tip()
+
+            def _on_lb_key(*_a):
+                nonlocal last_idx
+                try:
+                    sel = combo.tk.call(lb_path, "curselection")
+                    if not sel:
+                        return
+                    idx = int(sel[0] if not isinstance(sel, str) else sel.split()[0])
+                    bbox = _parse_bbox(combo.tk.call(lb_path, "bbox", idx))
+                    if not bbox:
+                        return
+                    _bx, by, _bw, bh = bbox
+                    full_line = str(combo.tk.call(lb_path, "get", idx))
+                    lb_rootx = int(combo.tk.call("winfo", "rootx", lb_path))
+                    lb_rooty = int(combo.tk.call("winfo", "rooty", lb_path))
+                    last_idx = idx
+                    _show_item_tip(
+                        full_line,
+                        lb_rootx + 12,
+                        lb_rooty + by,
+                        lb_rooty + by + bh,
+                        lb_rootx + 12,
+                        lb_rooty + by + bh // 2,
+                    )
+                except Exception:
+                    pass
+
+            try:
+                motion_cmd = combo.register(_on_lb_motion)
+                key_cmd = combo.register(_on_lb_key)
+                hide_cmd = combo.register(_hide_item_tip)
+                combo._nw_popdown_callbacks = (
+                    _on_lb_motion,
+                    _on_lb_key,
+                    _hide_item_tip,
+                    motion_cmd,
+                    key_cmd,
+                    hide_cmd,
+                )
+                combo.tk.call("bind", lb_path, "<Motion>", f"+{motion_cmd} %x %y %X %Y")
+                combo.tk.call("bind", lb_path, "<KeyRelease-Up>", f"+{key_cmd}")
+                combo.tk.call("bind", lb_path, "<KeyRelease-Down>", f"+{key_cmd}")
+                combo.tk.call("bind", lb_path, "<Leave>", f"+{hide_cmd}")
+                combo.tk.call("bind", popdown, "<Unmap>", f"+{hide_cmd}")
+                popdown_bound = True
+            except Exception:
+                pass
+
+        def _on_post():
+            nonlocal last_postoffset
+            if hasattr(combo, "_nw_hide_tooltip"):
+                combo._nw_hide_tooltip()
+            _ensure_popdown_bound()
+            if not style_name:
+                return
+            try:
+                vals = list(combo["values"] or ())
+                if not vals:
+                    return
+                try:
+                    fnt = tkfont.nametofont(str(combo.cget("font") or "TkTextFont"))
+                except Exception:
+                    fnt = tkfont.nametofont("TkTextFont")
+                max_px = max(fnt.measure(str(v)) for v in vals) + 34
+                cb_w = max(1, combo.winfo_width())
+                cb_rx = combo.winfo_rootx()
+                cb_ry = combo.winfo_rooty()
+                bounds = self._get_monitor_workarea(cb_rx, cb_ry)
+                if bounds is not None:
+                    ml, _mt, mr, _mb = bounds
+                    max_px = min(max_px, max(cb_w, (mr - ml) - 20))
+                extra_w = max(0, int(max_px - cb_w))
+                dx = 0
+                if extra_w > 0 and bounds is not None:
+                    ml, _mt, mr, _mb = bounds
+                    overflow_r = (cb_rx + cb_w + extra_w) - (mr - 8)
+                    if overflow_r > 0:
+                        dx = -min(overflow_r, max(0, cb_rx - (ml + 8)))
+                new_offset = (int(dx), 0, int(extra_w), 0)
+                if new_offset != last_postoffset:
+                    last_postoffset = new_offset
+                    self.style.configure(style_name, postoffset=new_offset)
+                    combo.update_idletasks()
+            except Exception:
+                pass
+
+        try:
+            combo.configure(postcommand=_on_post)
+        except Exception:
+            pass
+
+        def _on_closed_combo_wheel(event):
+            try:
+                popdown = combo.tk.call("ttk::combobox::PopdownWindow", combo._w)
+                if int(combo.tk.call("winfo", "ismapped", popdown)):
+                    return None
+            except Exception:
+                pass
+            self._on_mousewheel(event, force_canvas=True)
+            return "break"
+
+        combo.bind("<MouseWheel>", _on_closed_combo_wheel)
+        if IS_LINUX:
+            combo.bind("<Button-4>", _on_closed_combo_wheel)
+            combo.bind("<Button-5>", _on_closed_combo_wheel)
+        combo.bind("<<ComboboxSelected>>", lambda _e: _hide_item_tip(), add="+")
+        combo.bind("<Destroy>", lambda _e: _hide_item_tip(), add="+")
+        combo._nw_hide_item_tip = _hide_item_tip
 
     def play_feedback_sound(self, start=True):
         # Use platform-aware sound function
@@ -1661,29 +2007,140 @@ class WhisperApp:
             log.error("[Config] Warning: failed to save shared config: %s", e)
         self._save_local_config(config)
 
-    def _on_mousewheel(self, event):
-        """Handle mousewheel scrolling for the main content area."""
-        # Don't scroll canvas when mouse is over a text widget with its own scrollbar
-        widget = event.widget
-        if isinstance(widget, (tk.Text, scrolledtext.ScrolledText)):
+    def _on_canvas_configure(self, event):
+        """Sync content frame width and re-clamp scroll bounds when window resizes."""
+        try:
+            self._scroll_canvas.itemconfig(self._scroll_canvas_window, width=event.width)
+        except Exception:
+            pass
+        self._update_scroll_region()
+
+    def _on_scrollbar_yview(self, *args):
+        """Scrollbar command wrapper that keeps canvasy(0) strictly within [0, max_y]."""
+        try:
+            req_h = self.content_frame.winfo_reqheight()
+            avail_h = max(1, self._scroll_canvas.winfo_height())
+            if req_h <= avail_h:
+                self._scroll_canvas.yview_moveto(0.0)
+                return
+            self._scroll_canvas.yview(*args)
+            self._clamp_scroll_position(req_h, avail_h)
+        except Exception:
+            pass
+
+    def _clamp_scroll_position(self, req_h=None, avail_h=None):
+        """Ensure the content frame never scrolls into negative space (top gap)
+        or past its bottom edge."""
+        if req_h is None:
+            req_h = self.content_frame.winfo_reqheight()
+        if avail_h is None:
+            avail_h = max(1, self._scroll_canvas.winfo_height())
+        region_h = max(req_h, avail_h, 1)
+        cur_y = float(self._scroll_canvas.canvasy(0))
+        if req_h <= avail_h:
+            if abs(cur_y) > 0.5:
+                self._scroll_canvas.yview_moveto(0.0)
             return
-        self._scroll_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        max_y = float(req_h - avail_h)
+        clamped_y = max(0.0, min(max_y, cur_y))
+        if abs(clamped_y - cur_y) > 0.5:
+            self._scroll_canvas.yview_moveto(clamped_y / float(region_h))
+
+    def _schedule_scroll_region_sync(self):
+        """Refresh and clamp scroll bounds immediately and once layout settles."""
+        if getattr(self, "_shutting_down", False):
+            return
+        try:
+            self.content_frame.update_idletasks()
+            self._update_scroll_region()
+        except Exception:
+            pass
+        prev = getattr(self, "_scroll_sync_job", None)
+        if prev is not None:
+            try:
+                self.root.after_cancel(prev)
+            except Exception:
+                pass
+
+        def _settled():
+            self._scroll_sync_job = None
+            if not getattr(self, "_shutting_down", False):
+                self._update_scroll_region()
+
+        self._scroll_sync_job = self.root.after(50, _settled)
+
+    def _on_mousewheel(self, event, force_canvas=False):
+        """Handle mousewheel/touchpad scrolling with strict [0, max_y] clamping."""
+        if not force_canvas:
+            widget = getattr(event, "widget", None)
+            # Internal Tcl popup widgets (such as open ttk.Combobox popdown listboxes)
+            # arrive as raw str paths: let them scroll their own list without moving root.
+            if isinstance(widget, str):
+                return
+            if isinstance(widget, (tk.Text, scrolledtext.ScrolledText, tk.Listbox)):
+                return
+            if widget is not None:
+                try:
+                    if widget.winfo_toplevel() is not self.root:
+                        return
+                except Exception:
+                    return
+
+        try:
+            req_h = self.content_frame.winfo_reqheight()
+            avail_h = max(1, self._scroll_canvas.winfo_height())
+            if req_h <= avail_h:
+                if abs(float(self._scroll_canvas.canvasy(0))) > 0.5:
+                    self._scroll_canvas.yview_moveto(0.0)
+                return
+
+            num = getattr(event, "num", None)
+            delta = getattr(event, "delta", 0)
+            if num == 4:
+                step_px = -48.0
+            elif num == 5:
+                step_px = 48.0
+            elif delta:
+                # Windows/X11 wheel notch = ±120 -> 48 px; Precision Touchpad
+                # sends smaller smooth deltas (e.g. 15..60); macOS sends small ints.
+                if IS_MAC and abs(delta) < 20:
+                    step_px = float(-delta) * 14.0
+                else:
+                    step_px = -(float(delta) / 120.0) * 48.0
+                    if 0.0 < abs(step_px) < 4.0:
+                        step_px = -4.0 if step_px < 0 else 4.0
+            else:
+                return
+
+            region_h = float(max(req_h, avail_h))
+            cur_y = float(self._scroll_canvas.canvasy(0))
+            max_y = float(req_h - avail_h)
+            new_y = max(0.0, min(max_y, cur_y + step_px))
+            if abs(new_y - cur_y) >= 0.5:
+                self._scroll_canvas.yview_moveto(new_y / region_h)
+        except Exception:
+            pass
 
     def _update_scroll_region(self, event=None):
-        """Update the scroll region when content changes size, and show the
-        scrollbar only while the content actually overflows the viewport."""
-        self._scroll_canvas.configure(scrollregion=self._scroll_canvas.bbox("all"))
+        """Update the scroll region when content or viewport changes size,
+        clamp scrollregion height >= viewport height so content can never drift
+        into negative space, and show the scrollbar only when content overflows."""
         try:
-            req = self.content_frame.winfo_reqheight()
-            avail = self._scroll_canvas.winfo_height()
+            req_w = max(1, self._scroll_canvas.winfo_width())
+            req_h = self.content_frame.winfo_reqheight()
+            avail_h = max(1, self._scroll_canvas.winfo_height())
+            region_h = max(req_h, avail_h)
+            self._scroll_canvas.configure(scrollregion=(0, 0, req_w, region_h))
+            self._clamp_scroll_position(req_h, avail_h)
+
             mapped = bool(self._scroll_vsb.winfo_ismapped())
             # Hysteresis: hiding the bar widens the canvas, which can re-wrap
-            # content and change reqheight, so the hide threshold sits well
-            # below the show threshold to stop the two from oscillating.
-            if not mapped and req > avail:
+            # content and change reqheight, so the hide threshold sits below
+            # the show threshold to stop the two from oscillating.
+            if not mapped and req_h > avail_h + 2:
                 self._scroll_vsb.pack(side="right", fill="y",
                                       before=self._scroll_canvas)
-            elif mapped and req <= avail - 24:
+            elif mapped and req_h <= avail_h - 18:
                 self._scroll_vsb.pack_forget()
         except Exception:
             pass
@@ -1845,9 +2302,12 @@ class WhisperApp:
             side="right", padx=(4, 14), pady=4)
 
         # --- SCROLLABLE CONTENT AREA (fallback for expanded accordions) ---
-        self._scroll_canvas = tk.Canvas(self.root, bg=COLOR_BG, highlightthickness=0)
-        self._scroll_vsb = ttk.Scrollbar(self.root, orient="vertical",
-                                          command=self._scroll_canvas.yview)
+        self._scroll_canvas = tk.Canvas(
+            self.root, bg=COLOR_BG, highlightthickness=0, yscrollincrement=1
+        )
+        self._scroll_vsb = ttk.Scrollbar(
+            self.root, orient="vertical", command=self._on_scrollbar_yview
+        )
         self.content_frame = tk.Frame(self._scroll_canvas, bg=COLOR_BG)
 
         self.content_frame.bind("<Configure>", self._update_scroll_region)
@@ -1856,15 +2316,16 @@ class WhisperApp:
         )
         self._scroll_canvas.configure(yscrollcommand=self._scroll_vsb.set)
 
-        self._scroll_vsb.pack(side="right", fill="y")
         self._scroll_canvas.pack(side="left", fill="both", expand=True)
 
-        # Keep content frame width in sync with canvas viewport
-        self._scroll_canvas.bind("<Configure>",
-            lambda e: self._scroll_canvas.itemconfig(self._scroll_canvas_window, width=e.width))
+        # Keep content frame width AND clamped scrollregion in sync with viewport
+        self._scroll_canvas.bind("<Configure>", self._on_canvas_configure)
 
-        # Mousewheel scrolling
+        # Mousewheel scrolling (Windows/macOS <MouseWheel>, Linux X11 <Button-4>/<Button-5>)
         self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+        if IS_LINUX:
+            self.root.bind_all("<Button-4>", self._on_mousewheel)
+            self.root.bind_all("<Button-5>", self._on_mousewheel)
 
         # --- HEADER: wordmark + three icon buttons ---
         header_frame = tk.Frame(self.content_frame, bg=COLOR_BG)
@@ -2036,10 +2497,26 @@ class WhisperApp:
         foot.pack(fill="x", pady=(6, 0))
         self.device_info_var = tk.StringVar(value="Mic · default")
         self.model_info_var = tk.StringVar(value="")
-        tk.Label(foot, textvariable=self.device_info_var, bg=COLOR_ACCENT_BG,
-                 fg=COLOR_TEXT_FAINT, font=("Arial", 8)).pack(side="left")
-        tk.Label(foot, textvariable=self.model_info_var, bg=COLOR_ACCENT_BG,
-                 fg=COLOR_TEXT_FAINT, font=("Arial", 8)).pack(side="right")
+        mic_footer_lbl = tk.Label(foot, textvariable=self.device_info_var, bg=COLOR_ACCENT_BG,
+                                  fg=COLOR_TEXT_FAINT, font=("Arial", 8))
+        mic_footer_lbl.pack(side="left")
+        model_footer_lbl = tk.Label(foot, textvariable=self.model_info_var, bg=COLOR_ACCENT_BG,
+                                    fg=COLOR_TEXT_FAINT, font=("Arial", 8))
+        model_footer_lbl.pack(side="right")
+        self._create_tooltip(
+            mic_footer_lbl,
+            lambda: f"Mic · {self.device_var.get()}"
+            if hasattr(self, "device_var") and self.device_var.get()
+            else self.device_info_var.get(),
+        )
+        self._create_tooltip(
+            model_footer_lbl,
+            lambda: (
+                f"{self.config.get('model_key', '')}\n({self.model_info_var.get()})"
+                if self.transcription_mode.get() == "local"
+                else f"Cloud · {self.model_info_var.get()}"
+            ),
+        )
 
         # ==============================================================
         # 2. LAST TRANSCRIPTION CARD
@@ -2311,6 +2788,10 @@ class WhisperApp:
         self.combo = ttk.Combobox(r1, textvariable=self.model_var, values=display_values, width=28, state="readonly")
         self.combo.pack(side="left", padx=5)
         self.combo.bind("<<ComboboxSelected>>", self.on_model_select)
+        self._enhance_combobox(
+            self.combo,
+            "Local speech-to-text model ('[get]' = downloads once on first selection, then runs 100% offline)",
+        )
 
         # Recovery affordance after a failed load (the error dialog names it).
         self.btn_reload_model = tk.Button(
@@ -2361,7 +2842,10 @@ class WhisperApp:
         )
         local_lang_combo.pack(side="left", padx=4)
         local_lang_combo.bind("<<ComboboxSelected>>", self._on_local_lang_change)
-        self._create_tooltip(local_lang_combo, "Spoken language for local dictation ('auto' detects automatically;\npinning 'en' or 'de' avoids short-chunk language flips).")
+        self._enhance_combobox(
+            local_lang_combo,
+            "Spoken language for local dictation ('auto' detects automatically;\npinning 'en' or 'de' avoids short-chunk language flips).",
+        )
 
         r2 = ttk.Frame(self.settings_content)
         r2.pack(fill="x", padx=5, pady=5)
@@ -2406,8 +2890,10 @@ class WhisperApp:
         else:
             self.device_var = tk.StringVar(value=default_dev)
             mic_combo = ttk.Combobox(r2, textvariable=self.device_var, values=input_devices, state="readonly")
+        self.mic_combo = mic_combo
         mic_combo.pack(side="left", fill="x", expand=True, padx=5)
         mic_combo.bind("<<ComboboxSelected>>", self.on_mic_change)
+        self._enhance_combobox(mic_combo, "Active audio input device")
 
         # --- BACKEND/ACCELERATION SELECTOR ---
         r_backend = ttk.Frame(self.settings_content)
@@ -2427,10 +2913,11 @@ class WhisperApp:
         self.backend_var = tk.StringVar(value=current_backend_display)
         backend_combo = ttk.Combobox(r_backend, textvariable=self.backend_var,
                                       values=backend_options, width=21, state="readonly")
+        self.backend_combo = backend_combo
         backend_combo.pack(side="left", padx=5)
         backend_combo.bind("<<ComboboxSelected>>", self.on_backend_change)
 
-        self._create_tooltip(
+        self._enhance_combobox(
             backend_combo,
             "Acceleration Mode:\n"
             "• Auto: Detects best local engine\n"
@@ -2562,6 +3049,7 @@ class WhisperApp:
                                          values=OPENAI_TRANSCRIPTION_MODEL_OPTIONS, width=16, state="readonly")
         trans_model_combo.pack(side="left", padx=5)
         trans_model_combo.bind("<<ComboboxSelected>>", lambda e: self._auto_save_openai_settings())
+        self._enhance_combobox(trans_model_combo, "OpenAI speech-to-text model")
 
         ttk.Label(model_row, text="Lang:").pack(side="left", padx=(8, 0))
         self.openai_lang_var = tk.StringVar(value=self.config.get('openai_language', DEFAULT_CONFIG['openai_language']))
@@ -2570,6 +3058,7 @@ class WhisperApp:
                                   width=6, state="readonly")
         lang_combo.pack(side="left", padx=5)
         lang_combo.bind("<<ComboboxSelected>>", lambda e: self._auto_save_openai_settings())
+        self._enhance_combobox(lang_combo, "Spoken language hint for OpenAI transcription ('auto' detects automatically)")
 
         model_row2 = ttk.Frame(openai_frame)
         model_row2.pack(fill="x", padx=10, pady=5)
@@ -2581,6 +3070,7 @@ class WhisperApp:
                                         values=OPENAI_EDIT_MODEL_OPTIONS, width=15, state="readonly")
         edit_model_combo.pack(side="left", padx=5)
         edit_model_combo.bind("<<ComboboxSelected>>", lambda e: self._auto_save_openai_settings())
+        self._enhance_combobox(edit_model_combo, "OpenAI model used by +EDIT mode")
 
         # Edit prompt row
         prompt_row = ttk.Frame(openai_frame)
@@ -4595,7 +5085,7 @@ Troubleshooting:
             self.insights_collapsed.set(True)
         self.config['insights_collapsed'] = self.insights_collapsed.get()
         self._persist_config()
-        self.root.after(50, self._update_scroll_region)
+        self._schedule_scroll_region_sync()
 
     def toggle_settings(self):
         """Toggle the collapsible Configuration accordion."""
@@ -4613,7 +5103,7 @@ Troubleshooting:
         self.config['config_collapsed'] = self.config_collapsed.get()
         self._persist_config()
         # Refresh scroll region after content change
-        self.root.after(50, self._update_scroll_region)
+        self._schedule_scroll_region_sync()
 
     def toggle_log(self):
         """Toggle the collapsible System Log accordion (widget built lazily)."""
@@ -4626,7 +5116,7 @@ Troubleshooting:
             self.log_body.pack_forget()
             self.log_toggle_btn.config(text="\u25b6")
             self.log_collapsed.set(True)
-        self.root.after(50, self._update_scroll_region)
+        self._schedule_scroll_region_sync()
 
     def _build_log_widget(self):
         """Create the ScrolledText on first expand and flush the buffer."""
@@ -4672,25 +5162,33 @@ Troubleshooting:
         """Header CFG button: expand Configuration and scroll to it."""
         if self.config_collapsed.get():
             self.toggle_settings()
-        self.root.after(80, self._scroll_to_configuration)
-
-    def _scroll_to_configuration(self):
-        """Scroll the Configuration accordion header into view.
-
-        Not yview_moveto(1.0): the System Log accordion is packed after
-        Configuration, so scrolling to the bottom overshoots the panel the
-        CFG button just opened.
-        """
-        try:
-            self._scroll_canvas.update_idletasks()
-            y = self.settings_toggle_btn.winfo_rooty() - self.content_frame.winfo_rooty()
-            total = max(1, self.content_frame.winfo_height())
-            self._scroll_canvas.yview_moveto(max(0.0, min(1.0, y / total)))
-        except Exception:
+        prev = getattr(self, "_focus_cfg_job", None)
+        if prev is not None:
             try:
-                self._scroll_canvas.yview_moveto(1.0)
+                self.root.after_cancel(prev)
             except Exception:
                 pass
+        self._focus_cfg_job = self.root.after(60, self._scroll_to_configuration)
+
+    def _scroll_to_configuration(self):
+        """Scroll the Configuration accordion header into view without overshooting."""
+        self._focus_cfg_job = None
+        if getattr(self, "_shutting_down", False):
+            return
+        try:
+            self.content_frame.update_idletasks()
+            self._update_scroll_region()
+            req_h = self.content_frame.winfo_reqheight()
+            avail_h = max(1, self._scroll_canvas.winfo_height())
+            if req_h <= avail_h:
+                self._scroll_canvas.yview_moveto(0.0)
+                return
+            y = self.settings_toggle_btn.winfo_rooty() - self.content_frame.winfo_rooty()
+            max_y = float(req_h - avail_h)
+            target_y = max(0.0, min(max_y, float(y)))
+            self._scroll_canvas.yview_moveto(target_y / float(req_h))
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # OpenAI API key: first-run welcome and the inline AI-Insights notice
@@ -8120,6 +8618,8 @@ Troubleshooting:
             "_init_histogram_job",
             "_welcome_job",
             "_auto_crunch_job",
+            "_scroll_sync_job",
+            "_focus_cfg_job",
         ):
             job_id = getattr(self, job_attr, None)
             if job_id is not None:
@@ -8128,6 +8628,14 @@ Troubleshooting:
                     self.root.after_cancel(job_id)
                 except Exception:
                     pass
+
+        for tip in list(getattr(self, "_active_tooltips", ())):
+            try:
+                tip.destroy()
+            except Exception:
+                pass
+        if hasattr(self, "_active_tooltips"):
+            self._active_tooltips.clear()
 
         # Stop whatever is recording. Done inline rather than via
         # _stop_any_recording(): that spawns the async finalisation threads,
