@@ -70,7 +70,7 @@ def _parse_dt(value, params):
 _WEEKDAY_CODES = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
 
 
-def _expand_rrule(start, rule, horizon, cap=1500):
+def _expand_rrule(start, rule, horizon, cap=20000):
     """Minimal RRULE expansion: FREQ/INTERVAL/COUNT/UNTIL/BYDAY(weekly)."""
     parts = {}
     for chunk in rule.split(";"):
@@ -98,10 +98,10 @@ def _expand_rrule(start, rule, horizon, cap=1500):
     guard = 0
     while len(out) < (count or cap) and guard < cap * 4:
         guard += 1
-        if cursor > horizon or (until and cursor > until):
-            break
         if freq == "WEEKLY" and bydays:
             week_start = cursor - dt.timedelta(days=cursor.weekday())
+            if week_start > horizon or (until and week_start > until):
+                break
             for wd in sorted(bydays):
                 day = week_start + dt.timedelta(days=wd)
                 if day < base_date or day > horizon or (until and day > until):
@@ -109,8 +109,10 @@ def _expand_rrule(start, rule, horizon, cap=1500):
                 out.append(day)
                 if count and len(out) >= count:
                     break
-            cursor = cursor + dt.timedelta(weeks=interval)
+            cursor = week_start + dt.timedelta(weeks=interval)
             continue
+        if cursor > horizon or (until and cursor > until):
+            break
         out.append(cursor)
         if freq == "DAILY":
             cursor = cursor + dt.timedelta(days=interval)
@@ -140,16 +142,27 @@ def parse_ics(path, horizon=None):
         lines = _unfold(fh.read())
     events = []
     cur = None
+    nested_depth = 0
     for line in lines:
         if line.startswith("BEGIN:VEVENT"):
             cur = {}
+            nested_depth = 0
             continue
         if line.startswith("END:VEVENT"):
             if cur is not None:
                 events.extend(_finish_event(cur, horizon))
             cur = None
+            nested_depth = 0
             continue
-        if cur is None or ":" not in line:
+        if cur is None:
+            continue
+        if line.startswith("BEGIN:"):
+            nested_depth += 1
+            continue
+        if line.startswith("END:"):
+            nested_depth = max(0, nested_depth - 1)
+            continue
+        if nested_depth > 0 or ":" not in line:
             continue
         head, value = line.split(":", 1)
         bits = head.split(";")
@@ -164,28 +177,42 @@ def parse_ics(path, horizon=None):
         elif name in ("SUMMARY", "RRULE", "STATUS", "TRANSP"):
             cur[name] = value
         elif name == "EXDATE":
-            parsed, _ = _parse_dt(value.split(",")[0], params)
-            cur.setdefault("EXDATE", []).append(parsed)
+            for part in value.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                parsed, _ = _parse_dt(part, params)
+                if parsed is not None:
+                    cur.setdefault("EXDATE", []).append(parsed)
     return events
 
 
 def _finish_event(cur, horizon):
     if "DTSTART" not in cur or cur["DTSTART"][0] is None:
         return []
-    if str(cur.get("STATUS", "")).upper() == "CANCELLED":
+    if str(cur.get("STATUS", "")).strip().upper() == "CANCELLED":
         return []
     start, all_day = cur["DTSTART"]
+    if not all_day and str(cur.get("TRANSP", "")).strip().upper() == "TRANSPARENT":
+        return []
     end, _ = cur.get("DTEND", (None, all_day))
     if end is None:
         end = (start + dt.timedelta(days=1)) if all_day else (start + dt.timedelta(hours=1))
-    duration = end - start
+    elif isinstance(start, dt.datetime) and not isinstance(end, dt.datetime):
+        end = dt.datetime.combine(end, dt.time.min)
+    elif not isinstance(start, dt.datetime) and isinstance(end, dt.datetime):
+        end = end.date()
+    duration = max(dt.timedelta(0), end - start)
     summary = _unescape(cur.get("SUMMARY", ""))
     starts = ([start] if "RRULE" not in cur
               else _expand_rrule(start, cur["RRULE"], horizon))
-    excluded = {x for x in cur.get("EXDATE", []) if x is not None}
+    raw_ex = [x for x in cur.get("EXDATE", []) if x is not None]
+    excluded_exact = set(raw_ex)
+    excluded_dates = {x for x in raw_ex if not isinstance(x, dt.datetime)}
     out = []
     for s in starts:
-        if s in excluded:
+        s_date = s.date() if isinstance(s, dt.datetime) else s
+        if s in excluded_exact or s_date in excluded_dates:
             continue
         out.append({
             "start": s.isoformat(),
@@ -283,6 +310,12 @@ def _pearson(pairs):
 
 
 def build_tables(feats, moods):
+    if feats:
+        cal_start, cal_end = min(feats), max(feats)
+        scoped_moods = {d: m for d, m in moods.items() if cal_start <= d <= cal_end}
+        if scoped_moods:
+            moods = scoped_moods
+
     def group(name, predicate):
         xs = [moods[d] for d in moods if predicate(d)]
         return {"group": name, "n": len(xs),

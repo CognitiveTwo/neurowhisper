@@ -10,46 +10,65 @@
 #   sudo apt-get install -y python3-tk python3-venv libportaudio2
 set -euo pipefail
 
+export PYTHONUTF8=1
+
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${HOME}/.local/share/neurowhisper/venv"
+VENV_PY="${VENV_DIR}/bin/python"
 REQ="${APP_DIR}/requirements.txt"
 STAMP="${VENV_DIR}/requirements.installed"
 
-# ---------------------------------------------------------------- interpreter
-PYTHON_CMD=""
-for candidate in python3 python; do
-    if command -v "$candidate" >/dev/null 2>&1; then
-        PYTHON_CMD="$candidate"
-        break
+# ---------------------------------------------------------------- fast path
+if [ -x "$VENV_PY" ] && [ -f "$STAMP" ] && cmp -s "$STAMP" "$REQ"; then
+    if "$VENV_PY" -V >/dev/null 2>&1; then
+        cd "$APP_DIR"
+        exec "$VENV_PY" "${APP_DIR}/whisper_gui.pyw"
     fi
-done
-if [ -z "$PYTHON_CMD" ]; then
-    echo "[neurowhisper] No Python interpreter found."
-    echo "               Install Python 3.11 or newer from https://www.python.org/downloads/"
-    exit 1
 fi
 
-# ---------------------------------------------------------------- version gate
-if [ ! -x "${VENV_DIR}/bin/python" ]; then
-    if ! "$PYTHON_CMD" -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)"; then
-        found="$("$PYTHON_CMD" -c "import sys; print(sys.version.split()[0])" 2>/dev/null || echo unknown)"
-        echo "[neurowhisper] neurowhisper needs Python 3.11 or newer (found ${found})"
-        echo "               Download a newer Python from https://www.python.org/downloads/"
+# ---------------------------------------------------------------- venv / version gate
+venv_ok=0
+if [ -x "$VENV_PY" ] && "$VENV_PY" -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" >/dev/null 2>&1; then
+    venv_ok=1
+fi
+
+if [ "$venv_ok" -eq 0 ]; then
+    PYTHON_CMD=""
+    FOUND_ANY=""
+    for candidate in python3.13 python3.12 python3.11 python3 python; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            [ -z "$FOUND_ANY" ] && FOUND_ANY="$candidate"
+            if "$candidate" -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" >/dev/null 2>&1; then
+                PYTHON_CMD="$candidate"
+                break
+            fi
+        fi
+    done
+
+    if [ -z "$PYTHON_CMD" ]; then
+        if [ -n "$FOUND_ANY" ]; then
+            found="$("$FOUND_ANY" -c "import sys; print(sys.version.split()[0])" 2>/dev/null || echo unknown)"
+            echo "[neurowhisper] neurowhisper needs Python 3.11 or newer (found ${found})"
+            echo "               Download a newer Python from https://www.python.org/downloads/"
+        else
+            echo "[neurowhisper] No Python interpreter found."
+            echo "               Install Python 3.11 or newer from https://www.python.org/downloads/"
+        fi
         exit 1
     fi
+
     echo "[neurowhisper] First run on this machine - creating virtual environment..."
     echo "[neurowhisper] Venv location: ${VENV_DIR}"
     mkdir -p "$(dirname "$VENV_DIR")"
+    rm -f "$STAMP"
     # Debian/Ubuntu ship python3 without the venv module; the stock error
     # ("ensurepip is not available") does not say which package to install.
-    "$PYTHON_CMD" -m venv "$VENV_DIR" || {
+    "$PYTHON_CMD" -m venv --clear "$VENV_DIR" || {
         echo "[neurowhisper] venv creation failed - on Debian/Ubuntu install python3-venv:"
         echo "               sudo apt-get install -y python3-venv"
         exit 1
     }
 fi
-
-VENV_PY="${VENV_DIR}/bin/python"
 
 # ---------------------------------------------------------------- dependencies
 need_install=0
@@ -59,7 +78,7 @@ fi
 
 if [ "$need_install" -eq 1 ]; then
     echo "[neurowhisper] Installing/updating dependencies (this can take a few minutes)..."
-    "$VENV_PY" -m pip install --upgrade pip --quiet
+    "$VENV_PY" -m pip install --upgrade pip --quiet || true
     "$VENV_PY" -m pip install -r "$REQ"
     cp "$REQ" "$STAMP"
     echo "[neurowhisper] Dependencies are up to date."

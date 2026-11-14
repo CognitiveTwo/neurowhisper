@@ -17,6 +17,7 @@ import os
 import platform
 import re
 import sys
+import uuid
 from collections import defaultdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -84,17 +85,20 @@ def tokenize_words(text: str):
 
 
 def detect_language(text: str, tokens=None) -> str:
-    """Cheap per-entry language heuristic -> 'de' or 'en'."""
+    """Cheap per-entry language heuristic -> 'de' or 'en' (aligned with GUI)."""
     if not text:
         return "en"
-    if any(ch in _GERMAN_UMLAUTS for ch in text):
-        return "de"
     if tokens is None:
         tokens = tokenize_words(text)
     if not tokens:
-        return "en"
+        return "de" if any(ch in _GERMAN_UMLAUTS for ch in text) else "en"
     hits = sum(1 for t in tokens if t in GERMAN_FUNCTION_WORDS)
-    return "de" if (hits / len(tokens)) >= GERMAN_DETECT_THRESHOLD else "en"
+    if (hits / len(tokens)) >= GERMAN_DETECT_THRESHOLD:
+        return "de"
+    umlaut_count = sum(1 for ch in text if ch in _GERMAN_UMLAUTS)
+    if umlaut_count >= 2 or (umlaut_count == 1 and (len(tokens) <= 5 or hits >= 1)):
+        return "de"
+    return "en"
 
 
 # --------------------------------------------------------------------------
@@ -161,6 +165,7 @@ def key_source() -> str:
 # --------------------------------------------------------------------------
 
 _LINE_TS_FMT = "%Y-%m-%d %H:%M:%S"
+_LINE_RX = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] ?(.*)$")
 
 
 def transcript_files(directory: str | None = None):
@@ -180,34 +185,48 @@ def transcript_files(directory: str | None = None):
     return out
 
 
+def _flush_entry(entries, ts, lines, since, until):
+    if ts is None:
+        return
+    text = "\n".join(lines).strip()
+    if not text:
+        return
+    day = ts.strftime("%Y-%m-%d")
+    if since and day < since:
+        return
+    if until and day > until:
+        return
+    entries.append({"timestamp": ts, "text": text})
+
+
 def load_entries(directory: str | None = None, since: str | None = None,
                  until: str | None = None):
     """Parse the archive into ``[{"timestamp": datetime, "text": str}, ...]``.
 
-    Archive format is one line per dictation: ``[YYYY-MM-DD HH:MM:SS] text``.
+    Archive format starts each dictation with ``[YYYY-MM-DD HH:MM:SS] text``;
+    any subsequent non-timestamped lines belong to the same entry so
+    multi-paragraph dictations are preserved intact.
     """
     entries = []
     for path in transcript_files(directory):
         try:
+            current_ts = None
+            current_lines: list[str] = []
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line.startswith("[") or "] " not in line:
-                        continue
-                    ts_end = line.index("] ")
-                    try:
-                        ts = _dt.datetime.strptime(line[1:ts_end], _LINE_TS_FMT)
-                    except ValueError:
-                        continue
-                    text = line[ts_end + 2:].strip()
-                    if not text:
-                        continue
-                    day = ts.strftime("%Y-%m-%d")
-                    if since and day < since:
-                        continue
-                    if until and day > until:
-                        continue
-                    entries.append({"timestamp": ts, "text": text})
+                for raw_line in fh:
+                    line = raw_line.rstrip("\r\n")
+                    m = _LINE_RX.match(line)
+                    if m:
+                        _flush_entry(entries, current_ts, current_lines, since, until)
+                        try:
+                            current_ts = _dt.datetime.strptime(m.group(1), _LINE_TS_FMT)
+                            current_lines = [m.group(2)]
+                        except ValueError:
+                            current_ts = None
+                            current_lines = []
+                    elif current_ts is not None:
+                        current_lines.append(line)
+            _flush_entry(entries, current_ts, current_lines, since, until)
         except Exception:
             continue
     entries.sort(key=lambda e: e["timestamp"])
@@ -272,9 +291,25 @@ def read_json(path, default=None):
 
 
 def write_json(path, data, indent=1):
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=indent, ensure_ascii=False)
+    abs_path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+    tmp_path = f"{abs_path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=indent, ensure_ascii=False)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_path, abs_path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def load_labels(labels_dir: str | None = None):

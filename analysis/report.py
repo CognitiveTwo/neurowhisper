@@ -128,13 +128,15 @@ def chart_bars(rows, key, value_key, label, unit="", height=220, color=None,
         out.append(axis_text(pad_l - 8, y + 4, fmt(int(round(vmax * (4 - i) / 4))),
                              anchor="end"))
     for i, r in enumerate(rows):
-        v = r.get(value_key) or 0
+        raw_v = r.get(value_key)
+        v = raw_v or 0
         h = plot_h * v / vmax
         x = pad_l + slot * i + (slot - bar_w) / 2
         y = pad_t + plot_h - h
+        tip_val = "no data" if raw_v is None else f"{(value_fmt or fmt)(v)}{unit}"
         out.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w:.1f}" '
                    f'height="{max(0.0, h):.1f}" rx="2" fill="{color}"><title>'
-                   f'{esc(r.get(key))}: {esc((value_fmt or fmt)(v))}{esc(unit)}'
+                   f'{esc(r.get(key))}: {esc(tip_val)}'
                    f'</title></rect>')
         step = max(1, len(rows) // 18)
         if i % step == 0:
@@ -171,7 +173,10 @@ def chart_mood(daily, height=250):
                    f'{esc(r["date"])}: {esc(r["mood"])}'
                    f'{" - " + esc(r["mood_label"]) if r.get("mood_label") else ""}'
                    f'</title></circle>')
-    roll = [r for r in daily if r.get("mood_roll7") is not None]
+    roll = [
+        r for r in daily
+        if r.get("mood_roll7") is not None and pts[0]["date"] <= r["date"] <= pts[-1]["date"]
+    ]
     if len(roll) > 1:
         d = " ".join(f'{"M" if i == 0 else "L"}{x_of(r["date"]):.1f},'
                      f'{y_of(r["mood_roll7"]):.1f}' for i, r in enumerate(roll))
@@ -339,7 +344,8 @@ def render(series, calendar=None, title="Dictation report"):
                      f"{chart_bars(series['weekdays'], 'weekday', 'mood_mean', 'Mood by weekday', max_override=100, color='#59a14f')}"
                      f"</div>"
                      + table_rows(["Weekday", "Days", "Mean mood", "Words"],
-                                  [(r["weekday"], r["days"], r["mood_mean"],
+                                  [(r["weekday"], r["days"],
+                                    "-" if r["mood_mean"] is None else r["mood_mean"],
                                     fmt(r["words"])) for r in series["weekdays"]])
                      + "</section>")
 
@@ -352,7 +358,7 @@ def render(series, calendar=None, title="Dictation report"):
                 for r in tables["mood_by_meetings"]]
         r_all = tables.get("pearson_meetings_mood")
         r_wd = tables.get("pearson_meetings_mood_weekdays_only")
-        bars = [{"group": r["group"], "mood_mean": r["mood_mean"] or 0}
+        bars = [{"group": r["group"], "mood_mean": r["mood_mean"]}
                 for r in tables["mood_by_meetings"]]
         parts.append("<section><h2>Mood vs meetings</h2>"
                      f"<p class='note'>From your calendar export. Pearson r "
@@ -392,12 +398,19 @@ def main(argv=None):
         raise SystemExit(f"No series file at {series_path}. Run build_series.py first.")
     calendar = common.read_json(args.calendar or common.out_path("calendar_features.json"))
     out = args.output or common.out_path("report.html")
-    if os.path.abspath(out).startswith(os.path.abspath(common.OUT_DIR)) is False:
+    out_real = os.path.realpath(os.path.abspath(out))
+    out_dir_real = os.path.realpath(os.path.abspath(common.OUT_DIR))
+    try:
+        within_out = os.path.commonpath([out_real, out_dir_real]) == out_dir_real
+    except ValueError:
+        within_out = False
+    if not within_out:
         raise SystemExit("Refusing to write outside analysis/out/.")
+    os.makedirs(os.path.dirname(out_real), exist_ok=True)
     html_text = render(series, calendar, args.title)
-    with open(out, "w", encoding="utf-8") as fh:
+    with open(out_real, "w", encoding="utf-8") as fh:
         fh.write(html_text)
-    print(f"Wrote {out} ({len(html_text):,} bytes)")
+    print(f"Wrote {out_real} ({len(html_text):,} bytes)")
     return 0
 
 

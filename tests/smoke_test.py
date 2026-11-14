@@ -34,7 +34,7 @@ GUI_SETTLE_SECONDS = 8.0
 CLOSE_BUDGET_SECONDS = 5.0
 
 # Files/directories the app needs in its working directory to start up.
-APP_FILES = ("whisper_gui.pyw", "app_config.py", "platform_utils.py", "icon.ico")
+APP_FILES = ("whisper_gui.pyw", "app_config.py", "platform_utils.py", "icon.ico", "icon.png")
 APP_DIRS = ("backends",)
 
 _failures = []
@@ -92,13 +92,18 @@ def install_stubs():
 
         class _Listener(object):
             def __init__(self, *a, **k):
-                pass
+                self.running = False
 
             def start(self):
+                self.running = True
                 return None
 
             def stop(self):
+                self.running = False
                 return None
+
+            def is_alive(self):
+                return self.running
 
             def join(self, *a, **k):
                 return None

@@ -59,7 +59,8 @@ def main(argv=None):
         run("cluster_topics.py", "--model", args.model)
     run("build_series.py")
     if args.ics:
-        run("calendar_features.py", "--ics", args.ics)
+        ics_path = os.path.abspath(os.path.expanduser(args.ics))
+        run("calendar_features.py", "--ics", ics_path)
     run("report.py", "--title", args.title)
     print(f"\nReport: {common.out_path('report.html')}")
     return 0

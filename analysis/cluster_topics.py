@@ -137,7 +137,7 @@ def build_parser():
     p.add_argument("--no-name", action="store_true",
                    help="skip the naming call; clusters keep numeric names")
     p.add_argument("--labels", metavar="DIR", help="labels directory")
-    p.add_argument("--verbose", action="store_true", default=True,
+    p.add_argument("--verbose", action=argparse.BooleanOptionalAction, default=True,
                    help="progress output")
     return p
 
@@ -168,7 +168,7 @@ def main(argv=None):
             from openai import OpenAI
         except ImportError:
             raise SystemExit("The openai package is missing: pip install -r analysis/requirements.txt")
-        client = OpenAI(api_key=key)
+        client = OpenAI(api_key=key, timeout=90.0)
     if missing:
         embed_all(client, texts, cache, cache_path, args.verbose)
 
@@ -176,7 +176,9 @@ def main(argv=None):
     from sklearn.cluster import KMeans
 
     X = np.array([cache[t] for t in texts], dtype=float)
-    X = X / np.linalg.norm(X, axis=1, keepdims=True)
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    X = X / norms
 
     k = args.k or choose_k(X, args.k_min, min(args.k_max, len(texts) - 1), args.verbose)
     k = max(2, min(k, len(texts) - 1))
@@ -228,9 +230,15 @@ def main(argv=None):
     seen = {}
     for g in range(n_groups):
         base = group_names[str(g)]
-        if base in seen:
-            group_names[str(g)] = f"{base} ({g})"
-        seen[group_names[str(g)]] = g
+        candidate = base
+        suffix = g
+        while candidate in seen:
+            candidate = f"{base} ({suffix})"
+            suffix += 1
+        group_names[str(g)] = candidate
+        if candidate != base and base in definitions and candidate not in definitions:
+            definitions[candidate] = definitions[base]
+        seen[candidate] = g
 
     cluster_to_category = {str(c): group_names[str(cluster_group[c])] for c in range(k)}
     weight = collections.Counter()
