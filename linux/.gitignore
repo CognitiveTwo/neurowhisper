@@ -1,0 +1,9 @@
+build/
+dist/
+.build-venv/
+.test-venv/
+__pycache__/
+*.py[cod]
+*.AppImage
+*.AppImage.sha256
+*.AppDir/

@@ -1,0 +1,26 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=neurowhisper
+GenericName=Voice Dictation & Speech Insights
+Comment=Local & cloud AI voice dictation with live typing, Parakeet ONNX, and Speech Insights
+Exec=neurowhisper
+Icon=neurowhisper
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+Keywords=whisper;dictation;speech;transcription;voice;parakeet;
+StartupWMClass=neurowhisper
+StartupNotify=true
+Actions=ToggleLive;ToggleBatch;StopRecording;
+
+[Desktop Action ToggleLive]
+Name=Toggle Live Dictation
+Exec=neurowhisper --toggle-live
+
+[Desktop Action ToggleBatch]
+Name=Toggle Batch Recording
+Exec=neurowhisper --toggle-batch
+
+[Desktop Action StopRecording]
+Name=Stop Recording
+Exec=neurowhisper --stop

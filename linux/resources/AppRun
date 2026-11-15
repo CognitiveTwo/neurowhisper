@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# AppRun launcher for neurowhisper.AppImage
+# Preserves host LD_LIBRARY_PATH_ORIG for external desktop tools (xdg-open, wl-copy, wtype)
+# while enriching LD_LIBRARY_PATH with bundled libraries and optional user/host CUDA 12 runtimes.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export APPDIR="${APPDIR:-$HERE}"
+
+# Save the caller's original LD_LIBRARY_PATH so child calls to host browsers/clipboard tools stay clean
+if [[ -z "${LD_LIBRARY_PATH_ORIG+x}" ]]; then
+    export LD_LIBRARY_PATH_ORIG="${LD_LIBRARY_PATH:-}"
+fi
+
+EXTRA_LIB_DIRS=()
+
+# 1. Bundled shared libraries inside AppDir
+for bundled_dir in "${APPDIR}/usr/lib" "${APPDIR}/usr/bin/_internal"; do
+    if [[ -d "${bundled_dir}" ]]; then
+        EXTRA_LIB_DIRS+=("${bundled_dir}")
+    fi
+done
+
+# 2. Optional user-explicit CUDA directory override
+if [[ -n "${NEUROWHISPER_CUDA_LIB_DIR:-}" ]]; then
+    IFS=':' read -r -a user_cuda_dirs <<< "${NEUROWHISPER_CUDA_LIB_DIR}"
+    for udir in "${user_cuda_dirs[@]}"; do
+        if [[ -n "${udir}" && -d "${udir}" ]]; then
+            EXTRA_LIB_DIRS+=("${udir}")
+            for nv_sub in "${udir}"/nvidia/*/lib; do
+                [[ -d "${nv_sub}" ]] && EXTRA_LIB_DIRS+=("${nv_sub}")
+            done
+        fi
+    done
+fi
+
+# 3. User-space CUDA 12 add-on directory (~/.local/share/neurowhisper/cuda-libs)
+XDG_DATA_BASE="${XDG_DATA_HOME:-${HOME}/.local/share}"
+USER_CUDA_ROOT="${XDG_DATA_BASE}/neurowhisper/cuda-libs"
+if [[ -d "${USER_CUDA_ROOT}" ]]; then
+    EXTRA_LIB_DIRS+=("${USER_CUDA_ROOT}")
+    [[ -d "${USER_CUDA_ROOT}/lib" ]] && EXTRA_LIB_DIRS+=("${USER_CUDA_ROOT}/lib")
+    for nv_lib in "${USER_CUDA_ROOT}"/nvidia/*/lib; do
+        [[ -d "${nv_lib}" ]] && EXTRA_LIB_DIRS+=("${nv_lib}")
+    done
+fi
+
+# 4. Standard system CUDA toolkit paths
+for sys_cuda in \
+    "/usr/local/cuda/lib64" \
+    "/usr/local/cuda/targets/x86_64-linux/lib" \
+    "/usr/local/cuda/targets/sbsa-linux/lib" \
+    "/opt/cuda/lib64"
+do
+    if [[ -d "${sys_cuda}" ]]; then
+        EXTRA_LIB_DIRS+=("${sys_cuda}")
+    fi
+done
+
+if [[ "${#EXTRA_LIB_DIRS[@]}" -gt 0 ]]; then
+    JOINED_DIRS="$(IFS=:; echo "${EXTRA_LIB_DIRS[*]}")"
+    if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+        export LD_LIBRARY_PATH="${JOINED_DIRS}:${LD_LIBRARY_PATH}"
+    else
+        export LD_LIBRARY_PATH="${JOINED_DIRS}"
+    fi
+fi
+
+# Ensure Tcl/Tk & Fontconfig inside python-build-standalone resolve host X11/Wayland fonts cleanly
+if [[ -z "${FONTCONFIG_PATH:-}" && -d "/etc/fonts" ]]; then
+    export FONTCONFIG_PATH="/etc/fonts"
+fi
+
+exec "${APPDIR}/usr/bin/neurowhisper" "$@"

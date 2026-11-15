@@ -1,0 +1,10 @@
+build/
+dist/
+.build-venv/
+.test-venv/
+__pycache__/
+*.py[cod]
+*.dmg
+*.dmg.sha256
+*.app/
+.DS_Store

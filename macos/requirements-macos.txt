@@ -1,0 +1,26 @@
+# Core runtime dependencies for neurowhisper (macOS standalone bundle)
+faster-whisper>=1.1.0
+ctranslate2>=4.5.0
+sounddevice>=0.4.6
+customtkinter>=5.2.0
+Pillow>=10.0.0
+numpy>=1.24.0
+onnxruntime>=1.18.0
+onnx-asr>=0.7.0
+av>=12.0.0
+huggingface_hub>=0.23.0
+tokenizers>=0.19.0
+tqdm>=4.66.0
+PyYAML>=6.0
+openai>=1.30.0
+pystray>=0.19.5
+
+# macOS native frameworks (Quartz CGEventTap, NSPasteboard, NSSound, TCC AXIsProcessTrusted)
+pyobjc-core>=10.0; sys_platform == 'darwin'
+pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'
+pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'
+pyobjc-framework-ApplicationServices>=10.0; sys_platform == 'darwin'
+
+# Apple Silicon Metal GPU Whisper backend
+mlx>=0.18.0; sys_platform == 'darwin' and platform_machine == 'arm64'
+mlx-whisper>=0.4.0; sys_platform == 'darwin' and platform_machine == 'arm64'
